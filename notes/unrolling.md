@@ -68,9 +68,11 @@ The actual bottleneck breakdown:
 Going from 1 to 4 chains: **4x gain** (latency hiding).
 Going from 4 to 8 chains: **2x gain** (second FMA unit).
 
-In practice we observed ~3.3 → ~31 GFLOPS, roughly **9x**, which is close to the
-combined 4 * 2 = 8x theoretical. The extra gain comes from removing the loop overhead
-and index recomputation that the compiler could not optimize in the single-chain version.
+**Note (empirical observation):** In practice, manual 4x loop unrolling of the ikj SAXPY did NOT help
+single-threaded performance (actually slightly hurt it: 3.32 → 2.91 GFLOPS). The compiler's auto-vectorization
+was already sufficient. However, unrolling *did* help with multi-threading (OMP): cpp_ikj_omp at 81.8 GFLOPS
+vs cpp_ikj_unroll_omp at 94.2 GFLOPS. This suggests the unrolled version allows better parallelization
+across threads, likely because the manual unrolling exposes more independent work to the scheduler.
 
 ---
 

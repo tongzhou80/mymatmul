@@ -65,7 +65,7 @@ def plot(data):
     ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: str(int(v))))
     ax.set_xlabel("Matrix size (N×N×N)", fontsize=12)
     ax.set_ylabel("GFLOPS (log scale)", fontsize=12)
-    ax.set_title("Matrix multiplication: attained GFLOPS vs size", fontsize=13)
+    ax.set_title("Matrix multiplication: attained GFLOPS vs size (FP32)", fontsize=13)
     ax.legend(fontsize=9)
     ax.grid(True, which="both", linestyle=":", alpha=0.5)
 

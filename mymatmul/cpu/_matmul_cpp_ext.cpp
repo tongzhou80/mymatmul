@@ -107,11 +107,9 @@ static PyObject* py_matmul_cpp_ikj_unroll(PyObject* self, PyObject* args) {
             float* __restrict__ c = pC + i*N;
             const float* __restrict__ b = pB + k*N;
             int j = 0;
-            for (; j <= N - 32; j += 32) {
-                c[j +  0] += a_ik * b[j +  0];
-                c[j +  8] += a_ik * b[j +  8];
-                c[j + 16] += a_ik * b[j + 16];
-                c[j + 24] += a_ik * b[j + 24];
+            for (; j + 31 < N; j += 32) {
+                for (int jj = 0; jj < 32; jj++)
+                    c[j + jj] += a_ik * b[j + jj];
             }
             for (; j < N; j++)
                 c[j] += a_ik * b[j];
@@ -174,11 +172,9 @@ static PyObject* py_matmul_cpp_ikj_unroll_omp(PyObject* self, PyObject* args) {
             float* __restrict__ c = pC + i*N;
             const float* __restrict__ b = pB + k*N;
             int j = 0;
-            for (; j <= N - 32; j += 32) {
-                c[j +  0] += a_ik * b[j +  0];
-                c[j +  8] += a_ik * b[j +  8];
-                c[j + 16] += a_ik * b[j + 16];
-                c[j + 24] += a_ik * b[j + 24];
+            for (; j + 31 < N; j += 32) {
+                for (int jj = 0; jj < 32; jj++)
+                    c[j + jj] += a_ik * b[j + jj];
             }
             for (; j < N; j++)
                 c[j] += a_ik * b[j];

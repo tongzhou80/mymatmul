@@ -11,14 +11,14 @@ import numpy as np
 # Registry: name -> (dotpath, max_size or None for no limit)
 # max_size: skip sizes larger than this (leaves empty cells in the results table)
 IMPLEMENTATIONS = {
-    "python_ijk":     ("mymatmul.matmul_python.matmul_python_ijk",       512),
-    "python_ikj":     ("mymatmul.matmul_python.matmul_python_ikj",       512),
-    "cpp_ijk":        ("mymatmul.matmul_cpp.matmul_cpp_ijk",             None),
-    "cpp_ikj":        ("mymatmul.matmul_cpp.matmul_cpp_ikj",             None),
-    "cpp_ikj_vec":    ("mymatmul.matmul_cpp.matmul_cpp_ikj_vec",         None),
-    "cpp_ikj_unroll":     ("mymatmul.matmul_cpp.matmul_cpp_ikj_unroll",         None),
-    "cpp_ikj_omp":        ("mymatmul.matmul_cpp.matmul_cpp_ikj_omp",            None),
-    "cpp_ikj_unroll_omp": ("mymatmul.matmul_cpp.matmul_cpp_ikj_unroll_omp",     None),
+    "python_ijk":     ("mymatmul.cpu.matmul_python.matmul_python_ijk",       512),
+    "python_ikj":     ("mymatmul.cpu.matmul_python.matmul_python_ikj",       512),
+    "cpp_ijk":        ("mymatmul.cpu.matmul_cpp.matmul_cpp_ijk",             None),
+    "cpp_ikj":        ("mymatmul.cpu.matmul_cpp.matmul_cpp_ikj",             None),
+    "cpp_ikj_vec":    ("mymatmul.cpu.matmul_cpp.matmul_cpp_ikj_vec",         None),
+    "cpp_ikj_unroll":     ("mymatmul.cpu.matmul_cpp.matmul_cpp_ikj_unroll",         None),
+    "cpp_ikj_omp":        ("mymatmul.cpu.matmul_cpp.matmul_cpp_ikj_omp",            None),
+    "cpp_ikj_unroll_omp": ("mymatmul.cpu.matmul_cpp.matmul_cpp_ikj_unroll_omp",     None),
 }
 
 SIZES = [64, 128, 256, 512, 1024, 2048, 4096]
@@ -51,6 +51,17 @@ def load_fn(dotpath: str):
     return getattr(mod, fn_name)
 
 
+def validate_fn(fn, A, B, rtol=1e-4, atol=1e-3):
+    """Validate implementation against numpy.matmul reference."""
+    result = fn(A, B)
+    expected = np.matmul(A, B)
+
+    if not np.allclose(result, expected, rtol=rtol, atol=atol):
+        max_err = np.max(np.abs(result - expected))
+        raise AssertionError(f"Result mismatch! max_error={max_err:.2e}")
+    return True
+
+
 def run(impls, sizes):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rows = []
@@ -69,12 +80,19 @@ def run(impls, sizes):
             A = np.random.randn(M, K).astype(np.float32)
             B = np.random.randn(K, N).astype(np.float32)
 
+            # Validate result before benchmarking
+            try:
+                validate_fn(fn, A, B)
+            except AssertionError as e:
+                print(f"  {M}x{N}x{K}: ✗ validation FAILED: {e}")
+                continue
+
             times = benchmark_fn(fn, A, B)
             ms_mean = np.mean(times) * 1e3
             ms_min = np.min(times) * 1e3
             gf = gflops(M, N, K, np.min(times))
 
-            print(f"  {M}x{N}x{K}: {gf:.2f} GFLOPS  (mean {ms_mean:.1f} ms, best {ms_min:.1f} ms)")
+            print(f"  {M}x{N}x{K}: ✓ {gf:.2f} GFLOPS  (mean {ms_mean:.1f} ms, best {ms_min:.1f} ms)")
 
             rows.append({
                 "timestamp": timestamp,
