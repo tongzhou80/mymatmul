@@ -50,14 +50,14 @@ def load_fn(dotpath: str):
     return getattr(mod, fn_name)
 
 
-def validate_fn(fn, A_gpu, B_gpu, A_cpu, B_cpu, rtol=1e-4, atol=1e-3):
-    """Validate GPU implementation against numpy reference."""
-    result_gpu = fn(A_gpu, B_gpu)
-    result_cpu = result_gpu.cpu().numpy().astype(A_cpu.dtype)
-    expected = np.matmul(A_cpu, B_cpu)
+def validate_fn(fn, A_gpu, B_gpu, rtol=1e-3, atol=1e-2):
+    """Validate GPU implementation against torch.matmul reference on GPU."""
+    result = fn(A_gpu, B_gpu)
+    expected = torch.matmul(A_gpu, B_gpu)
 
-    if not np.allclose(result_cpu, expected, rtol=rtol, atol=atol):
-        max_err = np.max(np.abs(result_cpu - expected))
+    # Compare on GPU (avoids host transfer)
+    if not torch.allclose(result, expected, rtol=rtol, atol=atol):
+        max_err = torch.max(torch.abs(result - expected)).item()
         raise AssertionError(f"Result mismatch! max_error={max_err:.2e}")
     return True
 
@@ -77,15 +77,13 @@ def run(impls, sizes):
                 print(f"  {M}x{N}x{K}: skipped (max_size={max_size})")
                 continue
 
-            # Create on CPU first, then move to GPU (before timing)
-            A = np.random.randn(M, K).astype(np.float32)
-            B = np.random.randn(K, N).astype(np.float32)
-            A_gpu = torch.from_numpy(A).cuda()
-            B_gpu = torch.from_numpy(B).cuda()
+            # Create tensors directly on GPU
+            A_gpu = torch.randn(M, K, dtype=torch.float16, device='cuda')
+            B_gpu = torch.randn(K, N, dtype=torch.float16, device='cuda')
 
             # Validate result before benchmarking
             try:
-                validate_fn(fn, A_gpu, B_gpu, A, B)
+                validate_fn(fn, A_gpu, B_gpu)
             except AssertionError as e:
                 print(f"  {M}x{N}x{K}: ✗ validation FAILED: {e}")
                 continue

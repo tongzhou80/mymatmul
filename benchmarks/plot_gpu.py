@@ -12,8 +12,9 @@ RESULTS_FILE = os.path.join(os.path.dirname(__file__), "results_gpu.csv")
 PLOT_FILE = os.path.join(os.path.dirname(__file__), "results_gpu.png")
 
 # Theoretical peak GFLOPS
-# RTX 4090: 16384 CUDA cores, 2.505 GHz boost, 2 FP32 ops per clock per core
-GPU_4090_PEAK = 82_580.0  # GFLOPS (FP32)
+# RTX 4090: 512 fourth-gen Tensor Cores
+GPU_4090_FP32_PEAK = 82_580.0   # GFLOPS (FP32, CUDA cores)
+GPU_4090_FP16_PEAK = 165_200.0  # GFLOPS (FP16, Tensor Cores)
 
 
 def load_results(path):
@@ -42,8 +43,10 @@ def plot(data):
     all_sizes = sorted({s for d in data.values() for s in d["sizes"]})
     x_min, x_max = all_sizes[0] * 0.8, all_sizes[-1] * 1.2
 
-    ax.axhline(GPU_4090_PEAK, color="mediumseagreen", linestyle="--", linewidth=1.2,
-               label=f"RTX 4090 peak  ({GPU_4090_PEAK:,.0f} GFLOPS)")
+    ax.axhline(GPU_4090_FP32_PEAK, color="steelblue", linestyle="--", linewidth=1.2,
+               label=f"RTX 4090 FP32 peak  ({GPU_4090_FP32_PEAK:,.0f} GFLOPS)")
+    ax.axhline(GPU_4090_FP16_PEAK, color="mediumseagreen", linestyle="--", linewidth=1.2,
+               label=f"RTX 4090 FP16 peak  ({GPU_4090_FP16_PEAK:,.0f} GFLOPS)")
 
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
@@ -51,7 +54,7 @@ def plot(data):
     ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: str(int(v))))
     ax.set_xlabel("Matrix size (N×N×N)", fontsize=12)
     ax.set_ylabel("GFLOPS (log scale)", fontsize=12)
-    ax.set_title("Matrix multiplication: GPU attained GFLOPS vs size (FP32)", fontsize=13)
+    ax.set_title("Matrix multiplication: GPU attained GFLOPS vs size (FP16)", fontsize=13)
     ax.legend(fontsize=9)
     ax.grid(True, which="both", linestyle=":", alpha=0.5)
 
