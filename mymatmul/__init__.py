@@ -1,4 +1,5 @@
 from .cpu import (
+    matmul_openblas,
     matmul_python_ijk,
     matmul_python_ikj,
     matmul_numba_ijk,
@@ -12,6 +13,7 @@ from .cpu import (
 )
 
 __all__ = [
+    "matmul_openblas",
     "matmul_python_ijk",
     "matmul_python_ikj",
     "matmul_numba_ijk",

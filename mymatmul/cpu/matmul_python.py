@@ -1,6 +1,11 @@
 import numpy as np
 
 
+def matmul_openblas(A, B):
+    """NumPy's matmul using OpenBLAS backend."""
+    return np.matmul(A, B)
+
+
 def matmul_python_ijk(A, B):
     """Naive triple-loop matmul in pure Python, loop order i-j-k.
 

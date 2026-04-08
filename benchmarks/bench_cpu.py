@@ -11,17 +11,18 @@ import numpy as np
 # Registry: name -> (dotpath, max_size or None for no limit)
 # max_size: skip sizes larger than this (leaves empty cells in the results table)
 IMPLEMENTATIONS = {
-    "python_ijk":     ("mymatmul.cpu.matmul_python.matmul_python_ijk",       512),
-    "python_ikj":     ("mymatmul.cpu.matmul_python.matmul_python_ikj",       512),
-    "cpp_ijk":        ("mymatmul.cpu.matmul_cpp.matmul_cpp_ijk",             None),
-    "cpp_ikj":        ("mymatmul.cpu.matmul_cpp.matmul_cpp_ikj",             None),
-    "cpp_ikj_vec":    ("mymatmul.cpu.matmul_cpp.matmul_cpp_ikj_vec",         None),
-    "cpp_ikj_unroll":     ("mymatmul.cpu.matmul_cpp.matmul_cpp_ikj_unroll",         None),
-    "cpp_ikj_omp":        ("mymatmul.cpu.matmul_cpp.matmul_cpp_ikj_omp",            None),
-    "cpp_ikj_unroll_omp": ("mymatmul.cpu.matmul_cpp.matmul_cpp_ikj_unroll_omp",     None),
+    "openblas":           ("mymatmul.cpu.matmul_python.matmul_openblas",         None),
+    "python_ijk":         ("mymatmul.cpu.matmul_python.matmul_python_ijk",       256),
+    "python_ikj":         ("mymatmul.cpu.matmul_python.matmul_python_ikj",       256),
+    "cpp_ijk":            ("mymatmul.cpu.matmul_cpp.matmul_cpp_ijk",             512),
+    "cpp_ikj":            ("mymatmul.cpu.matmul_cpp.matmul_cpp_ikj",             None),
+    "cpp_ikj_vec":        ("mymatmul.cpu.matmul_cpp.matmul_cpp_ikj_vec",         None),
+    "cpp_ikj_unroll":     ("mymatmul.cpu.matmul_cpp.matmul_cpp_ikj_unroll",      None),
+    "cpp_ikj_omp":        ("mymatmul.cpu.matmul_cpp.matmul_cpp_ikj_omp",         None),
+    "cpp_ikj_unroll_omp": ("mymatmul.cpu.matmul_cpp.matmul_cpp_ikj_unroll_omp",  None),
 }
 
-SIZES = [64, 128, 256, 512, 1024, 2048, 4096]
+SIZES = [128, 256, 512, 1024, 2048]
 WARMUP_RUNS = 1
 TIMED_RUNS = 3
 
