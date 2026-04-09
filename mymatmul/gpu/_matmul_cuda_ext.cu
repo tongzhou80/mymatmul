@@ -34,7 +34,7 @@ torch::Tensor matmul_cuda_naive_ijk(torch::Tensor A, torch::Tensor B) {
     dim3 threads(16, 16);  // 16x16 = 256 threads per block
     dim3 blocks((M + 15) / 16, (N + 15) / 16);
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(A.scalar_type(), "matmul_naive_ijk", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, A.scalar_type(), "matmul_naive_ijk", [&] {
         matmul_naive_ijk_2d_grid<scalar_t><<<blocks, threads>>>(
             A.data_ptr<scalar_t>(),
             B.data_ptr<scalar_t>(),
@@ -79,7 +79,7 @@ torch::Tensor matmul_cuda_naive_ijk_jx(torch::Tensor A, torch::Tensor B) {
     dim3 threads(16, 16);  // 16x16 = 256 threads per block
     dim3 blocks((N + 15) / 16, (M + 15) / 16);  // Swapped: x for N, y for M
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(A.scalar_type(), "matmul_naive_ijk_jx", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, A.scalar_type(), "matmul_naive_ijk_jx", [&] {
         matmul_naive_ijk_2d_grid_jx<scalar_t><<<blocks, threads>>>(
             A.data_ptr<scalar_t>(),
             B.data_ptr<scalar_t>(),
@@ -165,7 +165,7 @@ torch::Tensor matmul_cuda_tiled_32x32(torch::Tensor A, torch::Tensor B) {
     dim3 threads(32, 32);  // 32x32 = 1024 threads per block
     dim3 blocks((N + 31) / 32, (M + 31) / 32);
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(A.scalar_type(), "matmul_tiled_32x32", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, A.scalar_type(), "matmul_tiled_32x32", [&] {
         matmul_tiled_32x32<scalar_t><<<blocks, threads>>>(
             A.data_ptr<scalar_t>(),
             B.data_ptr<scalar_t>(),

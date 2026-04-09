@@ -90,8 +90,8 @@ def run(impls, sizes):
                 continue
 
             # Create tensors directly on GPU
-            A_gpu = torch.randn(M, K, dtype=torch.float16, device='cuda')
-            B_gpu = torch.randn(K, N, dtype=torch.float16, device='cuda')
+            A_gpu = torch.randn(M, K, dtype=torch.bfloat16, device='cuda')
+            B_gpu = torch.randn(K, N, dtype=torch.bfloat16, device='cuda')
 
             # Validate result before benchmarking
             try:

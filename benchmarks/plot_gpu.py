@@ -46,7 +46,7 @@ def plot(data):
     ax.axhline(GPU_4090_FP32_PEAK, color="steelblue", linestyle="--", linewidth=1.2,
                label=f"RTX 4090 FP32 peak  ({GPU_4090_FP32_PEAK:,.0f} GFLOPS)")
     ax.axhline(GPU_4090_FP16_PEAK, color="mediumseagreen", linestyle="--", linewidth=1.2,
-               label=f"RTX 4090 FP16 peak  ({GPU_4090_FP16_PEAK:,.0f} GFLOPS)")
+               label=f"RTX 4090 BF16 peak  ({GPU_4090_FP16_PEAK:,.0f} GFLOPS)")
 
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
@@ -54,7 +54,7 @@ def plot(data):
     ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: str(int(v))))
     ax.set_xlabel("Matrix size (N×N×N)", fontsize=12)
     ax.set_ylabel("GFLOPS (log scale)", fontsize=12)
-    ax.set_title("Matrix multiplication: GPU attained GFLOPS vs size (FP16)", fontsize=13)
+    ax.set_title("Matrix multiplication: GPU attained GFLOPS vs size (BF16)", fontsize=13)
     ax.legend(fontsize=9)
     ax.grid(True, which="both", linestyle=":", alpha=0.5)
 
