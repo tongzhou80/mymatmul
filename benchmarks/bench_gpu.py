@@ -15,6 +15,7 @@ IMPLEMENTATIONS = {
     "torch_matmul": ("mymatmul.gpu.matmul_torch.matmul_torch",   None),
     "cuda_naive_ijk": ("mymatmul.gpu.matmul_cuda.matmul_cuda_naive_ijk", None),
     "cuda_naive_ijk_jx": ("mymatmul.gpu.matmul_cuda.matmul_cuda_naive_ijk_jx", None),
+    "cuda_tiled_32x32": ("mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x32", None),
 }
 
 SIZES = [64, 128, 256, 512, 1024, 2048, 4096]
