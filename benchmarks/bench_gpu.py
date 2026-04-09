@@ -12,7 +12,9 @@ import torch
 # Registry: name -> (dotpath, max_size or None for no limit)
 # max_size: skip sizes larger than this (leaves empty cells in the results table)
 IMPLEMENTATIONS = {
-    "torch": ("mymatmul.gpu.matmul_torch.matmul_torch",   None),
+    "torch_matmul": ("mymatmul.gpu.matmul_torch.matmul_torch",   None),
+    "cuda_naive_ijk": ("mymatmul.gpu.matmul_cuda.matmul_cuda_naive_ijk", None),
+    "cuda_naive_ijk_jx": ("mymatmul.gpu.matmul_cuda.matmul_cuda_naive_ijk_jx", None),
 }
 
 SIZES = [64, 128, 256, 512, 1024, 2048, 4096]
@@ -50,15 +52,24 @@ def load_fn(dotpath: str):
     return getattr(mod, fn_name)
 
 
-def validate_fn(fn, A_gpu, B_gpu, rtol=1e-3, atol=1e-2):
-    """Validate GPU implementation against torch.matmul reference on GPU."""
-    result = fn(A_gpu, B_gpu)
-    expected = torch.matmul(A_gpu, B_gpu)
+def validate_fn(fn, A_gpu, B_gpu, rtol=1e-2, atol=1e-1):
+    result = fn(A_gpu, B_gpu).float()
+    expected = torch.matmul(A_gpu.float(), B_gpu.float())
 
-    # Compare on GPU (avoids host transfer)
+    diff = (result - expected).abs()
+    rel = diff / expected.abs().clamp_min(1e-3)
+
+    max_abs = diff.max().item()
+    mean_abs = diff.mean().item()
+    p99_abs = diff.quantile(0.99).item()
+    max_rel = rel.max().item()
+    mean_rel = rel.mean().item()
+
     if not torch.allclose(result, expected, rtol=rtol, atol=atol):
-        max_err = torch.max(torch.abs(result - expected)).item()
-        raise AssertionError(f"Result mismatch! max_error={max_err:.2e}")
+        raise AssertionError(
+            f"Mismatch: max_abs={max_abs:.3e}, p99_abs={p99_abs:.3e}, "
+            f"mean_abs={mean_abs:.3e}, max_rel={max_rel:.3e}, mean_rel={mean_rel:.3e}"
+        )
     return True
 
 

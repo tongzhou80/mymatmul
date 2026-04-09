@@ -1,5 +1,10 @@
 from setuptools import setup, find_packages, Extension
 import numpy as np
+import os
+
+# Check if CUDA is available for GPU extension
+cuda_available = os.environ.get('CUDA_HOME') or os.path.exists('/usr/local/cuda')
+ext_modules = []
 
 cpp_ext = Extension(
     "mymatmul.cpu._matmul_cpp_ext",
@@ -9,14 +14,35 @@ cpp_ext = Extension(
     extra_link_args=["-fopenmp"],
     language="c++",
 )
+ext_modules.append(cpp_ext)
+
+# Add CUDA extension if available
+if cuda_available:
+    try:
+        from torch.utils.cpp_extension import CUDAExtension
+        cuda_ext = CUDAExtension(
+            "mymatmul.gpu._matmul_cuda_ext",
+            sources=["mymatmul/gpu/_matmul_cuda_ext.cu"],
+            extra_compile_args={
+                'cxx': ["-O3"],
+                'nvcc': ["-O3", "-std=c++17"],
+            },
+        )
+        ext_modules.append(cuda_ext)
+    except ImportError:
+        print("Warning: PyTorch CUDA extension not available, skipping GPU extension")
 
 setup(
     name="mymatmul",
     version="0.1.0",
     packages=find_packages(),
-    ext_modules=[cpp_ext],
+    ext_modules=ext_modules,
     install_requires=[
         "numpy",
         "numba",
+        "torch",
     ],
+    cmdclass={
+        'build_ext': __import__('torch.utils.cpp_extension', fromlist=['BuildExtension']).BuildExtension if cuda_available else None
+    } if cuda_available else {},
 )
