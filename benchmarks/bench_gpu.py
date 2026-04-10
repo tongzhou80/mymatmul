@@ -20,11 +20,12 @@ IMPLEMENTATIONS = {
     "cuda_tiled_32x32_32x8": ("mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x32_threads_32x8", None),
     "cuda_tiled_32x32_32x4": ("mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x32_threads_32x4", None),
     "cuda_tiled_32x64_32x4": ("mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x64_threads_32x4", None),
+    "cuda_tiled_32x64_tm4_tn4": ("mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x64_tm4_tn4", None),
 }
 
 SIZES = [64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096]
-WARMUP_RUNS = 1
-TIMED_RUNS = 3
+WARMUP_RUNS = 3
+TIMED_RUNS = 10
 
 RESULTS_FILE = os.path.join(os.path.dirname(__file__), "results_gpu.csv")
 FIELDNAMES = ["timestamp", "impl", "M", "N", "K", "gflops", "ms_mean", "ms_min"]
@@ -60,9 +61,6 @@ def benchmark_fn(fn, A_gpu, B_gpu):
     for _ in range(WARMUP_RUNS):
         fn(A_gpu, B_gpu)
         torch.cuda.synchronize()
-
-    # Flush L2 cache before timed runs
-    flush_l2_cache()
 
     # Timed runs with synchronization
     times = []

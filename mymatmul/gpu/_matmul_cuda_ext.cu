@@ -735,33 +735,6 @@ torch::Tensor matmul_cuda_tiled_32x32_32x4_threads(torch::Tensor A, torch::Tenso
     return C;
 }
 
-/* Tiled matmul with larger output tiles: 64x32x32 (larger i dimension)
-   Uses 32x4 warp-aligned thread layout but with bigger output tiles.
-
-   Design:
-   - blockDim: 32x4 = 128 threads
-   - Output tile: 64x32 (BM x BN)
-   - K tile: 32 (BK)
-   - Each thread computes 2x8 micro-tile (2 rows, 8 columns)
-
-   Thread to output mapping:
-   - Thread (tx, ty) covers:
-     - Rows: [block_row + ty*2, block_row + ty*2 + 1]
-     - Columns: [block_col + tx*8 to block_col + tx*8 + 7]
-   - This gives 2D locality (adjacent output elements)
-
-   Advantages of larger output tiles:
-   - More work per block → better amortization of synchronization
-   - Better reuse of shared memory data
-   - More computation per thread (16 elements in 2D arrangement) → better cache locality
-
-   Trade-offs:
-   - Larger shared memory footprint: A[64][32] + B[32][32] = 3072 elements
-   - Each thread loads more elements (16 for A, 8 from B)
-   - Fewer blocks per SM at given problem size (less occupancy)
-   - But more work per block with better temporal locality
-*/
-
 /* Tiled matmul: 32x64 output tiles with 32x4 warp-aligned thread layout
    Each thread computes an 8x2 micro-tile.
 
@@ -955,6 +928,180 @@ torch::Tensor matmul_cuda_tiled_32x64_32x4_threads(torch::Tensor A, torch::Tenso
     return C;
 }
 
+/* Tiled matmul: 32x64 output tiles with 32x4 warp-aligned thread layout
+   Each thread computes a 4x4 micro-tile (TM=TN=4), using tid-based remapping
+   to decouple physical layout from logical output assignment.
+
+   Physical layout:    32x4  = 128 threads (same as before)
+   Logical grid:        8x16 = 128 threads (BM/TM x BN/TN = 32/4 x 64/4)
+   Thread tile:         TM=4, TN=4 = 16 outputs per thread (same as before)
+
+   The key idea:
+     tid = ty*32 + tx                  (physical, 0..127)
+     ltx = tid % 16,  lty = tid / 16  (logical, maps tid into 8x16 grid)
+     row_start = lty * TM             (which 4-row block this thread owns)
+     col_start = ltx * TN             (which 4-col block this thread owns)
+
+   Global loads still use tid directly (coalesced, 32 consecutive threads
+   in the physical x-dim hit consecutive addresses — unchanged from before).
+*/
+template <typename scalar_t>
+__global__ void matmul_tiled_32x64_tm4_tn4(
+    const scalar_t* A, const scalar_t* B, scalar_t* C,
+    int M, int K, int N
+) {
+    constexpr int BM = 32;
+    constexpr int BN = 64;
+    constexpr int BK = 32;
+    constexpr int TM = 4;
+    constexpr int TN = 4;
+
+    // Logical grid dimensions (derived, not hardcoded)
+    // LROWS = BM/TM = 8,  LCOLS = BN/TN = 16
+    // LROWS * LCOLS = 128 = total threads ✓
+    constexpr int LROWS = BM / TM;   // 8
+    constexpr int LCOLS = BN / TN;   // 16
+
+    __shared__ scalar_t A_shared[BM][BK];
+    __shared__ scalar_t B_shared[BK][BN];
+
+    // --- Physical thread indices (used only for global loads) ---
+    const int tx = threadIdx.x;              // 0..31
+    const int ty = threadIdx.y;              // 0..3
+    const int tid = ty * blockDim.x + tx;   // 0..127
+
+    // --- Logical thread indices (used for compute + writeback) ---
+    const int ltx = tid % LCOLS;   // 0..15  (which TN-column block)
+    const int lty = tid / LCOLS;   // 0..7   (which TM-row block)
+
+    const int block_row = blockIdx.y * BM;
+    const int block_col = blockIdx.x * BN;
+
+    // This thread's output region (4 rows x 4 cols in the CTA tile)
+    const int row_start = block_row + lty * TM;
+    const int col_start = block_col + ltx * TN;
+
+    // 4x4 accumulator (TM x TN), all in registers
+    float acc[TM][TN] = {};
+
+    for (int k0 = 0; k0 < K; k0 += BK) {
+
+        // ----------------------------------------------------------
+        // Load A tile: BM*BK = 32*32 = 1024 elems, 128 threads
+        // => 8 elems/thread, identical to original
+        // (physical tx/ty used here, not logical ltx/lty)
+        // ----------------------------------------------------------
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int idx = tid + i * 128;
+            const int r = idx / BK;
+            const int c = idx % BK;
+            const int global_r = block_row + r;
+            const int global_c = k0 + c;
+            A_shared[r][c] = (global_r < M && global_c < K)
+                ? A[global_r * K + global_c]
+                : static_cast<scalar_t>(0);
+        }
+
+        // ----------------------------------------------------------
+        // Load B tile: BK*BN = 32*64 = 2048 elems, 128 threads
+        // => 16 elems/thread, identical to original
+        // ----------------------------------------------------------
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            const int idx = tid + i * 128;
+            const int r = idx / BN;
+            const int c = idx % BN;
+            const int global_r = k0 + r;
+            const int global_c = block_col + c;
+            B_shared[r][c] = (global_r < K && global_c < N)
+                ? B[global_r * N + global_c]
+                : static_cast<scalar_t>(0);
+        }
+
+        __syncthreads();
+
+        // ----------------------------------------------------------
+        // Compute: each thread does its TM x TN = 4x4 micro-tile
+        // lty/ltx used here, NOT ty/tx
+        // ----------------------------------------------------------
+        #pragma unroll
+        for (int kk = 0; kk < BK; kk++) {
+            // Load this thread's 4 A values (one column of its row-block)
+            float a[TM];
+            #pragma unroll
+            for (int i = 0; i < TM; i++)
+                a[i] = (float)A_shared[lty * TM + i][kk];
+
+            // Load this thread's 4 B values (one row of its col-block)
+            float b[TN];
+            #pragma unroll
+            for (int j = 0; j < TN; j++)
+                b[j] = (float)B_shared[kk][ltx * TN + j];
+
+            // Outer product accumulation
+            #pragma unroll
+            for (int i = 0; i < TM; i++)
+                #pragma unroll
+                for (int j = 0; j < TN; j++)
+                    acc[i][j] += a[i] * b[j];
+        }
+
+        __syncthreads();
+    }
+
+    // ----------------------------------------------------------
+    // Writeback: 4x4 block of C
+    // ----------------------------------------------------------
+    #pragma unroll
+    for (int i = 0; i < TM; i++) {
+        #pragma unroll
+        for (int j = 0; j < TN; j++) {
+            const int global_r = row_start + i;
+            const int global_c = col_start + j;
+            if (global_r < M && global_c < N)
+                C[global_r * N + global_c] = (scalar_t)acc[i][j];
+        }
+    }
+}
+
+torch::Tensor matmul_cuda_tiled_32x64_tm4_tn4(torch::Tensor A, torch::Tensor B) {
+    TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
+    TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
+    TORCH_CHECK(A.dtype() == B.dtype(), "A and B must have the same dtype");
+    TORCH_CHECK(A.dim() == 2, "A must be 2D");
+    TORCH_CHECK(B.dim() == 2, "B must be 2D");
+    TORCH_CHECK(A.size(1) == B.size(0), "Inner dimensions must match");
+    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
+
+    const int M = A.size(0);
+    const int K = A.size(1);
+    const int N = B.size(1);
+
+    auto C = torch::zeros({M, N}, A.options());
+
+    dim3 threads(32, 4);                         // physical (x,y) = (32,4)
+    dim3 blocks((N + 63) / 64, (M + 31) / 32);  // each CTA computes a 32x64 tile
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        torch::kHalf,
+        torch::kBFloat16,
+        A.scalar_type(),
+        "matmul_tiled_32x64_tm4_tn4",
+        [&] {
+            matmul_tiled_32x64_tm4_tn4<scalar_t><<<blocks, threads>>>(
+                A.data_ptr<scalar_t>(),
+                B.data_ptr<scalar_t>(),
+                C.data_ptr<scalar_t>(),
+                M, K, N
+            );
+        }
+    );
+
+    return C;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("matmul_cuda_naive_ijk", &matmul_cuda_naive_ijk, "Naive CUDA matmul: 2D grid (i->x, j->y), each thread (i,j) computes full k");
     m.def("matmul_cuda_naive_ijk_jx", &matmul_cuda_naive_ijk_jx, "Naive CUDA matmul: 2D grid (j->x, i->y), each thread (i,j) computes full k");
@@ -963,4 +1110,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("matmul_cuda_tiled_32x32_32x8_threads", &matmul_cuda_tiled_32x32_32x8_threads, "Warp-aligned tiled CUDA matmul: 32x32 tiles, 32x8 threads, each thread computes 4x1 micro-tile, zero bank conflicts");
     m.def("matmul_cuda_tiled_32x32_32x4_threads", &matmul_cuda_tiled_32x32_32x4_threads, "Ultra-warp-aligned tiled CUDA matmul: 32x32 tiles, 32x4 threads, each thread computes 8x1 micro-tile");
     m.def("matmul_cuda_tiled_32x64_32x4_threads", &matmul_cuda_tiled_32x64_32x4_threads, "Larger tile matmul: 32x64 output tiles, 32x4 threads, each thread computes 8x2 micro-tile");
+    m.def("matmul_cuda_tiled_32x64_tm4_tn4", &matmul_cuda_tiled_32x64_tm4_tn4, "Symmetric tile matmul: 32x64 output tiles, 32x4 threads remapped to 8x16 logical grid, each thread computes 4x4 micro-tile");
 }

@@ -109,6 +109,23 @@ def matmul_cuda_tiled_32x32_threads_32x4(A_gpu, B_gpu):
     return _matmul_cuda_ext.matmul_cuda_tiled_32x32_32x4_threads(A_gpu, B_gpu)  # Calls the refactored kernel
 
 
+def matmul_cuda_tiled_32x64_tm4_tn4(A_gpu, B_gpu):
+    """Symmetric tiled CUDA matmul: 32x64 output tiles with 32x4 threads remapped to 8x16 logical grid.
+
+    Each thread computes a 4x4 micro-tile (TM=TN=4) using tid-based remapping
+    to decouple physical layout from logical output assignment.
+
+    Physical layout:    32x4  = 128 threads
+    Logical grid:        8x16 = 128 threads (BM/TM x BN/TN = 32/4 x 64/4)
+    Thread tile:         TM=4, TN=4 = 16 outputs per thread
+
+    Assumes A_gpu and B_gpu are already on GPU and contiguous.
+    Returns result as GPU tensor.
+    """
+    from . import _matmul_cuda_ext
+    return _matmul_cuda_ext.matmul_cuda_tiled_32x64_tm4_tn4(A_gpu, B_gpu)
+
+
 def matmul_cuda_tiled_32x64_threads_32x4(A_gpu, B_gpu):
     """Larger tile CUDA matmul: 32x64 output tiles with 32x4 threads.
 
