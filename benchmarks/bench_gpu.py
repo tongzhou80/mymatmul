@@ -22,7 +22,7 @@ IMPLEMENTATIONS = {
     "cuda_tiled_32x64_32x4": ("mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x64_threads_32x4", None),
 }
 
-SIZES = [64, 128, 256, 512, 1024, 2048, 4096]
+SIZES = [64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096]
 WARMUP_RUNS = 1
 TIMED_RUNS = 3
 
