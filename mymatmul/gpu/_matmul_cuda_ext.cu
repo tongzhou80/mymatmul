@@ -380,9 +380,366 @@ torch::Tensor matmul_cuda_tiled_32x32_16x16_threads(torch::Tensor A, torch::Tens
     return C;
 }
 
+/* Tiled matmul: 32x32 tiles with 32x8 warp-aligned thread layout
+   Each thread computes a 4x1 micro-tile, one warp owns a full row stripe.
+
+   Thread mapping:
+   - blockDim: 32x8 = 256 threads (8 warps, each with 32 threads)
+   - Each thread (tx, ty) computes: C[row0, col], C[row1, col], C[row2, col], C[row3, col]
+     where row0 = block_row + ty, row1 = block_row + 8+ty, etc.
+     and col = block_col + tx
+
+   Shared memory:
+   - A_shared[32][32]: row-major, pitch 64 bytes (bfloat16)
+   - B_shared[32][32]: row-major, pitch 64 bytes
+
+   Benefit: One warp operates on one row stripe. When reading B_shared[kk][tx],
+   all 32 threads in the warp read B_shared[kk][0..31] sequentially, mapping to
+   banks 0..31. No bank conflicts!
+
+   Compared to 16x16 layout:
+   - 16x16: Warp spans 2 rows, causing B_shared bank conflicts across rows
+   - 32x8: Warp stays in one row, no conflicts in B_shared reads
+*/
+template <typename scalar_t>
+__global__ void matmul_tiled_32x32_32x8_threads(
+    const scalar_t* A, const scalar_t* B, scalar_t* C,
+    int M, int K, int N
+) {
+    constexpr int BM = 32;   // C tile height
+    constexpr int BN = 32;   // C tile width
+    constexpr int BK = 32;   // K tile depth
+
+    __shared__ scalar_t A_shared[BM][BK];
+    __shared__ scalar_t B_shared[BK][BN];
+
+    const int tx = threadIdx.x;   // 0..31
+    const int ty = threadIdx.y;   // 0..7
+
+    const int tid = ty * blockDim.x + tx;   // Linear thread ID within block
+
+    const int block_row = blockIdx.y * BM;
+    const int block_col = blockIdx.x * BN;
+
+    // This thread computes a 4x1 micro-tile in C
+    const int col0 = block_col + tx;
+
+    const int row0 = block_row + ty;
+    const int row1 = block_row + 8  + ty;
+    const int row2 = block_row + 16 + ty;
+    const int row3 = block_row + 24 + ty;
+
+    float acc0 = 0.0f;   // C[row0, col0]
+    float acc1 = 0.0f;   // C[row1, col0]
+    float acc2 = 0.0f;   // C[row2, col0]
+    float acc3 = 0.0f;   // C[row3, col0]
+
+    // Sweep over K dimension in tiles of 32
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        // Load A tile into shared memory: 1024 elements, 256 threads => 4 per thread
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int idx = tid + i * 256;   // Linearized index 0..1023
+            const int r = idx / BK;          // Row in A_shared: 0..31
+            const int c = idx % BK;          // Col in A_shared: 0..31
+
+            const int global_r = block_row + r;
+            const int global_c = k0 + c;
+
+            if (global_r < M && global_c < K) {
+                A_shared[r][c] = A[global_r * K + global_c];
+            } else {
+                A_shared[r][c] = static_cast<scalar_t>(0);
+            }
+        }
+
+        // Load B tile into shared memory: 1024 elements, 256 threads => 4 per thread
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int idx = tid + i * 256;   // Linearized index 0..1023
+            const int r = idx / BN;          // Row in B_shared (K dimension): 0..31
+            const int c = idx % BN;          // Col in B_shared (N dimension): 0..31
+
+            const int global_r = k0 + r;
+            const int global_c = block_col + c;
+
+            if (global_r < K && global_c < N) {
+                B_shared[r][c] = B[global_r * N + global_c];
+            } else {
+                B_shared[r][c] = static_cast<scalar_t>(0);
+            }
+        }
+
+        __syncthreads();
+
+        // Compute on the shared tiles
+        #pragma unroll
+        for (int kk = 0; kk < BK; kk++) {
+            float a0 = (float)A_shared[ty][kk];
+            float a1 = (float)A_shared[ty + 8][kk];
+            float a2 = (float)A_shared[ty + 16][kk];
+            float a3 = (float)A_shared[ty + 24][kk];
+
+            float b0 = (float)B_shared[kk][tx];
+
+            acc0 += a0 * b0;
+            acc1 += a1 * b0;
+            acc2 += a2 * b0;
+            acc3 += a3 * b0;
+        }
+
+        __syncthreads();
+    }
+
+    // Write back 4 outputs
+    if (row0 < M && col0 < N) {
+        C[row0 * N + col0] = (scalar_t)acc0;
+    }
+    if (row1 < M && col0 < N) {
+        C[row1 * N + col0] = (scalar_t)acc1;
+    }
+    if (row2 < M && col0 < N) {
+        C[row2 * N + col0] = (scalar_t)acc2;
+    }
+    if (row3 < M && col0 < N) {
+        C[row3 * N + col0] = (scalar_t)acc3;
+    }
+}
+
+torch::Tensor matmul_cuda_tiled_32x32_32x8_threads(torch::Tensor A, torch::Tensor B) {
+    TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
+    TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
+    TORCH_CHECK(A.dtype() == B.dtype(), "A and B must have the same dtype");
+    TORCH_CHECK(A.dim() == 2, "A must be 2D");
+    TORCH_CHECK(B.dim() == 2, "B must be 2D");
+    TORCH_CHECK(A.size(1) == B.size(0), "Inner dimensions must match");
+    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
+
+    const int M = A.size(0);
+    const int K = A.size(1);
+    const int N = B.size(1);
+
+    auto C = torch::zeros({M, N}, A.options());
+
+    dim3 threads(32, 8);                         // 256 threads, warp-aligned
+    dim3 blocks((N + 31) / 32, (M + 31) / 32);  // each CTA computes a 32x32 tile
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        torch::kHalf,
+        torch::kBFloat16,
+        A.scalar_type(),
+        "matmul_tiled_32x32_32x8_threads",
+        [&] {
+            matmul_tiled_32x32_32x8_threads<scalar_t><<<blocks, threads>>>(
+                A.data_ptr<scalar_t>(),
+                B.data_ptr<scalar_t>(),
+                C.data_ptr<scalar_t>(),
+                M, K, N
+            );
+        }
+    );
+
+    return C;
+}
+
+/* Tiled matmul: 32x32 tiles with 32x4 warp-aligned thread layout
+   Each thread computes an 8x1 micro-tile, two warps own half the output tile.
+
+   Thread mapping:
+   - blockDim: 32x4 = 128 threads (4 warps, each with 32 threads)
+   - Each thread (tx, ty) computes 8 consecutive rows in a single column:
+     C[row0, col], C[row1, col], ..., C[row7, col]
+     where rowk = block_row + ty + 8*k
+
+   Shared memory:
+   - A_shared[32][32]: row-major, pitch 64 bytes (bfloat16)
+   - B_shared[32][32]: row-major, pitch 64 bytes
+
+   Benefit: Extreme warp efficiency - one warp owns 8 consecutive output elements.
+   Bank conflict profile is identical to 32x8 (zero conflicts in B_shared).
+
+   Trade-offs:
+   - Fewer total threads → lower occupancy per SM
+   - Each thread has more work (8 accumulators) → better ILP
+   - Fewer syncs per thread block
+   - Very high register usage per thread (8 float accumulators)
+*/
+template <typename scalar_t>
+__global__ void matmul_tiled_32x32_32x4_threads(
+    const scalar_t* A, const scalar_t* B, scalar_t* C,
+    int M, int K, int N
+) {
+    constexpr int BM = 32;   // C tile height
+    constexpr int BN = 32;   // C tile width
+    constexpr int BK = 32;   // K tile depth
+
+    __shared__ scalar_t A_shared[BM][BK];
+    __shared__ scalar_t B_shared[BK][BN];
+
+    const int tx = threadIdx.x;   // 0..31
+    const int ty = threadIdx.y;   // 0..3
+
+    const int tid = ty * blockDim.x + tx;   // Linear thread ID within block
+
+    const int block_row = blockIdx.y * BM;
+    const int block_col = blockIdx.x * BN;
+
+    // This thread computes an 8x1 micro-tile in C
+    const int col0 = block_col + tx;
+
+    const int row0 = block_row + ty;
+    const int row1 = block_row + 4  + ty;
+    const int row2 = block_row + 8  + ty;
+    const int row3 = block_row + 12 + ty;
+    const int row4 = block_row + 16 + ty;
+    const int row5 = block_row + 20 + ty;
+    const int row6 = block_row + 24 + ty;
+    const int row7 = block_row + 28 + ty;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    float acc4 = 0.0f;
+    float acc5 = 0.0f;
+    float acc6 = 0.0f;
+    float acc7 = 0.0f;
+
+    // Sweep over K dimension in tiles of 32
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        // Load A tile into shared memory: 1024 elements, 128 threads => 8 per thread
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int idx = tid + i * 128;   // Linearized index 0..1023
+            const int r = idx / BK;          // Row in A_shared: 0..31
+            const int c = idx % BK;          // Col in A_shared: 0..31
+
+            const int global_r = block_row + r;
+            const int global_c = k0 + c;
+
+            if (global_r < M && global_c < K) {
+                A_shared[r][c] = A[global_r * K + global_c];
+            } else {
+                A_shared[r][c] = static_cast<scalar_t>(0);
+            }
+        }
+
+        // Load B tile into shared memory: 1024 elements, 128 threads => 8 per thread
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int idx = tid + i * 128;   // Linearized index 0..1023
+            const int r = idx / BN;          // Row in B_shared (K dimension): 0..31
+            const int c = idx % BN;          // Col in B_shared (N dimension): 0..31
+
+            const int global_r = k0 + r;
+            const int global_c = block_col + c;
+
+            if (global_r < K && global_c < N) {
+                B_shared[r][c] = B[global_r * N + global_c];
+            } else {
+                B_shared[r][c] = static_cast<scalar_t>(0);
+            }
+        }
+
+        __syncthreads();
+
+        // Compute on the shared tiles
+        #pragma unroll
+        for (int kk = 0; kk < BK; kk++) {
+            float a0 = (float)A_shared[ty][kk];
+            float a1 = (float)A_shared[ty + 4][kk];
+            float a2 = (float)A_shared[ty + 8][kk];
+            float a3 = (float)A_shared[ty + 12][kk];
+            float a4 = (float)A_shared[ty + 16][kk];
+            float a5 = (float)A_shared[ty + 20][kk];
+            float a6 = (float)A_shared[ty + 24][kk];
+            float a7 = (float)A_shared[ty + 28][kk];
+
+            float b0 = (float)B_shared[kk][tx];
+
+            acc0 += a0 * b0;
+            acc1 += a1 * b0;
+            acc2 += a2 * b0;
+            acc3 += a3 * b0;
+            acc4 += a4 * b0;
+            acc5 += a5 * b0;
+            acc6 += a6 * b0;
+            acc7 += a7 * b0;
+        }
+
+        __syncthreads();
+    }
+
+    // Write back 8 outputs
+    if (row0 < M && col0 < N) {
+        C[row0 * N + col0] = (scalar_t)acc0;
+    }
+    if (row1 < M && col0 < N) {
+        C[row1 * N + col0] = (scalar_t)acc1;
+    }
+    if (row2 < M && col0 < N) {
+        C[row2 * N + col0] = (scalar_t)acc2;
+    }
+    if (row3 < M && col0 < N) {
+        C[row3 * N + col0] = (scalar_t)acc3;
+    }
+    if (row4 < M && col0 < N) {
+        C[row4 * N + col0] = (scalar_t)acc4;
+    }
+    if (row5 < M && col0 < N) {
+        C[row5 * N + col0] = (scalar_t)acc5;
+    }
+    if (row6 < M && col0 < N) {
+        C[row6 * N + col0] = (scalar_t)acc6;
+    }
+    if (row7 < M && col0 < N) {
+        C[row7 * N + col0] = (scalar_t)acc7;
+    }
+}
+
+torch::Tensor matmul_cuda_tiled_32x32_32x4_threads(torch::Tensor A, torch::Tensor B) {
+    TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
+    TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
+    TORCH_CHECK(A.dtype() == B.dtype(), "A and B must have the same dtype");
+    TORCH_CHECK(A.dim() == 2, "A must be 2D");
+    TORCH_CHECK(B.dim() == 2, "B must be 2D");
+    TORCH_CHECK(A.size(1) == B.size(0), "Inner dimensions must match");
+    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
+
+    const int M = A.size(0);
+    const int K = A.size(1);
+    const int N = B.size(1);
+
+    auto C = torch::zeros({M, N}, A.options());
+
+    dim3 threads(32, 4);                         // 128 threads, warp-aligned
+    dim3 blocks((N + 31) / 32, (M + 31) / 32);  // each CTA computes a 32x32 tile
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        torch::kHalf,
+        torch::kBFloat16,
+        A.scalar_type(),
+        "matmul_tiled_32x32_32x4_threads",
+        [&] {
+            matmul_tiled_32x32_32x4_threads<scalar_t><<<blocks, threads>>>(
+                A.data_ptr<scalar_t>(),
+                B.data_ptr<scalar_t>(),
+                C.data_ptr<scalar_t>(),
+                M, K, N
+            );
+        }
+    );
+
+    return C;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("matmul_cuda_naive_ijk", &matmul_cuda_naive_ijk, "Naive CUDA matmul: 2D grid (i->x, j->y), each thread (i,j) computes full k");
     m.def("matmul_cuda_naive_ijk_jx", &matmul_cuda_naive_ijk_jx, "Naive CUDA matmul: 2D grid (j->x, i->y), each thread (i,j) computes full k");
     m.def("matmul_cuda_tiled_32x32", &matmul_cuda_tiled_32x32, "Tiled CUDA matmul: 32x32 tiles with shared memory");
     m.def("matmul_cuda_tiled_32x32_16x16_threads", &matmul_cuda_tiled_32x32_16x16_threads, "Optimized tiled CUDA matmul: 32x32 tiles, 16x16 threads, each thread computes 2x2 micro-tile");
+    m.def("matmul_cuda_tiled_32x32_32x8_threads", &matmul_cuda_tiled_32x32_32x8_threads, "Warp-aligned tiled CUDA matmul: 32x32 tiles, 32x8 threads, each thread computes 4x1 micro-tile, zero bank conflicts");
+    m.def("matmul_cuda_tiled_32x32_32x4_threads", &matmul_cuda_tiled_32x32_32x4_threads, "Ultra-warp-aligned tiled CUDA matmul: 32x32 tiles, 32x4 threads, each thread computes 8x1 micro-tile");
 }
