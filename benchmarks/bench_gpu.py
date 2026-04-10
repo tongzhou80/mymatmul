@@ -34,15 +34,42 @@ def gflops(M, N, K, seconds):
     return 2 * M * N * K / seconds / 1e9
 
 
+def flush_l2_cache():
+    """Flush GPU L2 cache by allocating and accessing a large buffer.
+
+    RTX 4090 has 72MB L2 cache. We allocate 256MB (> L2 size) and read/write
+    to force eviction of L2 contents before timed measurements.
+    """
+    cache_flush_size = 256 * 1024 * 1024  # 256MB in bytes
+    # Each float32 is 4 bytes, so we need this many elements
+    flush_buffer = torch.zeros(cache_flush_size // 4, dtype=torch.float32, device='cuda')
+
+    # Read and write to the buffer to force L2 eviction
+    flush_buffer[:] = flush_buffer[:] + 1.0
+
+    # Synchronize to ensure flush is complete
+    torch.cuda.synchronize()
+
+    # Free the buffer
+    del flush_buffer
+    torch.cuda.synchronize()
+
+
 def benchmark_fn(fn, A_gpu, B_gpu):
     # Warmup with GPU synchronization
     for _ in range(WARMUP_RUNS):
         fn(A_gpu, B_gpu)
         torch.cuda.synchronize()
 
+    # Flush L2 cache before timed runs
+    flush_l2_cache()
+
     # Timed runs with synchronization
     times = []
     for _ in range(TIMED_RUNS):
+        # Flush L2 cache before each timed run for clean measurements
+        flush_l2_cache()
+
         t0 = time.perf_counter()
         fn(A_gpu, B_gpu)
         torch.cuda.synchronize()  # Wait for GPU to finish before stopping timer
