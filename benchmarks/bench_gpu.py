@@ -19,6 +19,7 @@ IMPLEMENTATIONS = {
     "cuda_tiled_32x32_16x16": ("mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x32_threads_16x16", None),
     "cuda_tiled_32x32_32x8": ("mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x32_threads_32x8", None),
     "cuda_tiled_32x32_32x4": ("mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x32_threads_32x4", None),
+    "cuda_tiled_32x64_32x4": ("mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x64_threads_32x4", None),
 }
 
 SIZES = [64, 128, 256, 512, 1024, 2048, 4096]

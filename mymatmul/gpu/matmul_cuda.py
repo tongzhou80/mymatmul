@@ -107,3 +107,39 @@ def matmul_cuda_tiled_32x32_threads_32x4(A_gpu, B_gpu):
     """
     from . import _matmul_cuda_ext
     return _matmul_cuda_ext.matmul_cuda_tiled_32x32_32x4_threads(A_gpu, B_gpu)  # Calls the refactored kernel
+
+
+def matmul_cuda_tiled_32x64_threads_32x4(A_gpu, B_gpu):
+    """Larger tile CUDA matmul: 32x64 output tiles with 32x4 threads.
+
+    Thread mapping:
+    - Blocksize: 32x4 = 128 threads (same as 32x32 version)
+    - Block computes C tile [block_row : block_row+32, block_col : block_col+64]
+    - Each thread computes an 8x2 micro-tile (8 rows, 2 columns)
+
+    Output mapping:
+    - Thread (tx, ty) computes columns [tx, tx+32] for 8 consecutive rows
+    - Rows stride by 4 per thread: row offsets [ty, ty+4, ty+8, ..., ty+28]
+    - This gives 2D spatial locality with good cache utilization
+
+    Memory architecture:
+    - Shared memory: A_shared[32][32] + B_shared[32][64] = 3072 elements
+    - Each thread loads 8 elements from A, 16 from B per K-tile
+    - Larger B_shared footprint for better column reuse
+
+    Benefits over 32x32 tiles:
+    - More work per block in N dimension → better amortization
+    - Each thread computes 16 elements in 8x2 arrangement
+    - Better cache locality from 2D output pattern
+    - More computation before synchronization
+
+    Trade-offs:
+    - Higher shared memory usage (3072 vs 2048 bytes)
+    - Fewer blocks per SM if memory-limited, more work per block
+    - Increased B_shared bandwidth but coalescing still good
+
+    Assumes A_gpu and B_gpu are already on GPU and contiguous.
+    Returns result as GPU tensor.
+    """
+    from . import _matmul_cuda_ext
+    return _matmul_cuda_ext.matmul_cuda_tiled_32x64_32x4_threads(A_gpu, B_gpu)
