@@ -203,3 +203,97 @@ arithmetic intensity (21-64 global, 2-4 register) compensates for the lower occu
 
 
 The CUDA implementations for all 5 configs are in `mymatmul/gpu/_matmul_cuda_ext1.cu`.
+
+## Empirical tuning: BK and tile-load unroll factor (RTX 4090, 4096³, bf16)
+
+We swept BK ∈ {16, 32} and tile-load unroll ∈ {1, 2, 4, 8} for all 5 configs.
+Peak GFLOPS at each (BK, unroll) combination:
+
+```
+BK=32:
+┌─────────────────────┬──────────┬──────────┬──────────┬──────────┐
+│       Kernel        │ unroll 1 │ unroll 2 │ unroll 4 │ unroll 8 │
+├─────────────────────┼──────────┼──────────┼──────────┼──────────┤
+│ tm4_tn4_bm32_bn64   │  29,262  │  22,148  │  24,233  │  30,098  │
+│ tm4_tn4_bm64_bn64   │  31,087  │  26,369  │  28,008  │  32,080  │
+│ tm8_tn4_bm64_bn64   │  33,176  │  27,853  │  29,117  │  33,867  │
+│ tm8_tn8_bm128_bn64  │  18,566  │  29,870  │  35,233  │  35,872  │
+│ tm8_tn8_bm128_bn128 │  39,970  │  34,298  │  38,901  │  39,804  │
+└─────────────────────┴──────────┴──────────┴──────────┴──────────┘
+
+BK=16:
+┌─────────────────────┬──────────┬──────────┬──────────┬──────────┐
+│       Kernel        │ unroll 1 │ unroll 2 │ unroll 4 │ unroll 8 │
+├─────────────────────┼──────────┼──────────┼──────────┼──────────┤
+│ tm4_tn4_bm32_bn64   │  19,183  │  22,777  │  25,872  │  30,144  │
+│ tm4_tn4_bm64_bn64   │  24,210  │  26,392  │  32,888  │  32,293  │
+│ tm8_tn4_bm64_bn64   │  24,273  │  27,632  │  29,983  │  35,494  │
+│ tm8_tn8_bm128_bn64  │  21,353  │  29,288  │  34,675  │  35,408  │
+│ tm8_tn8_bm128_bn128 │  26,271  │  33,854  │  38,083  │  35,890  │
+└─────────────────────┴──────────┴──────────┴──────────┴──────────┘
+```
+
+**Takeaways:**
+- **BK=32 is better across the board.** Even though BK=16 reduces SMEM usage and shortens
+  the load loops, the larger K-tile gives more compute per __syncthreads() and better
+  amortizes the synchronization overhead.
+- **Unroll 8 is generally best.** More unrolling in the tile-load loops gives the compiler
+  more ILP to hide global memory latency. The only exception is BK=32/unroll=1 which
+  happens to be competitive for smaller configs (compiler chooses a good schedule on its
+  own), and BK=32/tm8_tn8 configs where the A-load loop is 32 iters and unroll 8 vs
+  unroll 1 are essentially tied — those kernels are compute-bound rather than load-bound.
+- **Best config overall: tm8_tn8_bm128_bn128, BK=32, unroll=8 → ~40 TFLOPS**
+  (27% of RTX 4090's 165 TFLOPS bf16 theoretical peak).
+
+
+Notes
+  ┌─────────────────────┬──────────┬──────────┬──────┐                                         
+  │       Kernel        │ unroll 4 │ unroll 2 │  Δ   │                                                                                                                                        
+  ├─────────────────────┼──────────┼──────────┼──────┤                   
+  │ tm4_tn4_bm32_bn64   │ 24,233   │ 22,148   │ -9%  │                      
+  ├─────────────────────┼──────────┼──────────┼──────┤                                                                                                                                        
+  │ tm4_tn4_bm64_bn64   │ 28,008   │ 26,369   │ -6%  │                                                                                                                                        
+  ├─────────────────────┼──────────┼──────────┼──────┤                                                                                                                                        
+  │ tm8_tn4_bm64_bn64   │ 29,117   │ 27,853   │ -4%  │                                         
+  ├─────────────────────┼──────────┼──────────┼──────┤                                                                                                                                        
+  │ tm8_tn8_bm128_bn64  │ 35,233   │ 29,870   │ -15% │ 
+  ├─────────────────────┼──────────┼──────────┼──────┤                                         
+  │ tm8_tn8_bm128_bn128 │ 38,901   │ 34,298   │ -12% │                                                                                                                                        
+  └─────────────────────┴──────────┴──────────┴──────┘   
+
+So increasing arithmetic intensity is more effective than increasing occupancy here because when 
+the memory bandwidth is already saturated, increasing occupancy does not really help anymore.
+
+Another question is, why does unrolling the cooperative tile loading loop help at all? And it 
+seems more helpful to the high occupancy configurations than to the high a.i. ones
+
+
+  ┌─────────────────────┬──────────┬──────────┬──────────┬──────────┐                          
+  │       Kernel        │ unroll 1 │ unroll 2 │ unroll 4 │ unroll 8 │                          
+  ├─────────────────────┼──────────┼──────────┼──────────┼──────────┤                          
+  │ tm4_tn4_bm32_bn64   │  29,262  │  22,148  │  24,233  │  30,098  │                          
+  ├─────────────────────┼──────────┼──────────┼──────────┼──────────┤                          
+  │ tm4_tn4_bm64_bn64   │  31,087  │  26,369  │  28,008  │  32,080  │                          
+  ├─────────────────────┼──────────┼──────────┼──────────┼──────────┤                          
+  │ tm8_tn4_bm64_bn64   │  33,176  │  27,853  │  29,117  │  33,867  │                          
+  ├─────────────────────┼──────────┼──────────┼──────────┼──────────┤                          
+  │ tm8_tn8_bm128_bn64  │  18,566  │  29,870  │  35,233  │  35,872  │                          
+  ├─────────────────────┼──────────┼──────────┼──────────┼──────────┤                          
+  │ tm8_tn8_bm128_bn128 │  39,970  │  34,298  │  38,901  │  39,804  │                          
+  └─────────────────────┴──────────┴──────────┴──────────┴──────────┘        
+
+
+  Full table at 4096³ (GFLOPS), BK=16:
+  ┌─────────────────────┬──────────┬──────────┬──────────┬──────────┐
+  │       Kernel        │ unroll 1 │ unroll 2 │ unroll 4 │ unroll 8 │
+  ├─────────────────────┼──────────┼──────────┼──────────┼──────────┤
+  │ tm4_tn4_bm32_bn64   │  19,183  │  22,777  │  25,872  │  30,144  │
+  ├─────────────────────┼──────────┼──────────┼──────────┼──────────┤                                                                           
+  │ tm4_tn4_bm64_bn64   │  24,210  │  26,392  │  32,888  │  32,293  │
+  ├─────────────────────┼──────────┼──────────┼──────────┼──────────┤                                                                                                                     
+  │ tm8_tn4_bm64_bn64   │  24,273  │  27,632  │  29,983  │  35,494  │                                                                                                                         
+  ├─────────────────────┼──────────┼──────────┼──────────┼──────────┤                                                                                                                         
+  │ tm8_tn8_bm128_bn64  │  21,353  │  29,288  │  34,675  │  35,408  │                                                                                                                         
+  ├─────────────────────┼──────────┼──────────┼──────────┼──────────┤                                                                                                                         
+  │ tm8_tn8_bm128_bn128 │  26,271  │  33,854  │  38,083  │  35,890  │                                                                                                                         
+  └─────────────────────┴──────────┴──────────┴──────────┴──────────┘  

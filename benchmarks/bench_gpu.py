@@ -21,6 +21,16 @@ IMPLEMENTATIONS = {
     "cuda_tiled_32x32_32x4": ("mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x32_threads_32x4", None),
     "cuda_tiled_32x64_32x4": ("mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x64_threads_32x4", None),
     "cuda_tiled_32x64_tm4_tn4": ("mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x64_tm4_tn4", None),
+    # Stage 3: BK=32, unroll=8
+    **{f"s3_{k}_bk32_u8": (f"mymatmul.gpu.matmul_cuda_s3.matmul_s3_{k}_bk32_u8", None)
+       for k in ["tm4_tn4_bm32_bn64","tm4_tn4_bm64_bn64","tm8_tn4_bm64_bn64","tm8_tn8_bm128_bn64","tm8_tn8_bm128_bn128"]},
+    # Stage 3: BK=16, unroll=1,2,4,8
+    **{f"s3_{k}_bk16_u{u}": (f"mymatmul.gpu.matmul_cuda_s3.matmul_s3_{k}_bk16_u{u}", None)
+       for u in [1, 2, 4, 8]
+       for k in ["tm4_tn4_bm32_bn64","tm4_tn4_bm64_bn64","tm8_tn4_bm64_bn64","tm8_tn8_bm128_bn64","tm8_tn8_bm128_bn128"]},
+    # Stage 4: double-buffered with cp.async, BK=16
+    **{f"s4_{k}_bk16": (f"mymatmul.gpu.matmul_cuda_s4.matmul_s4_{k}_bk16", None)
+       for k in ["tm4_tn4_bm32_bn64","tm4_tn4_bm64_bn64","tm8_tn4_bm64_bn64","tm8_tn8_bm128_bn64","tm8_tn8_bm128_bn128"]},
 }
 
 SIZES = [64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096]
