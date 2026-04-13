@@ -143,5 +143,63 @@ should be at least as good as case 1, or even better!
 
 
 
+# Stage 3: Square Tile Sizes via Tx-Remap
+You've probably already noticed a tension: for coalesced memory access, we'd like the thread layout x-dim to be a multiple of 32 and accordingly the y-dim would typically be 4 or 8 because usually very large thread blocks (512 or 1024) could lower the occupancy; on the other hand, as we shall see soon, square tile sizes / micro-tile sizes achieve higher data reuse. The question is, how do we set BMxBN and TMxTN to be square-like while keeping the 32x4 or 32x8 physical thread layout? The trick here is a technique called `tx-remap`. 
 
- 
+The idea of `tx-remap` is to decouple data loading, computing and results write back. It assigns both a physical id (tx, ty) and a logical id to each thread (ltx, lty). 
+While the physical layout must be 32x4 or 32x8, the logical layout can be organized however you like. For example, to create a 16x16 logical layout from a 32x8 physical layout,
+you simply do:
+
+1. Compute the flattened id for each thread: `int tid = ty * blockDim.x + tx`
+2. Logical id is `int lty = tid / 16; int ltx = tid % 16;
+
+The physical id is used for cooperative loading, while the logical id is used for compute and write-back.
+
+Once we have this remap technique in place, let's explore more BM, BN, TM, TN combinations. We can first fix TM and TN because they affect register usage.
+To make register usage not too high, good candidates are 4x4, 4x8, 8x4. To push register reuse to an extreme, we can even try 8x8, though occupancy might be lower.
+
+For a general occupancy consideration, we will use 128 or 256 threads per CTA with 32x4 or 32x8 physical layout. By multiplying TM/TN with the thread layout, we get BM, BN.
+BK will stay 32 for now.
+
+For example, the following configurations are all worth trying (thread layouts are logical layouts):
+
+| TM | TN | Threads (logical) | BM | BN | SMEM AI | Reg AI | Regs/thread | SMEM/block | Active warps/SM | Occupancy |
+|----|----|----|----|----|---------|--------|-------------|------------|-----------------|-----------|
+| 4  | 4  | 16x8  (128t, phys 32x4) | 32 | 64 | 21.33 | 2    | 48  | 6144B  | 32 | 50%   |
+| 4  | 4  | 16x16 (256t, phys 32x8) | 64 | 64 | 32    | 2    | 48  | 8192B  | 40 | 62.5% |
+| 8  | 4  | 16x8  (128t, phys 32x4) | 64 | 64 | 32    | 2.67 | 65  | 8192B  | 24 | 37.5% |
+| 8  | 8  | 16x8  (128t, phys 32x4) |128 | 64 | 42.67 | 4    | 128 | 12288B | 16 | 25%   |
+| 8  | 8  | 16x16 (256t, phys 32x8) |128 |128 | 64    | 4    | 128 | 16384B | 16 | 25%   |
+
+Register and SMEM counts obtained by compiling with `nvcc -arch=sm_89 -O3 -Xptxas -v` on RTX 4090,
+with `#pragma unroll 4` applied consistently to all tile-loading loops (loading loops with many
+iterations must not be fully unrolled — doing so blows up register usage without benefit, since the
+loop body is memory-latency-bound not instruction-count-bound).
+
+Occupancy analysis (RTX 4090, SM 8.9):
+- SM limits: 65536 registers, 48KB SMEM (default), 64 warps (2048 threads), 32 blocks max
+- Register allocation granularity: 256 registers/warp → `ceil(regs × 32 / 256) × 256` per warp
+
+| Config | Regs limiter | SMEM limiter | Binding |
+|--------|-------------|--------------|---------|
+| TM=4,TN=4, 128t | 10 blocks → 40w | 8 blocks → 32w | **SMEM** → 32w |
+| TM=4,TN=4, 256t | 5 blocks → 40w | 6 blocks → 48w | **Regs** → 40w |
+| TM=8,TN=4, 128t | 7 blocks → 28w | 6 blocks → 24w | **SMEM** → 24w |
+| TM=8,TN=8, 128t | 4 blocks → 16w | 4 blocks → 16w | **Tie** → 16w  |
+| TM=8,TN=8, 256t | 2 blocks → 16w | 3 blocks → 24w | **Regs** → 16w |
+
+w = warps. Each row shows two limiters independently:                                                                 
+  - "10 blocks → 40w" means: if only registers were the constraint, you could fit 10 blocks on the SM, giving 10 × 4 warps/block = 40 active warps                                            
+  - "8 blocks → 32w" means: if only SMEM were the constraint, you could fit 8 blocks, giving 8 × 4 = 32 active warps                                                                          
+  - Binding = whichever limit is tighter (smaller warp count wins)           
+
+The register count is directly interpretable: TM×TN accumulators (float32) plus a small constant
+for loop variables and indices. 16 accumulators → 48 regs, 32 → 65 regs, 64 → 128 regs.
+
+As we increase BM/BN or TM/TN, data reuse keeps increasing. At TM=TN=8 with 16x16 logical layout,
+reuse for both SMEM and register become very high. However, the 64 float32 accumulators per thread
+(128 registers) halve the occupancy compared to TM=TN=4. The question is whether the higher
+arithmetic intensity (21-64 global, 2-4 register) compensates for the lower occupancy.
+
+
+The CUDA implementations for all 5 configs are in `mymatmul/gpu/_matmul_cuda_ext1.cu`.
