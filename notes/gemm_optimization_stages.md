@@ -144,10 +144,14 @@ block with 256 threads and uses more shared memory (`16*32 + 32*32` vs case 1's 
 
 Register and shared memory usage can be obtained just by compiler options `-Xptxas -v`. For RTX 4090, `nvcc -arch=sm_89 -O3 -Xptxas -v` would show the register and shared memory usage for your kernel.
 
-|        | SMEM   | Register |
-|--------|--------|----------|
-| Case 1 | 2560B  | 48       |
-| Case 2 | 3072B  | 40       |
+|        | SMEM   | Registers per Thread | Registers per Block|
+|--------|--------|--------------------- | -------------------|
+| Case 1 | 2560B  | 48                   | 6144               |
+| Case 2 | 3072B  | 40                   | 10240              |
+
+Registers usage will be the limiting factor here for both. With 65536 registers (RTX 4090), each SM can fit 
+10 blocks for case 1, and 6 for case 2. Due to case 2 has 2x thread count, it achieves a higher occupancy with 
+6 * 8 = 48 warps. On the other hand, case 1 achieves 10*4 = 40 warps.
 
 Case 2 wins on both fronts — higher occupancy (few register and SMEM usage per thread) and higher arithmetic intensity.
 
