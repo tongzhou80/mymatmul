@@ -1,6 +1,6 @@
-This repo is intended for optimizing GEMM (or matmul) step by step. 
-We do not distinguish GEMM from matmul in this documentation as their computations are exactly the same with GEMM adds a scaling factor and an offset when writing back 
-the results. The underlying optimization principles are identical. Matrix muliplication is used for illustration in this work.
+This repo shows a few stages in optimizing GEMM or matrix multiplication (matmul). 
+We do not distinguish GEMM from matmul in this documentation as their computations are basically the same except that GEMM adds a scaling factor and an offset when writing back 
+the results. The underlying optimization principles are identical. Thus, matrix muliplication is used for illustration in this work for simplicity.
  
 # Terminology
 Consider matrix muliplication (matmul) as 
