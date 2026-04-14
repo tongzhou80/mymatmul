@@ -167,13 +167,23 @@ BK will stay 32 for now.
 
 For example, the following configurations are all worth trying (thread layouts are logical layouts):
 
-| TM | TN | Threads (logical) | BM | BN | SMEM AI | Reg AI | Regs/thread | SMEM/block | Active warps/SM | Occupancy |
-|----|----|----|----|----|---------|--------|-------------|------------|-----------------|-----------|
-| 4  | 4  | 16x8  (128t, phys 32x4) | 32 | 64 | 21.33 | 2    | 48  | 6144B  | 32 | 50%   |
-| 4  | 4  | 16x16 (256t, phys 32x8) | 64 | 64 | 32    | 2    | 48  | 8192B  | 40 | 62.5% |
-| 8  | 4  | 16x8  (128t, phys 32x4) | 64 | 64 | 32    | 2.67 | 65  | 8192B  | 24 | 37.5% |
-| 8  | 8  | 16x8  (128t, phys 32x4) |128 | 64 | 42.67 | 4    | 128 | 12288B | 16 | 25%   |
-| 8  | 8  | 16x16 (256t, phys 32x8) |128 |128 | 64    | 4    | 128 | 16384B | 16 | 25%   |
+| TM | TN | Threads (logical)       | BM  | BN  | SMEM AI | Reg AI |
+|----|----|----|-----|-----|---------|--------|
+| 4  | 4  | 16x8  (128t, phys 32x4) | 32  | 64  | 21.33   | 2      |
+| 4  | 4  | 16x16 (256t, phys 32x8) | 64  | 64  | 32      | 2      |
+| 8  | 4  | 16x8  (128t, phys 32x4) | 64  | 64  | 32      | 2.67   |
+| 8  | 8  | 16x8  (128t, phys 32x4) | 128 | 64  | 42.67   | 4      |
+| 8  | 8  | 16x16 (256t, phys 32x8) | 128 | 128 | 64      | 4      |
+
+Occupancy breakdown:
+
+| TM | TN | Threads (logical)       | Regs/thread | SMEM/block | Active warps/SM | Occupancy |
+|----|----|----|-------------|------------|-----------------|-----------|
+| 4  | 4  | 16x8  (128t, phys 32x4) | 48          | 6144B      | 32              | 50%       |
+| 4  | 4  | 16x16 (256t, phys 32x8) | 48          | 8192B      | 40              | 62.5%     |
+| 8  | 4  | 16x8  (128t, phys 32x4) | 65          | 8192B      | 24              | 37.5%     |
+| 8  | 8  | 16x8  (128t, phys 32x4) | 128         | 12288B     | 16              | 25%       |
+| 8  | 8  | 16x16 (256t, phys 32x8) | 128         | 16384B     | 16              | 25%       |
 
 Register and SMEM counts obtained by compiling with `nvcc -arch=sm_89 -O3 -Xptxas -v` on RTX 4090,
 with `#pragma unroll 4` applied consistently to all tile-loading loops (loading loops with many
