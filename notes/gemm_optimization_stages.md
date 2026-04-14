@@ -144,8 +144,12 @@ block with 256 threads and uses more shared memory (`16*32 + 32*32` vs case 1's 
 
 Register and shared memory usage can be obtained just by compiler options `-Xptxas -v`. For RTX 4090, `nvcc -arch=sm_89 -O3 -Xptxas -v` would show the register and shared memory usage for your kernel.
 
+|        | SMEM   | Register |
+|--------|--------|----------|
+| Case 1 | 2560B  | 48       |
+| Case 2 | 3072B  | 40       |
 
-
+Case 2 wins on both fronts — higher occupancy (few register and SMEM usage per thread) and higher arithmetic intensity.
 
 # Stage 3: Square Tile Sizes via Tx-Remap
 You've probably already noticed a tension: for coalesced memory access, we'd like the thread layout x-dim to be a multiple of 32 and accordingly the y-dim would typically be 4 or 8 because usually very large thread blocks (512 or 1024) could lower the occupancy; on the other hand, as we shall see soon, square tile sizes / micro-tile sizes achieve higher data reuse. The question is, how do we set BMxBN and TMxTN to be square-like while keeping the 32x4 or 32x8 physical thread layout? The trick here is a technique called `tx-remap`. 
