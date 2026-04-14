@@ -23,29 +23,29 @@ for i in range(M):
             C[i,j] += A[i,k] * B[k,j] 
 ```
 
-We will start with a naive "outer i-j parallelized" version where we launch 2-D grid with 2-D thread layout, and each thread loops over the entire k-dim to 
-compute one output element. In CUDA style this would be
+We will start with a naive "outer i-j parallelized" version where we launch 2-D grid with 2-D thread layout, and each thread loops over the entire k dimension to compute one output element. In CUDA style this would be
 ```
 int i = blockDim.x * blockIdx.x + threadIdx.x;
 int j = blockDim.y * blockIdx.y + threadIdx.y;
 
 if (i < M && j < N) {
-    float acc = 0f;
-    for (int k = 0; k < K; k++) {
-	acc += ....;
-    }
-    C[i*N + j] = acc;
+  float acc = 0f;
+  for (int k = 0; k < K; k++) {
+    acc += ....;
+  }
+  C[i*N + j] = acc;
 }
 ``` 
-with a square thread layout, e.g. 16x16 thread block luanch.
 
-We then progress the optimizations in 4 stages:
+Whatever thread layout is fine to start with, but let's use a 16x16 thread block layout for now.
+
+From here, we will progress the optimizations in 4 stages:
 
 # Stage 1: Memory Coalescing
 The first optimization at this stage is to map the x-dim (thread layout dimension) to `j` instead of `i`, as `x-dim` is the fastest changing dimension in CUDA (a common
 confusing design to CUDA beginners!) so it should be mapped to the `j` dimension for more contiguous memory access patterns.
 
-```
+```c
 int j = blockDim.x * blockIdx.x + threadIdx.x;
 int i = blockDim.y * blockIdx.y + threadIdx.y;
 ```
@@ -73,7 +73,7 @@ be 8 and BN will be 32 (suppose the thread layout is 32x8, and remember x-dim co
 
 Putting it all together, the CUDA pseudocode is
 
-```cuda
+```c
 __shared__ A_tile[BM][BK];
 __shared__ B_tile[BK][BN];
 
@@ -98,6 +98,9 @@ for (int k = 0; k < K; k += BK) {
     for (int kk = 0; kk < BK; kk += 1) {
         acc += ...
     }
+
+    // The second necessary sync because otherwise other warps may proceed to load the next tile
+    __syncthreads(); 
 }
 
 // Write back
@@ -108,17 +111,15 @@ For kernel luanch, we still use a 32x8 thread layout.
 
 While this implementation alone won't achieve super high performance, it clearly shows the structure of shared memory tiling, and lays a foundation to explore increasing arith. intensity, as well as how that affects occupancy.
 
-The idea of increaing arith. intensity is simply doing more compute (FMA) per memory load. We can achieve this because matmul inherently contains data reuse opportunities! Now we have two knobs to play with - the tile sizes (BM, BN, BK) and the thread count and layout e.g. 32x8, or 32x4 or 16x16 etc. Tile sizes determine compute per global memory load while thread layout (and 
-the register reuse that comes with it) determines computer per shared memory load. In general, larger tile sizes give us more data reuse in shared memory while more work per thread give 
-us more data reuse in registers. But here's the thing - using two many registers per thread or too much shared memory per thread block could lower the occupancy, so there's a tradeoff 
-here. 
+The idea of increaing arith. intensity is simply doing more compute (FMA) per memory load. We can achieve this because matmul inherently contains data reuse opportunities! Now we have two knobs to play with - the tile sizes (BM, BN, BK) and the thread layout e.g. 32x8, or 32x4 or 16x16 etc. Tile sizes determine compute per global memory load while thread layout (and the register reuse that comes with it) determines # number of compute per shared memory load. We introduce two additional symbols for per-thread micro-tile: TM and TN which represent the output tile that each thread computes. 
 
-The simplest next step to explore data reuse is to keep the same tile sizes (BM=8, BN=32, BK=32), but change the thread layout to 32x4. This achives simple register reuse while shared memory usage stays the same. Alternatively, we can increase the tile sizes to BM=16, BN=32, BK=32 while keeping thread layout as 32x8 is. At this stage, we will do quantitiave analysis
-of arith. intensity vs occupancy. We will also introduce two additional symbols for per-thread micro-tile: TM and TN which represent the output tile that each thread computes. 
+By tuning TM, TN and BM, BN we achieve different arithmetic intensity for shared memory and global memory respectively. In general, larger TM/TN achieves higher shared memory arithmetic intensity but also uses more registers per thread, while larger BM/BN achieves higher global memory arithmetic intensity but use more shared memory per thread block. Using more resources could lower the occupancy, so there's a tradeoff.
 
-We now show how the arithmetic intensity is calculated.
 
-Case 1: BM=8, BN=32, BK=32, threads=32x4 => TM=2, TN=1
+The simplest next step to explore data reuse is to keep the same tile sizes (BM=8, BN=32, BK=32), but change the thread layout to 32x4. This achives simple register reuse while shared memory usage stays the same. Alternatively, we can increase the tile sizes to BM=16, BN=32, BK=32 while keeping thread layout as 32x8 is. With these two examples we show how arithmetic intensity and occupancy are calculated.
+
+
+## Case 1: BM=8, BN=32, BK=32, threads=32x4 => TM=2, TN=1
 
 Each thread now computes two output element (two vertical elements), the total # of output elements computed per CTA is 8 * 32.
 
@@ -132,14 +133,17 @@ So # of FMA per global memory load is 8 * 32 / (8 + 32) = 6.4, # of FMA per shar
 
 Basically the formula for global memory arith. intensity is BM * BN / (BM + BN) and for shared memory arith. intensity is TM * TN / (TM + TN).
 
-Case 2: BM=16, BN=32, BK=32, threads=32x8 => TM=2, TN=1
+## Case 2: BM=16, BN=32, BK=32, threads=32x8 => TM=2, TN=1
 
 TM and TN are identical to case 1 so the # of FMA per shared memory load is the same. And the global memory arith. intensity is (16 * 32) / (16 + 32) = 10.66!
-Wow a boost from previous 6.4! Why is that? Because 16x32 is more square-like than 8x32, and as we shall see later, a more square-like tile gives higher arith. intensity.
 
-However, now it comes to the tradeoff between arith. intensity and occupancy. Although case 2 achieve higher arithmetic intensity but it does use a 2x as large thread 
-block with 256 threads and uses more shared memory (`16*32 + 32*32` vs case 1's `8*32 + 32*32`). But the increase in shared memory usage is less than 2x so the warp occupancy
-should be at least as good as case 1, or even better!  
+Wow a boost from previous 6.4! Why is that? Because 16x32 is more square-like than 8x32, and as we shall see later, a more square-like tile gives us higher arith. intensity.
+
+However, now it comes to the tradeoff. Although case 2 achieve higher arithmetic intensity but it does use a 2x as large thread 
+block with 256 threads and uses more shared memory (`16*32 + 32*32` vs case 1's `8*32 + 32*32`). But the increase in shared memory usage is less than 2x so the warp occupancy should be at least as good as case 1, or even better!  
+
+Register and shared memory usage can be obtained just by compiler options `-Xptxas -v`. For RTX 4090, `nvcc -arch=sm_89 -O3 -Xptxas -v` would show the register and shared memory usage for your kernel.
+
 
 
 
