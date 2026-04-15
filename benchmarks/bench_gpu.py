@@ -28,12 +28,18 @@ IMPLEMENTATIONS = {
     **{f"s3_{k}_bk16_u{u}": (f"mymatmul.gpu.matmul_cuda_s3.matmul_s3_{k}_bk16_u{u}", None)
        for u in [1, 2, 4, 8]
        for k in ["tm4_tn4_bm32_bn64","tm4_tn4_bm64_bn64","tm8_tn4_bm64_bn64","tm8_tn8_bm128_bn64","tm8_tn8_bm128_bn128"]},
-    # Stage 4: double-buffered with cp.async, BK=16
+    # Stage 4: double-buffered with cp.async, BK=16 (small configs: fixed full unroll)
     **{f"s4_{k}_bk16": (f"mymatmul.gpu.matmul_cuda_s4.matmul_s4_{k}_bk16", None)
-       for k in ["tm4_tn4_bm32_bn64","tm4_tn4_bm64_bn64","tm8_tn4_bm64_bn64","tm8_tn8_bm128_bn64","tm8_tn8_bm128_bn128"]},
+       for k in ["tm4_tn4_bm32_bn64","tm4_tn4_bm64_bn64","tm8_tn4_bm64_bn64"]},
+    # Stage 4: large configs, sweep compute-loop unroll 1,2,4,8,16
+    **{f"s4_{k}_bk16_u{u}": (f"mymatmul.gpu.matmul_cuda_s4.matmul_s4_{k}_bk16_u{u}", None)
+       for u in [1, 2, 4, 8, 16]
+       for k in ["tm8_tn8_bm128_bn64", "tm8_tn8_bm128_bn128"]},
+    # Stage 5: Tensor Core WMMA
+    "s5_wmma_bm128_bn128": ("mymatmul.gpu.matmul_cuda_s5.matmul_s5_wmma_bm128_bn128", None),
 }
 
-SIZES = [64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096]
+SIZES = [128, 256, 512, 1024, 2048, 4096, 8192]
 WARMUP_RUNS = 3
 TIMED_RUNS = 10
 
@@ -101,7 +107,10 @@ def validate_fn(fn, A_gpu, B_gpu, rtol=1e-2, atol=1e-1):
 
     max_abs = diff.max().item()
     mean_abs = diff.mean().item()
-    p99_abs = diff.quantile(0.99).item()
+    sample = diff.flatten()
+    if sample.numel() > 10_000_000:
+        sample = sample[torch.randperm(sample.numel(), device=sample.device)[:10_000_000]]
+    p99_abs = sample.quantile(0.99).item()
     max_rel = rel.max().item()
     mean_rel = rel.mean().item()
 

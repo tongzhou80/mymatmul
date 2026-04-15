@@ -1,8 +1,8 @@
 """Stage 3 CUDA matmul kernels: square tile sizes via tx-remap."""
 
 def _ext():
-    from . import _matmul_cuda_ext1
-    return _matmul_cuda_ext1
+    from . import _matmul_cuda_ext_s3
+    return _matmul_cuda_ext_s3
 
 def _make(name):
     def fn(A, B): return getattr(_ext(), name)(A, B)
