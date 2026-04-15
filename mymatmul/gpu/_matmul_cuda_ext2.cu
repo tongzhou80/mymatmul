@@ -25,7 +25,7 @@
  *
  * Constraint: M, N, K must be multiples of BM, BN, BK respectively.
  */
-template <typename scalar_t, int BM, int BN, int BK, int TM, int TN>
+template <typename scalar_t, int BM, int BN, int BK, int TM, int TN, int UNROLL>
 __global__ void matmul_s4(
     const scalar_t* __restrict__ A,
     const scalar_t* __restrict__ B,
@@ -101,7 +101,7 @@ __global__ void matmul_s4(
 
 #define COMPUTE_TILE(buf_)                                                              \
     do {                                                                                \
-        _Pragma("unroll")                                                               \
+        _Pragma("unroll UNROLL")                                                        \
         for (int _kk = 0; _kk < BK; _kk++) {                                           \
             float _a[TM], _b[TN];                                                       \
             _Pragma("unroll")                                                           \
@@ -155,7 +155,7 @@ __global__ void matmul_s4(
 }
 
 // ---- Launch wrapper macro (no UNROLL — load loops are 1-4 iters, compiler handles) ----
-#define MAKE_LAUNCHER_S4(NAME, BM, BN, BK, TM, TN)                                 \
+#define MAKE_LAUNCHER_S4(NAME, BM, BN, BK, TM, TN, UNROLL)                         \
 torch::Tensor NAME(torch::Tensor A, torch::Tensor B) {                              \
     TORCH_CHECK(A.is_cuda() && B.is_cuda(), "Inputs must be CUDA tensors");         \
     TORCH_CHECK(A.dtype() == B.dtype(), "Dtype mismatch");                          \
@@ -168,25 +168,45 @@ torch::Tensor NAME(torch::Tensor A, torch::Tensor B) {                          
     dim3 threads(32, THREADS / 32);                                                 \
     dim3 blocks((N + BN - 1) / BN, (M + BM - 1) / BM);                            \
     AT_DISPATCH_FLOAT_HALF_BF16(A.scalar_type(), #NAME, [&] {                      \
-        matmul_s4<scalar_t, BM, BN, BK, TM, TN><<<blocks, threads>>>(              \
+        matmul_s4<scalar_t, BM, BN, BK, TM, TN, UNROLL><<<blocks, threads>>>(      \
             A.data_ptr<scalar_t>(), B.data_ptr<scalar_t>(),                         \
             C.data_ptr<scalar_t>(), M, K, N);                                       \
     });                                                                             \
     return C;                                                                       \
 }
 
-// ---- Stage 4 instantiations: BK=16, same 5 configs as Stage 3 ----
-//                             NAME                              BM   BN  BK  TM  TN
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm4_tn4_bm32_bn64_bk16,         32,  64, 16,  4,  4)
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm4_tn4_bm64_bn64_bk16,         64,  64, 16,  4,  4)
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn4_bm64_bn64_bk16,         64,  64, 16,  8,  4)
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16,       128,  64, 16,  8,  8)
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16,      128, 128, 16,  8,  8)
+// ---- Stage 4 instantiations ----
+// Small configs: full unroll (BK=16 is short, register pressure is low)
+//                             NAME                                BM   BN  BK  TM  TN  UNROLL
+MAKE_LAUNCHER_S4(matmul_cuda_s4_tm4_tn4_bm32_bn64_bk16,          32,  64, 16,  4,  4,  16)
+MAKE_LAUNCHER_S4(matmul_cuda_s4_tm4_tn4_bm64_bn64_bk16,          64,  64, 16,  4,  4,  16)
+MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn4_bm64_bn64_bk16,          64,  64, 16,  8,  4,  16)
+
+// Large configs: sweep unroll 1,2,4,8,16 to study register vs ILP tradeoff
+MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u1,     128,  64, 16,  8,  8,   1)
+MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u2,     128,  64, 16,  8,  8,   2)
+MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u4,     128,  64, 16,  8,  8,   4)
+MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u8,     128,  64, 16,  8,  8,   8)
+MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u16,    128,  64, 16,  8,  8,  16)
+
+MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u1,    128, 128, 16,  8,  8,   1)
+MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u2,    128, 128, 16,  8,  8,   2)
+MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u4,    128, 128, 16,  8,  8,   4)
+MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u8,    128, 128, 16,  8,  8,   8)
+MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u16,   128, 128, 16,  8,  8,  16)
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("matmul_cuda_s4_tm4_tn4_bm32_bn64_bk16",  &matmul_cuda_s4_tm4_tn4_bm32_bn64_bk16);
-    m.def("matmul_cuda_s4_tm4_tn4_bm64_bn64_bk16",  &matmul_cuda_s4_tm4_tn4_bm64_bn64_bk16);
-    m.def("matmul_cuda_s4_tm8_tn4_bm64_bn64_bk16",  &matmul_cuda_s4_tm8_tn4_bm64_bn64_bk16);
-    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16", &matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16);
-    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16",&matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16);
+    m.def("matmul_cuda_s4_tm4_tn4_bm32_bn64_bk16",        &matmul_cuda_s4_tm4_tn4_bm32_bn64_bk16);
+    m.def("matmul_cuda_s4_tm4_tn4_bm64_bn64_bk16",        &matmul_cuda_s4_tm4_tn4_bm64_bn64_bk16);
+    m.def("matmul_cuda_s4_tm8_tn4_bm64_bn64_bk16",        &matmul_cuda_s4_tm8_tn4_bm64_bn64_bk16);
+    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u1",    &matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u1);
+    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u2",    &matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u2);
+    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u4",    &matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u4);
+    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u8",    &matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u8);
+    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u16",   &matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u16);
+    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u1",   &matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u1);
+    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u2",   &matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u2);
+    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u4",   &matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u4);
+    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u8",   &matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u8);
+    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u16",  &matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u16);
 }
