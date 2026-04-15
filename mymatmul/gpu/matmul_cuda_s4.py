@@ -1,8 +1,8 @@
 """Stage 4 CUDA matmul kernels: double-buffered with cp.async."""
 
 def _ext():
-    from . import _matmul_cuda_ext2
-    return _matmul_cuda_ext2
+    from . import _matmul_cuda_ext_s4
+    return _matmul_cuda_ext_s4
 
 def _make(name):
     def fn(A, B): return getattr(_ext(), name)(A, B)
