@@ -1,6 +1,23 @@
+# Install with: pip install -e . --no-build-isolation
+#
+# The --no-build-isolation flag is required because this package builds CUDA
+# extensions via torch.utils.cpp_extension, which must match your system's
+# CUDA version. pip's default isolated build environment installs a generic
+# torch that may be compiled against a different CUDA version, causing a
+# mismatch error at build time.
+#
+# Before installing, make sure you have the correct torch for your CUDA version:
+#   https://pytorch.org/get-started/locally/
+# e.g. for CUDA 12.1:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+
 from setuptools import setup, find_packages, Extension
 import numpy as np
 import os
+
+# Target only the local GPU architecture to speed up compilation.
+# Override by setting TORCH_CUDA_ARCH_LIST in the environment.
+os.environ.setdefault('TORCH_CUDA_ARCH_LIST', '8.9')  # RTX 4090
 
 # Check if CUDA is available for GPU extension
 cuda_available = os.environ.get('CUDA_HOME') or os.path.exists('/usr/local/cuda')
@@ -50,6 +67,16 @@ if cuda_available:
         )
         ext_modules.append(cuda_ext_s4)
 
+        cuda_ext_s4b = CUDAExtension(
+            "mymatmul.gpu._matmul_cuda_ext_s4b",
+            sources=["mymatmul/gpu/_matmul_cuda_ext_s4b.cu"],
+            extra_compile_args={
+                'cxx': ["-O3"],
+                'nvcc': ["-O3", "-std=c++17", "-Xptxas", "-v"],
+            },
+        )
+        ext_modules.append(cuda_ext_s4b)
+
         # cuda_ext2 = CUDAExtension(
         #     "mymatmul.gpu._matmul_cuda_ext2",
         #     sources=["mymatmul/gpu/_matmul_cuda_ext2.cu"],
@@ -79,6 +106,26 @@ if cuda_available:
             },
         )
         ext_modules.append(cuda_ext_s2)
+
+        cuda_ext_s3_warp = CUDAExtension(
+            "mymatmul.gpu._matmul_cuda_ext_s3_warp",
+            sources=["mymatmul/gpu/_matmul_cuda_ext_s3_warp.cu"],
+            extra_compile_args={
+                'cxx': ["-O3"],
+                'nvcc': ["-O3", "-std=c++17", "-Xptxas", "-v"],
+            },
+        )
+        ext_modules.append(cuda_ext_s3_warp)
+
+        cuda_ext_s4sw = CUDAExtension(
+            "mymatmul.gpu._matmul_cuda_ext_s4sw",
+            sources=["mymatmul/gpu/_matmul_cuda_ext_s4sw.cu"],
+            extra_compile_args={
+                'cxx': ["-O3"],
+                'nvcc': ["-O3", "-std=c++17", "-Xptxas", "-v"],
+            },
+        )
+        ext_modules.append(cuda_ext_s4sw)
     except ImportError:
         print("Warning: PyTorch CUDA extension not available, skipping GPU extension")
 

@@ -13,6 +13,21 @@ import torch
 # max_size: skip sizes larger than this (leaves empty cells in the results table)
 IMPLEMENTATIONS = {
     "torch_matmul": ("mymatmul.gpu.matmul_torch.matmul_torch",   None),
+    # cuBLAS FP32 with TF32 disabled (pure FP32 SIMT, comparable to our s4 kernels)
+    "cublas_fp32_notf32": ("mymatmul.gpu.matmul_torch.matmul_torch_fp32_notf32", None),
+    # Triton BF16 (tensor cores on Ada Lovelace — NOT comparable to our SIMT kernels)
+    "triton_matmul_autotuned":     ("mymatmul.gpu.matmul_triton.triton_matmul_autotuned",    None),
+    "triton_bm128_bn256_bk64":     ("mymatmul.gpu.matmul_triton.triton_matmul_bm128_bn256_bk64", None),
+    "triton_bm128_bn128_bk64":     ("mymatmul.gpu.matmul_triton.triton_matmul_bm128_bn128_bk64", None),
+    "triton_bm64_bn256_bk32":      ("mymatmul.gpu.matmul_triton.triton_matmul_bm64_bn256_bk32",  None),
+    "triton_bm128_bn64_bk64":      ("mymatmul.gpu.matmul_triton.triton_matmul_bm128_bn64_bk64",  None),
+    # Triton FP32 SIMT (allow_tf32=False) — directly comparable to our s4 CUDA kernels
+    "triton_fp32simt_bm128_bn128_bk16": ("mymatmul.gpu.matmul_triton.triton_fp32simt_bm128_bn128_bk16", None),
+    "triton_fp32simt_bm128_bn64_bk16":  ("mymatmul.gpu.matmul_triton.triton_fp32simt_bm128_bn64_bk16",  None),
+    "triton_fp32simt_bm64_bn64_bk16":   ("mymatmul.gpu.matmul_triton.triton_fp32simt_bm64_bn64_bk16",   None),
+    "triton_fp32simt_bm128_bn128_bk32": ("mymatmul.gpu.matmul_triton.triton_fp32simt_bm128_bn128_bk32", None),
+    "triton_fp32simt_bm128_bn64_bk32":  ("mymatmul.gpu.matmul_triton.triton_fp32simt_bm128_bn64_bk32",  None),
+    "triton_fp32simt_bm64_bn64_bk32":   ("mymatmul.gpu.matmul_triton.triton_fp32simt_bm64_bn64_bk32",   None),
     "cuda_naive_ijk": ("mymatmul.gpu.matmul_cuda.matmul_cuda_naive_ijk", None),
     "cuda_naive_ijk_jx": ("mymatmul.gpu.matmul_cuda.matmul_cuda_naive_ijk_jx", None),
     "cuda_tiled_32x32": ("mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x32", None),
@@ -34,9 +49,27 @@ IMPLEMENTATIONS = {
     # Stage 4: large configs, sweep compute-loop unroll 1,2,4,8,16
     **{f"s4_{k}_bk16_u{u}": (f"mymatmul.gpu.matmul_cuda_s4.matmul_s4_{k}_bk16_u{u}", None)
        for u in [1, 2, 4, 8, 16]
-       for k in ["tm8_tn8_bm128_bn64", "tm8_tn8_bm128_bn128"]},
+       for k in ["tm8_tn8_bm128_bn64", "tm8_tn8_bm128_bn128", "tm8_tn8_bm64_bn64"]},
+    # Stage 4b: Stage 4 + A_shared bank-conflict fix (BK+4 padding), BN=128 only
+    **{f"s4b_tm8_tn8_bm128_bn128_bk16_u{u}": (f"mymatmul.gpu.matmul_cuda_s4b.matmul_s4b_tm8_tn8_bm128_bn128_bk16_u{u}", None)
+       for u in [8, 16]},
     # Stage 5: Tensor Core WMMA
     "s5_wmma_bm128_bn128": ("mymatmul.gpu.matmul_cuda_s5.matmul_s5_wmma_bm128_bn128", None),
+    # Stage 4 + A-swizzle: XOR swizzle on A_shared to eliminate bank conflicts
+    **{f"s4sw_{k}_bk16_u{u}": (f"mymatmul.gpu.matmul_cuda_s4sw.matmul_s4sw_{k}_bk16_u{u}", None)
+       for u in [1, 2, 4, 8, 16]
+       for k in ["tm8_tn8_bm128_bn128", "tm8_tn8_bm128_bn64", "tm8_tn8_bm64_bn64"]},
+    # Stage 3 + warp tiling
+    **{f"s3w_{k}": (f"mymatmul.gpu.matmul_cuda_s3_warp.matmul_s3_warp_{k}", None)
+       for k in [
+           "tm8_tn8_bm128_bn128_bk32_wm64_wn32_u8",
+           "tm8_tn8_bm128_bn128_bk32_wm32_wn64_u8",
+           "tm8_tn8_bm128_bn64_bk32_wm64_wn32_u8",
+           "tm8_tn8_bm128_bn64_bk32_wm32_wn64_u8",
+           "tm8_tn4_bm64_bn64_bk32_wm32_wn32_u8",
+           "tm4_tn4_bm64_bn64_bk32_wm32_wn16_u8",
+           "tm4_tn4_bm32_bn64_bk32_wm16_wn32_u8",
+       ]},
 }
 
 SIZES = [128, 256, 512, 1024, 2048, 4096, 8192]
@@ -109,7 +142,8 @@ def validate_fn(fn, A_gpu, B_gpu, rtol=1e-2, atol=1e-1):
     mean_abs = diff.mean().item()
     sample = diff.flatten()
     if sample.numel() > 10_000_000:
-        sample = sample[torch.randperm(sample.numel(), device=sample.device)[:10_000_000]]
+        step = sample.numel() // 10_000_000
+        sample = sample[::step][:10_000_000]
     p99_abs = sample.quantile(0.99).item()
     max_rel = rel.max().item()
     mean_rel = rel.mean().item()

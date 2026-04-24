@@ -11,22 +11,30 @@
     )
 
 /*
- * Stage 4: Double-buffered matmul with async global→shared copies (cp.async)
+ * Stage 4b: Stage 4 + A_shared bank-conflict fix.
  *
- * Key changes vs Stage 3:
- *   - Shared memory doubled: A_shared[2][BM][BK], B_shared[2][BK][BN]
- *   - Global→shared loads use __pipeline_memcpy_async (cp.async, SM 8.0+)
- *   - UNROLL removed: load loops are small enough that the compiler handles them
- *   - Adaptive load granularity per tile (A_LOAD_BYTES, B_LOAD_BYTES):
- *       choose largest of {4, 8, 16} bytes that divides evenly per thread
- *   - A trailing __syncthreads() after COMPUTE_TILE is required: buffer nxt
- *     at iteration k+1 is the same as buffer cur at iteration k, so we must
- *     ensure all threads finish reading cur before the next ISSUE_TILE writes to it
+ * Change vs Stage 4:
+ *   A_shared[2][BM][BK + 4]   (was [BK])
  *
- * Constraint: M, N, K must be multiples of BM, BN, BK respectively.
+ * Why BK+4 (not BK+1):
+ *   cp.async requires the destination address to be aligned to the copy size.
+ *   With BF16 (2 bytes/elem), row stride = (BK+P)*2 bytes.
+ *   For 8-byte cp.async: need (BK+P)*2 % 8 = 0 → (BK+P) % 4 = 0.
+ *   For bank-conflict fix: need 4*(BK+P) % 32 ≠ 0 → (BK+P) % 8 ≠ 0.
+ *   These two together require (BK+P) ≡ 4 (mod 8) → minimum P=4.
+ *   With P=4: row stride = 40 bytes (8-byte aligned ✓), bank_diff = 16 (≠ 0 ✓).
+ *
+ * Consequence: A_LOAD_BYTES is capped at 8 (was 16). A_GROUPS doubles (2 instead of 1).
+ *   The padding column is never read or written; it only widens the physical row stride.
+ *
+ * Why this fixes the conflict:
+ *   Without padding, row stride 32 bytes = 8 banks. Rows TM=8 apart shift by
+ *   8×8=64 banks ≡ 0 (mod 32): they land on the same bank.
+ *   With P=4, row stride 40 bytes = 10 banks. Rows 8 apart shift by 8×10=80 ≡ 16 (mod 32):
+ *   always a different bank.
  */
 template <typename scalar_t, int BM, int BN, int BK, int TM, int TN, int UNROLL>
-__global__ void matmul_s4(
+__global__ void matmul_s4b(
     const scalar_t* __restrict__ A,
     const scalar_t* __restrict__ B,
     scalar_t* __restrict__ C,
@@ -35,27 +43,25 @@ __global__ void matmul_s4(
     constexpr int THREADS  = (BM / TM) * (BN / TN);
     constexpr int LCOLS    = BN / TN;
 
-    // Adaptive load size: largest of {4, 8, 16} bytes that evenly divides per-thread load.
-    // For a tile of total_bytes = BM*BK*sizeof(scalar_t), each thread loads
-    // total_bytes/THREADS bytes. We pick the largest power-of-two load <= that and <= 16.
+    // A: cap at 8 bytes to maintain 8-byte alignment with BK+4 row stride.
     constexpr int A_THREAD_BYTES = BM * BK * (int)sizeof(scalar_t) / THREADS;
-    constexpr int A_LOAD_BYTES   = (A_THREAD_BYTES >= 16) ? 16 : (A_THREAD_BYTES >= 8) ? 8 : 4;
-    constexpr int A_ELEM         = A_LOAD_BYTES / (int)sizeof(scalar_t);   // elements per copy
-    constexpr int A_GROUPS       = BM * BK / A_ELEM / THREADS;             // copies per thread
+    constexpr int A_LOAD_BYTES   = (A_THREAD_BYTES >= 8) ? 8 : 4;
+    constexpr int A_ELEM         = A_LOAD_BYTES / (int)sizeof(scalar_t);
+    constexpr int A_GROUPS       = BM * BK / A_ELEM / THREADS;
 
+    // B: unchanged adaptive load size.
     constexpr int B_THREAD_BYTES = BK * BN * (int)sizeof(scalar_t) / THREADS;
     constexpr int B_LOAD_BYTES   = (B_THREAD_BYTES >= 16) ? 16 : (B_THREAD_BYTES >= 8) ? 8 : 4;
     constexpr int B_ELEM         = B_LOAD_BYTES / (int)sizeof(scalar_t);
     constexpr int B_GROUPS       = BK * BN / B_ELEM / THREADS;
 
-    // Double-buffered shared memory
-    __shared__ scalar_t A_shared[2][BM][BK];
+    // BK+4 padding on A eliminates bank conflicts (see file header).
+    __shared__ scalar_t A_shared[2][BM][BK + 4];
     __shared__ scalar_t B_shared[2][BK][BN];
 
     const int tx  = threadIdx.x, ty = threadIdx.y;
     const int tid = ty * blockDim.x + tx;
 
-    // Logical remap for output assignment
     const int ltx = tid % LCOLS, lty = tid / LCOLS;
 
     const int block_row = blockIdx.y * BM;
@@ -64,19 +70,6 @@ __global__ void matmul_s4(
     const int col_start = block_col + ltx * TN;
 
     float acc[TM][TN] = {};
-
-    // ---- Async tile loader and compute macros ----
-    // ISSUE_TILE: each thread issues A_GROUPS cp.async for A and B_GROUPS for B,
-    //   then commits the group. Load size is A_LOAD_BYTES / B_LOAD_BYTES bytes each.
-    //   The source/destination addresses are derived from the per-thread group index.
-    //
-    //   A tile (BM×BK, row-major): group g → elems [g*A_ELEM .. g*A_ELEM+A_ELEM-1]
-    //     r = (g * A_ELEM) / BK,  c = (g * A_ELEM) % BK
-    //   B tile (BK×BN, row-major): group g → elems [g*B_ELEM .. g*B_ELEM+B_ELEM-1]
-    //     r = (g * B_ELEM) / BN,  c = (g * B_ELEM) % BN
-    //
-    // Alignment: A_ELEM divides BK (power-of-2 tile dims), B_ELEM divides BN,
-    //   and block_row/col/k0 are multiples of BM/BN/BK → always aligned. ✓
 
 #define ISSUE_TILE(k0_, buf_)                                                           \
     do {                                                                                \
@@ -120,23 +113,18 @@ __global__ void matmul_s4(
 
     const int num_tiles = K / BK;
 
-    // Prefetch tile 0 → buffer 0
     ISSUE_TILE(0, 0);
 
-    // Main loop: prefetch tile k+1 into nxt, wait for tile k in cur, compute tile k.
-    // Trailing __syncthreads() after COMPUTE_TILE is required: nxt_{k+1} = cur_k,
-    // so we must ensure all threads finish reading cur before the next ISSUE_TILE.
     for (int k_iter = 0; k_iter < num_tiles - 1; k_iter++) {
         const int cur = k_iter & 1;
         const int nxt = 1 - cur;
         ISSUE_TILE((k_iter + 1) * BK, nxt);
-        __pipeline_wait_prior(1);   // wait for tile k (cur) to be ready
+        __pipeline_wait_prior(1);
         __syncthreads();
         COMPUTE_TILE(cur);
-        __syncthreads();            // protect cur: next ISSUE_TILE will overwrite it as nxt
+        __syncthreads();
     }
 
-    // Last tile
     __pipeline_wait_prior(0);
     __syncthreads();
     COMPUTE_TILE((num_tiles - 1) & 1);
@@ -144,7 +132,6 @@ __global__ void matmul_s4(
 #undef ISSUE_TILE
 #undef COMPUTE_TILE
 
-    // Write back
     #pragma unroll
     for (int i = 0; i < TM; i++)
         #pragma unroll
@@ -154,8 +141,7 @@ __global__ void matmul_s4(
         }
 }
 
-// ---- Launch wrapper macro (no UNROLL — load loops are 1-4 iters, compiler handles) ----
-#define MAKE_LAUNCHER_S4(NAME, BM, BN, BK, TM, TN, UNROLL)                         \
+#define MAKE_LAUNCHER_S4B(NAME, BM, BN, BK, TM, TN, UNROLL)                        \
 torch::Tensor NAME(torch::Tensor A, torch::Tensor B) {                              \
     TORCH_CHECK(A.is_cuda() && B.is_cuda(), "Inputs must be CUDA tensors");         \
     TORCH_CHECK(A.dtype() == B.dtype(), "Dtype mismatch");                          \
@@ -168,57 +154,20 @@ torch::Tensor NAME(torch::Tensor A, torch::Tensor B) {                          
     dim3 threads(32, THREADS / 32);                                                 \
     dim3 blocks((N + BN - 1) / BN, (M + BM - 1) / BM);                            \
     AT_DISPATCH_FLOAT_HALF_BF16(A.scalar_type(), #NAME, [&] {                      \
-        matmul_s4<scalar_t, BM, BN, BK, TM, TN, UNROLL><<<blocks, threads>>>(      \
+        matmul_s4b<scalar_t, BM, BN, BK, TM, TN, UNROLL><<<blocks, threads>>>(     \
             A.data_ptr<scalar_t>(), B.data_ptr<scalar_t>(),                         \
             C.data_ptr<scalar_t>(), M, K, N);                                       \
     });                                                                             \
     return C;                                                                       \
 }
 
-// ---- Stage 4 instantiations ----
-// Small configs: full unroll (BK=16 is short, register pressure is low)
-//                             NAME                                BM   BN  BK  TM  TN  UNROLL
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm4_tn4_bm32_bn64_bk16,          32,  64, 16,  4,  4,  16)
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm4_tn4_bm64_bn64_bk16,          64,  64, 16,  4,  4,  16)
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn4_bm64_bn64_bk16,          64,  64, 16,  8,  4,  16)
-
-// Large configs: sweep unroll 1,2,4,8,16 to study register vs ILP tradeoff
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u1,     128,  64, 16,  8,  8,   1)
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u2,     128,  64, 16,  8,  8,   2)
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u4,     128,  64, 16,  8,  8,   4)
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u8,     128,  64, 16,  8,  8,   8)
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u16,    128,  64, 16,  8,  8,  16)
-
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u1,    128, 128, 16,  8,  8,   1)
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u2,    128, 128, 16,  8,  8,   2)
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u4,    128, 128, 16,  8,  8,   4)
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u8,    128, 128, 16,  8,  8,   8)
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u16,   128, 128, 16,  8,  8,  16)
-
-// BM=BN=64, TM=TN=8: 64 threads/block, ~5 blocks/SM, same FMA/load ratio as bm128_bn128
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u1,       64,  64, 16,  8,  8,   1)
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u2,       64,  64, 16,  8,  8,   2)
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u4,       64,  64, 16,  8,  8,   4)
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u8,       64,  64, 16,  8,  8,   8)
-MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u16,      64,  64, 16,  8,  8,  16)
+// BN=128 only: P=4 fully eliminates the 2-way A conflict (lty=0 vs lty=1 per warp).
+// BN=64 is omitted: it has 4-way A conflicts requiring P=2 + 4-byte cp.async (more overhead).
+//                             NAME                                  BM   BN  BK  TM  TN  UNROLL
+MAKE_LAUNCHER_S4B(matmul_cuda_s4b_tm8_tn8_bm128_bn128_bk16_u8,     128, 128, 16,  8,  8,   8)
+MAKE_LAUNCHER_S4B(matmul_cuda_s4b_tm8_tn8_bm128_bn128_bk16_u16,    128, 128, 16,  8,  8,  16)
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("matmul_cuda_s4_tm4_tn4_bm32_bn64_bk16",        &matmul_cuda_s4_tm4_tn4_bm32_bn64_bk16);
-    m.def("matmul_cuda_s4_tm4_tn4_bm64_bn64_bk16",        &matmul_cuda_s4_tm4_tn4_bm64_bn64_bk16);
-    m.def("matmul_cuda_s4_tm8_tn4_bm64_bn64_bk16",        &matmul_cuda_s4_tm8_tn4_bm64_bn64_bk16);
-    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u1",    &matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u1);
-    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u2",    &matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u2);
-    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u4",    &matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u4);
-    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u8",    &matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u8);
-    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u16",   &matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u16);
-    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u1",   &matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u1);
-    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u2",   &matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u2);
-    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u4",   &matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u4);
-    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u8",   &matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u8);
-    m.def("matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u16",  &matmul_cuda_s4_tm8_tn8_bm128_bn128_bk16_u16);
-    m.def("matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u1",     &matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u1);
-    m.def("matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u2",     &matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u2);
-    m.def("matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u4",     &matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u4);
-    m.def("matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u8",     &matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u8);
-    m.def("matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u16",    &matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u16);
+    m.def("matmul_cuda_s4b_tm8_tn8_bm128_bn128_bk16_u8",   &matmul_cuda_s4b_tm8_tn8_bm128_bn128_bk16_u8);
+    m.def("matmul_cuda_s4b_tm8_tn8_bm128_bn128_bk16_u16",  &matmul_cuda_s4b_tm8_tn8_bm128_bn128_bk16_u16);
 }
