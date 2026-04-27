@@ -1,14 +1,5 @@
-#include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cuda_pipeline_primitives.h>
-
-// Dispatch for float, half, bfloat16 only
-#define AT_DISPATCH_FLOAT_HALF_BF16(TYPE, NAME, ...) \
-    AT_DISPATCH_SWITCH(TYPE, NAME,                   \
-        AT_DISPATCH_CASE(at::ScalarType::Float,      __VA_ARGS__) \
-        AT_DISPATCH_CASE(at::ScalarType::Half,       __VA_ARGS__) \
-        AT_DISPATCH_CASE(at::ScalarType::BFloat16,   __VA_ARGS__) \
-    )
 
 /*
  * Stage 4b: Stage 4 + A_shared bank-conflict fix.
@@ -33,31 +24,31 @@
  *   With P=4, row stride 40 bytes = 10 banks. Rows 8 apart shift by 8×10=80 ≡ 16 (mod 32):
  *   always a different bank.
  */
-template <typename scalar_t, int BM, int BN, int BK, int TM, int TN, int UNROLL>
-__global__ void matmul_s4b(
-    const scalar_t* __restrict__ A,
-    const scalar_t* __restrict__ B,
-    scalar_t* __restrict__ C,
+template <int BM, int BN, int BK, int TM, int TN, int UNROLL>
+__device__ __forceinline__ void matmul_s4b_impl(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
     int M, int K, int N
 ) {
     constexpr int THREADS  = (BM / TM) * (BN / TN);
     constexpr int LCOLS    = BN / TN;
 
     // A: cap at 8 bytes to maintain 8-byte alignment with BK+4 row stride.
-    constexpr int A_THREAD_BYTES = BM * BK * (int)sizeof(scalar_t) / THREADS;
+    constexpr int A_THREAD_BYTES = BM * BK * (int)sizeof(float) / THREADS;
     constexpr int A_LOAD_BYTES   = (A_THREAD_BYTES >= 8) ? 8 : 4;
-    constexpr int A_ELEM         = A_LOAD_BYTES / (int)sizeof(scalar_t);
+    constexpr int A_ELEM         = A_LOAD_BYTES / (int)sizeof(float);
     constexpr int A_GROUPS       = BM * BK / A_ELEM / THREADS;
 
     // B: unchanged adaptive load size.
-    constexpr int B_THREAD_BYTES = BK * BN * (int)sizeof(scalar_t) / THREADS;
+    constexpr int B_THREAD_BYTES = BK * BN * (int)sizeof(float) / THREADS;
     constexpr int B_LOAD_BYTES   = (B_THREAD_BYTES >= 16) ? 16 : (B_THREAD_BYTES >= 8) ? 8 : 4;
-    constexpr int B_ELEM         = B_LOAD_BYTES / (int)sizeof(scalar_t);
+    constexpr int B_ELEM         = B_LOAD_BYTES / (int)sizeof(float);
     constexpr int B_GROUPS       = BK * BN / B_ELEM / THREADS;
 
     // BK+4 padding on A eliminates bank conflicts (see file header).
-    __shared__ scalar_t A_shared[2][BM][BK + 4];
-    __shared__ scalar_t B_shared[2][BK][BN];
+    __shared__ float A_shared[2][BM][BK + 4];
+    __shared__ float B_shared[2][BK][BN];
 
     const int tx  = threadIdx.x, ty = threadIdx.y;
     const int tid = ty * blockDim.x + tx;
@@ -137,28 +128,15 @@ __global__ void matmul_s4b(
         #pragma unroll
         for (int j = 0; j < TN; j++) {
             const int gr = row_start + i, gc = col_start + j;
-            if (gr < M && gc < N) C[gr * N + gc] = (scalar_t)acc[i][j];
+            if (gr < M && gc < N) C[gr * N + gc] = acc[i][j];
         }
 }
 
 #define MAKE_LAUNCHER_S4B(NAME, BM, BN, BK, TM, TN, UNROLL)                        \
-torch::Tensor NAME(torch::Tensor A, torch::Tensor B) {                              \
-    TORCH_CHECK(A.is_cuda() && B.is_cuda(), "Inputs must be CUDA tensors");         \
-    TORCH_CHECK(A.dtype() == B.dtype(), "Dtype mismatch");                          \
-    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "Inputs must be 2D");                \
-    TORCH_CHECK(A.size(1) == B.size(0), "Inner dimensions must match");             \
-    TORCH_CHECK(A.is_contiguous() && B.is_contiguous(), "Must be contiguous");      \
-    constexpr int THREADS = (BM / TM) * (BN / TN);                                 \
-    const int M = A.size(0), K = A.size(1), N = B.size(1);                         \
-    auto C = torch::zeros({M, N}, A.options());                                     \
-    dim3 threads(32, THREADS / 32);                                                 \
-    dim3 blocks((N + BN - 1) / BN, (M + BM - 1) / BM);                            \
-    AT_DISPATCH_FLOAT_HALF_BF16(A.scalar_type(), #NAME, [&] {                      \
-        matmul_s4b<scalar_t, BM, BN, BK, TM, TN, UNROLL><<<blocks, threads>>>(     \
-            A.data_ptr<scalar_t>(), B.data_ptr<scalar_t>(),                         \
-            C.data_ptr<scalar_t>(), M, K, N);                                       \
-    });                                                                             \
-    return C;                                                                       \
+extern "C" __global__ void NAME(                                                    \
+    const float* __restrict__ A, const float* __restrict__ B,                      \
+    float* __restrict__ C, int M, int K, int N) {                                   \
+    matmul_s4b_impl<BM, BN, BK, TM, TN, UNROLL>(A, B, C, M, K, N);                \
 }
 
 // BN=128 only: P=4 fully eliminates the 2-way A conflict (lty=0 vs lty=1 per warp).
@@ -167,7 +145,3 @@ torch::Tensor NAME(torch::Tensor A, torch::Tensor B) {                          
 MAKE_LAUNCHER_S4B(matmul_cuda_s4b_tm8_tn8_bm128_bn128_bk16_u8,     128, 128, 16,  8,  8,   8)
 MAKE_LAUNCHER_S4B(matmul_cuda_s4b_tm8_tn8_bm128_bn128_bk16_u16,    128, 128, 16,  8,  8,  16)
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("matmul_cuda_s4b_tm8_tn8_bm128_bn128_bk16_u8",   &matmul_cuda_s4b_tm8_tn8_bm128_bn128_bk16_u8);
-    m.def("matmul_cuda_s4b_tm8_tn8_bm128_bn128_bk16_u16",  &matmul_cuda_s4b_tm8_tn8_bm128_bn128_bk16_u16);
-}

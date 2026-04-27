@@ -1,4 +1,3 @@
-#include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <mma.h>
@@ -59,7 +58,7 @@ constexpr int S5_WTILES_N = S5_WN / S5_WMMA_N;         // 2
 constexpr int S5_K_STEPS  = S5_BK / S5_WMMA_K;         // 2
 constexpr int S5_THREADS  = S5_WARPS_M * S5_WARPS_N * 32; // 256
 
-__global__ void matmul_s5_wmma_bm128_bn128_bk32(
+extern "C" __global__ void matmul_s5_wmma_bm128_bn128_bk32(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
     __nv_bfloat16* __restrict__ C,
@@ -166,34 +165,3 @@ __global__ void matmul_s5_wmma_bm128_bn128_bk32(
 }
 
 
-// ---------------------------------------------------------------------------
-// PyTorch dispatch wrapper
-// ---------------------------------------------------------------------------
-torch::Tensor matmul_s5_wmma_bm128_bn128(torch::Tensor A, torch::Tensor B) {
-    TORCH_CHECK(A.is_cuda() && B.is_cuda(), "Inputs must be CUDA tensors");
-    TORCH_CHECK(A.dtype() == torch::kBFloat16, "Only bfloat16 supported");
-    TORCH_CHECK(A.is_contiguous() && B.is_contiguous(), "Inputs must be contiguous");
-
-    const int M = A.size(0), K = A.size(1), N = B.size(1);
-    auto C = torch::zeros({M, N}, A.options());
-
-    dim3 threads(32, 8);   // 256 threads, 8 warps
-    dim3 blocks((N + S5_BN - 1) / S5_BN, (M + S5_BM - 1) / S5_BM);
-
-    matmul_s5_wmma_bm128_bn128_bk32<<<blocks, threads>>>(
-        reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(B.data_ptr()),
-        reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-        M, K, N
-    );
-    return C;
-}
-
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "Stage 5: Tensor Core WMMA — BM=BN=128, BK=32, 2x4 warp layout";
-    m.def("matmul_s5_wmma_bm128_bn128",
-          &matmul_s5_wmma_bm128_bn128,
-          "WMMA bf16 kernel: BM=128,BN=128,BK=32, WARPS_M=2,WARPS_N=4, "
-          "4x2 wmma tiles per warp (16x16x16 each)");
-}

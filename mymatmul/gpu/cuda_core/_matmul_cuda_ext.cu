@@ -1,11 +1,9 @@
-#include <torch/extension.h>
 #include <cuda_runtime.h>
 
 /* Naive 2D grid: each thread (i,j) computes the full k reduction
    Uses float32 accumulator for better numerical stability with float16 inputs */
-template <typename scalar_t>
-__global__ void matmul_naive_ijk_2d_grid(
-    const scalar_t* A, const scalar_t* B, scalar_t* C,
+extern "C" __global__ void matmul_naive_ijk_2d_grid(
+    const float* A, const float* B, float* C,
     int M, int K, int N
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -16,41 +14,15 @@ __global__ void matmul_naive_ijk_2d_grid(
         for (int k = 0; k < K; k++) {
             sum += (float)A[i*K + k] * (float)B[k*N + j];
         }
-        C[i*N + j] = (scalar_t)sum;  // Convert back to input dtype
+        C[i*N + j] = (float)sum;  // Convert back to input dtype
     }
 }
 
-torch::Tensor matmul_cuda_naive_ijk(torch::Tensor A, torch::Tensor B) {
-    TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
-    TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
-    TORCH_CHECK(A.dtype() == B.dtype(), "A and B must have the same dtype");
-
-    int M = A.size(0);
-    int K = A.size(1);
-    int N = B.size(1);
-
-    auto C = torch::zeros({M, N}, A.options());
-
-    dim3 threads(16, 16);  // 16x16 = 256 threads per block
-    dim3 blocks((M + 15) / 16, (N + 15) / 16);
-
-    AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, A.scalar_type(), "matmul_naive_ijk", [&] {
-        matmul_naive_ijk_2d_grid<scalar_t><<<blocks, threads>>>(
-            A.data_ptr<scalar_t>(),
-            B.data_ptr<scalar_t>(),
-            C.data_ptr<scalar_t>(),
-            M, K, N
-        );
-    });
-
-    return C;
-}
 
 /* Naive 2D grid with improved thread mapping: j to x (fastest-changing in row-major)
    Maps j (column, fastest-changing in C layout) to x (fastest CUDA dimension) */
-template <typename scalar_t>
-__global__ void matmul_naive_ijk_2d_grid_jx(
-    const scalar_t* A, const scalar_t* B, scalar_t* C,
+extern "C" __global__ void matmul_naive_ijk_2d_grid_jx(
+    const float* A, const float* B, float* C,
     int M, int K, int N
 ) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;  // x dimension (changes fastest)
@@ -61,35 +33,10 @@ __global__ void matmul_naive_ijk_2d_grid_jx(
         for (int k = 0; k < K; k++) {
             sum += (float)A[i*K + k] * (float)B[k*N + j];
         }
-        C[i*N + j] = (scalar_t)sum;  // Convert back to input dtype
+        C[i*N + j] = (float)sum;  // Convert back to input dtype
     }
 }
 
-torch::Tensor matmul_cuda_naive_ijk_jx(torch::Tensor A, torch::Tensor B) {
-    TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
-    TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
-    TORCH_CHECK(A.dtype() == B.dtype(), "A and B must have the same dtype");
-
-    int M = A.size(0);
-    int K = A.size(1);
-    int N = B.size(1);
-
-    auto C = torch::zeros({M, N}, A.options());
-
-    dim3 threads(16, 16);  // 16x16 = 256 threads per block
-    dim3 blocks((N + 15) / 16, (M + 15) / 16);  // Swapped: x for N, y for M
-
-    AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, A.scalar_type(), "matmul_naive_ijk_jx", [&] {
-        matmul_naive_ijk_2d_grid_jx<scalar_t><<<blocks, threads>>>(
-            A.data_ptr<scalar_t>(),
-            B.data_ptr<scalar_t>(),
-            C.data_ptr<scalar_t>(),
-            M, K, N
-        );
-    });
-
-    return C;
-}
 
 /* Tiled matmul: 32x32 tiles with shared memory
    Each thread (tx, ty) computes one element C[i,j] where:
@@ -98,14 +45,13 @@ torch::Tensor matmul_cuda_naive_ijk_jx(torch::Tensor A, torch::Tensor B) {
 
    For each K-tile, load 32x32 slice of A and B into shared memory,
    then accumulate 32 elements per iteration. */
-template <typename scalar_t>
-__global__ void matmul_tiled_32x32(
-    const scalar_t* A, const scalar_t* B, scalar_t* C,
+extern "C" __global__ void matmul_tiled_32x32(
+    const float* A, const float* B, float* C,
     int M, int K, int N
 ) {
     const int TILE_SIZE = 32;
-    __shared__ scalar_t A_shared[32][32];
-    __shared__ scalar_t B_shared[32][32];
+    __shared__ float A_shared[32][32];
+    __shared__ float B_shared[32][32];
 
     int i = blockIdx.y * TILE_SIZE + threadIdx.y;
     int j = blockIdx.x * TILE_SIZE + threadIdx.x;
@@ -147,35 +93,10 @@ __global__ void matmul_tiled_32x32(
 
     // Write result
     if (i < M && j < N) {
-        C[i * N + j] = (scalar_t)sum;
+        C[i * N + j] = (float)sum;
     }
 }
 
-torch::Tensor matmul_cuda_tiled_32x32(torch::Tensor A, torch::Tensor B) {
-    TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
-    TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
-    TORCH_CHECK(A.dtype() == B.dtype(), "A and B must have the same dtype");
-
-    int M = A.size(0);
-    int K = A.size(1);
-    int N = B.size(1);
-
-    auto C = torch::zeros({M, N}, A.options());
-
-    dim3 threads(32, 32);  // 32x32 = 1024 threads per block
-    dim3 blocks((N + 31) / 32, (M + 31) / 32);
-
-    AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, A.scalar_type(), "matmul_tiled_32x32", [&] {
-        matmul_tiled_32x32<scalar_t><<<blocks, threads>>>(
-            A.data_ptr<scalar_t>(),
-            B.data_ptr<scalar_t>(),
-            C.data_ptr<scalar_t>(),
-            M, K, N
-        );
-    });
-
-    return C;
-}
 
 /*
 16x16 threads per CTA, computing a 32x32 output tile.
@@ -201,9 +122,8 @@ Shared memory:
 Each thread loads 4 values into A_shared and 4 values into B_shared.
 Each thread accumulates 4 output values in float.
 */
-template <typename scalar_t>
-__global__ void matmul_tiled_32x32_16x16_threads(
-    const scalar_t* A, const scalar_t* B, scalar_t* C,
+extern "C" __global__ void matmul_tiled_32x32_16x16_threads(
+    const float* A, const float* B, float* C,
     int M, int K, int N
 ) {
     constexpr int BM = 32;   // C tile height
@@ -212,8 +132,8 @@ __global__ void matmul_tiled_32x32_16x16_threads(
     constexpr int TM = 2;    // per-thread rows
     constexpr int TN = 2;    // per-thread cols
 
-    __shared__ scalar_t A_shared[BM][BK];
-    __shared__ scalar_t B_shared[BK][BN];
+    __shared__ float A_shared[BM][BK];
+    __shared__ float B_shared[BK][BN];
 
     const int tx = threadIdx.x;   // 0..15
     const int ty = threadIdx.y;   // 0..15
@@ -245,28 +165,28 @@ __global__ void matmul_tiled_32x32_16x16_threads(
         if (row0 < M && (k0 + tx) < K) {
             A_shared[ty][tx] = A[row0 * K + (k0 + tx)];
         } else {
-            A_shared[ty][tx] = static_cast<scalar_t>(0);
+            A_shared[ty][tx] = static_cast<float>(0);
         }
 
         // A_shared[ty][tx+16] = A[row0][k0 + tx + 16]
         if (row0 < M && (k0 + tx + 16) < K) {
             A_shared[ty][tx + 16] = A[row0 * K + (k0 + tx + 16)];
         } else {
-            A_shared[ty][tx + 16] = static_cast<scalar_t>(0);
+            A_shared[ty][tx + 16] = static_cast<float>(0);
         }
 
         // A_shared[ty+16][tx] = A[row1][k0 + tx]
         if (row1 < M && (k0 + tx) < K) {
             A_shared[ty + 16][tx] = A[row1 * K + (k0 + tx)];
         } else {
-            A_shared[ty + 16][tx] = static_cast<scalar_t>(0);
+            A_shared[ty + 16][tx] = static_cast<float>(0);
         }
 
         // A_shared[ty+16][tx+16] = A[row1][k0 + tx + 16]
         if (row1 < M && (k0 + tx + 16) < K) {
             A_shared[ty + 16][tx + 16] = A[row1 * K + (k0 + tx + 16)];
         } else {
-            A_shared[ty + 16][tx + 16] = static_cast<scalar_t>(0);
+            A_shared[ty + 16][tx + 16] = static_cast<float>(0);
         }
 
         // ----------------------------
@@ -281,28 +201,28 @@ __global__ void matmul_tiled_32x32_16x16_threads(
         if ((k0 + ty) < K && col0 < N) {
             B_shared[ty][tx] = B[(k0 + ty) * N + col0];
         } else {
-            B_shared[ty][tx] = static_cast<scalar_t>(0);
+            B_shared[ty][tx] = static_cast<float>(0);
         }
 
         // B_shared[ty][tx+16] = B[k0 + ty][col1]
         if ((k0 + ty) < K && col1 < N) {
             B_shared[ty][tx + 16] = B[(k0 + ty) * N + col1];
         } else {
-            B_shared[ty][tx + 16] = static_cast<scalar_t>(0);
+            B_shared[ty][tx + 16] = static_cast<float>(0);
         }
 
         // B_shared[ty+16][tx] = B[k0 + ty + 16][col0]
         if ((k0 + ty + 16) < K && col0 < N) {
             B_shared[ty + 16][tx] = B[(k0 + ty + 16) * N + col0];
         } else {
-            B_shared[ty + 16][tx] = static_cast<scalar_t>(0);
+            B_shared[ty + 16][tx] = static_cast<float>(0);
         }
 
         // B_shared[ty+16][tx+16] = B[k0 + ty + 16][col1]
         if ((k0 + ty + 16) < K && col1 < N) {
             B_shared[ty + 16][tx + 16] = B[(k0 + ty + 16) * N + col1];
         } else {
-            B_shared[ty + 16][tx + 16] = static_cast<scalar_t>(0);
+            B_shared[ty + 16][tx + 16] = static_cast<float>(0);
         }
 
         __syncthreads();
@@ -330,55 +250,19 @@ __global__ void matmul_tiled_32x32_16x16_threads(
     // Write back 4 outputs
     // ----------------------------
     if (row0 < M && col0 < N) {
-        C[row0 * N + col0] = (scalar_t)acc00;
+        C[row0 * N + col0] = (float)acc00;
     }
     if (row0 < M && col1 < N) {
-        C[row0 * N + col1] = (scalar_t)acc01;
+        C[row0 * N + col1] = (float)acc01;
     }
     if (row1 < M && col0 < N) {
-        C[row1 * N + col0] = (scalar_t)acc10;
+        C[row1 * N + col0] = (float)acc10;
     }
     if (row1 < M && col1 < N) {
-        C[row1 * N + col1] = (scalar_t)acc11;
+        C[row1 * N + col1] = (float)acc11;
     }
 }
 
-torch::Tensor matmul_cuda_tiled_32x32_16x16_threads(torch::Tensor A, torch::Tensor B) {
-    TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
-    TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
-    TORCH_CHECK(A.dtype() == B.dtype(), "A and B must have the same dtype");
-    TORCH_CHECK(A.dim() == 2, "A must be 2D");
-    TORCH_CHECK(B.dim() == 2, "B must be 2D");
-    TORCH_CHECK(A.size(1) == B.size(0), "Inner dimensions must match");
-    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
-    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
-
-    const int M = A.size(0);
-    const int K = A.size(1);
-    const int N = B.size(1);
-
-    auto C = torch::zeros({M, N}, A.options());
-
-    dim3 threads(16, 16);                  // 256 threads
-    dim3 blocks((N + 31) / 32, (M + 31) / 32);   // each CTA computes a 32x32 tile
-
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        torch::kHalf,
-        torch::kBFloat16,
-        A.scalar_type(),
-        "matmul_tiled_32x32_16x16_threads",
-        [&] {
-            matmul_tiled_32x32_16x16_threads<scalar_t><<<blocks, threads>>>(
-                A.data_ptr<scalar_t>(),
-                B.data_ptr<scalar_t>(),
-                C.data_ptr<scalar_t>(),
-                M, K, N
-            );
-        }
-    );
-
-    return C;
-}
 
 /* Tiled matmul: 32x32 tiles with 32x8 warp-aligned thread layout
    Each thread computes a 4x1 micro-tile, one warp owns a full row stripe.
@@ -401,17 +285,16 @@ torch::Tensor matmul_cuda_tiled_32x32_16x16_threads(torch::Tensor A, torch::Tens
    - 16x16: Warp spans 2 rows, causing B_shared bank conflicts across rows
    - 32x8: Warp stays in one row, no conflicts in B_shared reads
 */
-template <typename scalar_t>
-__global__ void matmul_tiled_32x32_32x8_threads(
-    const scalar_t* A, const scalar_t* B, scalar_t* C,
+extern "C" __global__ void matmul_tiled_32x32_32x8_threads(
+    const float* A, const float* B, float* C,
     int M, int K, int N
 ) {
     constexpr int BM = 32;   // C tile height
     constexpr int BN = 32;   // C tile width
     constexpr int BK = 32;   // K tile depth
 
-    __shared__ scalar_t A_shared[BM][BK];
-    __shared__ scalar_t B_shared[BK][BN];
+    __shared__ float A_shared[BM][BK];
+    __shared__ float B_shared[BK][BN];
 
     const int tx = threadIdx.x;   // 0..31
     const int ty = threadIdx.y;   // 0..7
@@ -449,7 +332,7 @@ __global__ void matmul_tiled_32x32_32x8_threads(
             if (global_r < M && global_c < K) {
                 A_shared[r][c] = A[global_r * K + global_c];
             } else {
-                A_shared[r][c] = static_cast<scalar_t>(0);
+                A_shared[r][c] = static_cast<float>(0);
             }
         }
 
@@ -466,7 +349,7 @@ __global__ void matmul_tiled_32x32_32x8_threads(
             if (global_r < K && global_c < N) {
                 B_shared[r][c] = B[global_r * N + global_c];
             } else {
-                B_shared[r][c] = static_cast<scalar_t>(0);
+                B_shared[r][c] = static_cast<float>(0);
             }
         }
 
@@ -493,55 +376,19 @@ __global__ void matmul_tiled_32x32_32x8_threads(
 
     // Write back 4 outputs
     if (row0 < M && col0 < N) {
-        C[row0 * N + col0] = (scalar_t)acc0;
+        C[row0 * N + col0] = (float)acc0;
     }
     if (row1 < M && col0 < N) {
-        C[row1 * N + col0] = (scalar_t)acc1;
+        C[row1 * N + col0] = (float)acc1;
     }
     if (row2 < M && col0 < N) {
-        C[row2 * N + col0] = (scalar_t)acc2;
+        C[row2 * N + col0] = (float)acc2;
     }
     if (row3 < M && col0 < N) {
-        C[row3 * N + col0] = (scalar_t)acc3;
+        C[row3 * N + col0] = (float)acc3;
     }
 }
 
-torch::Tensor matmul_cuda_tiled_32x32_32x8_threads(torch::Tensor A, torch::Tensor B) {
-    TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
-    TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
-    TORCH_CHECK(A.dtype() == B.dtype(), "A and B must have the same dtype");
-    TORCH_CHECK(A.dim() == 2, "A must be 2D");
-    TORCH_CHECK(B.dim() == 2, "B must be 2D");
-    TORCH_CHECK(A.size(1) == B.size(0), "Inner dimensions must match");
-    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
-    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
-
-    const int M = A.size(0);
-    const int K = A.size(1);
-    const int N = B.size(1);
-
-    auto C = torch::zeros({M, N}, A.options());
-
-    dim3 threads(32, 8);                         // 256 threads, warp-aligned
-    dim3 blocks((N + 31) / 32, (M + 31) / 32);  // each CTA computes a 32x32 tile
-
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        torch::kHalf,
-        torch::kBFloat16,
-        A.scalar_type(),
-        "matmul_tiled_32x32_32x8_threads",
-        [&] {
-            matmul_tiled_32x32_32x8_threads<scalar_t><<<blocks, threads>>>(
-                A.data_ptr<scalar_t>(),
-                B.data_ptr<scalar_t>(),
-                C.data_ptr<scalar_t>(),
-                M, K, N
-            );
-        }
-    );
-
-    return C;
-}
 
 /* Tiled matmul: 32x32 tiles with 32x4 warp-aligned thread layout
    Each thread computes an 8x1 micro-tile, two warps own half the output tile.
@@ -565,17 +412,16 @@ torch::Tensor matmul_cuda_tiled_32x32_32x8_threads(torch::Tensor A, torch::Tenso
    - Fewer syncs per thread block
    - Very high register usage per thread (8 float accumulators)
 */
-template <typename scalar_t>
-__global__ void matmul_tiled_32x32_32x4_threads(
-    const scalar_t* A, const scalar_t* B, scalar_t* C,
+extern "C" __global__ void matmul_tiled_32x32_32x4_threads(
+    const float* A, const float* B, float* C,
     int M, int K, int N
 ) {
     constexpr int BM = 32;   // C tile height
     constexpr int BN = 32;   // C tile width
     constexpr int BK = 32;   // K tile depth
 
-    __shared__ scalar_t A_shared[BM][BK];
-    __shared__ scalar_t B_shared[BK][BN];
+    __shared__ float A_shared[BM][BK];
+    __shared__ float B_shared[BK][BN];
 
     const int tx = threadIdx.x;   // 0..31
     const int ty = threadIdx.y;   // 0..3
@@ -621,7 +467,7 @@ __global__ void matmul_tiled_32x32_32x4_threads(
             if (global_r < M && global_c < K) {
                 A_shared[r][c] = A[global_r * K + global_c];
             } else {
-                A_shared[r][c] = static_cast<scalar_t>(0);
+                A_shared[r][c] = static_cast<float>(0);
             }
         }
 
@@ -638,7 +484,7 @@ __global__ void matmul_tiled_32x32_32x4_threads(
             if (global_r < K && global_c < N) {
                 B_shared[r][c] = B[global_r * N + global_c];
             } else {
-                B_shared[r][c] = static_cast<scalar_t>(0);
+                B_shared[r][c] = static_cast<float>(0);
             }
         }
 
@@ -673,67 +519,31 @@ __global__ void matmul_tiled_32x32_32x4_threads(
 
     // Write back 8 outputs
     if (row0 < M && col0 < N) {
-        C[row0 * N + col0] = (scalar_t)acc0;
+        C[row0 * N + col0] = (float)acc0;
     }
     if (row1 < M && col0 < N) {
-        C[row1 * N + col0] = (scalar_t)acc1;
+        C[row1 * N + col0] = (float)acc1;
     }
     if (row2 < M && col0 < N) {
-        C[row2 * N + col0] = (scalar_t)acc2;
+        C[row2 * N + col0] = (float)acc2;
     }
     if (row3 < M && col0 < N) {
-        C[row3 * N + col0] = (scalar_t)acc3;
+        C[row3 * N + col0] = (float)acc3;
     }
     if (row4 < M && col0 < N) {
-        C[row4 * N + col0] = (scalar_t)acc4;
+        C[row4 * N + col0] = (float)acc4;
     }
     if (row5 < M && col0 < N) {
-        C[row5 * N + col0] = (scalar_t)acc5;
+        C[row5 * N + col0] = (float)acc5;
     }
     if (row6 < M && col0 < N) {
-        C[row6 * N + col0] = (scalar_t)acc6;
+        C[row6 * N + col0] = (float)acc6;
     }
     if (row7 < M && col0 < N) {
-        C[row7 * N + col0] = (scalar_t)acc7;
+        C[row7 * N + col0] = (float)acc7;
     }
 }
 
-torch::Tensor matmul_cuda_tiled_32x32_32x4_threads(torch::Tensor A, torch::Tensor B) {
-    TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
-    TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
-    TORCH_CHECK(A.dtype() == B.dtype(), "A and B must have the same dtype");
-    TORCH_CHECK(A.dim() == 2, "A must be 2D");
-    TORCH_CHECK(B.dim() == 2, "B must be 2D");
-    TORCH_CHECK(A.size(1) == B.size(0), "Inner dimensions must match");
-    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
-    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
-
-    const int M = A.size(0);
-    const int K = A.size(1);
-    const int N = B.size(1);
-
-    auto C = torch::zeros({M, N}, A.options());
-
-    dim3 threads(32, 4);                         // 128 threads, warp-aligned
-    dim3 blocks((N + 31) / 32, (M + 31) / 32);  // each CTA computes a 32x32 tile
-
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        torch::kHalf,
-        torch::kBFloat16,
-        A.scalar_type(),
-        "matmul_tiled_32x32_32x4_threads",
-        [&] {
-            matmul_tiled_32x32_32x4_threads<scalar_t><<<blocks, threads>>>(
-                A.data_ptr<scalar_t>(),
-                B.data_ptr<scalar_t>(),
-                C.data_ptr<scalar_t>(),
-                M, K, N
-            );
-        }
-    );
-
-    return C;
-}
 
 /* Tiled matmul: 32x64 output tiles with 32x4 warp-aligned thread layout
    Each thread computes an 8x2 micro-tile.
@@ -759,17 +569,16 @@ torch::Tensor matmul_cuda_tiled_32x32_32x4_threads(torch::Tensor A, torch::Tenso
    - BN = 64
    - BK = 32
 */
-template <typename scalar_t>
-__global__ void matmul_tiled_32x64_32x4_threads(
-    const scalar_t* A, const scalar_t* B, scalar_t* C,
+extern "C" __global__ void matmul_tiled_32x64_32x4_threads(
+    const float* A, const float* B, float* C,
     int M, int K, int N
 ) {
     constexpr int BM = 32;   // C tile height
     constexpr int BN = 64;   // C tile width
     constexpr int BK = 32;   // K tile depth
 
-    __shared__ scalar_t A_shared[BM][BK];
-    __shared__ scalar_t B_shared[BK][BN];
+    __shared__ float A_shared[BM][BK];
+    __shared__ float B_shared[BK][BN];
 
     const int tx = threadIdx.x;   // 0..31
     const int ty = threadIdx.y;   // 0..3
@@ -814,7 +623,7 @@ __global__ void matmul_tiled_32x64_32x4_threads(
             if (global_r < M && global_c < K) {
                 A_shared[r][c] = A[global_r * K + global_c];
             } else {
-                A_shared[r][c] = static_cast<scalar_t>(0);
+                A_shared[r][c] = static_cast<float>(0);
             }
         }
 
@@ -831,7 +640,7 @@ __global__ void matmul_tiled_32x64_32x4_threads(
             if (global_r < K && global_c < N) {
                 B_shared[r][c] = B[global_r * N + global_c];
             } else {
-                B_shared[r][c] = static_cast<scalar_t>(0);
+                B_shared[r][c] = static_cast<float>(0);
             }
         }
 
@@ -866,67 +675,31 @@ __global__ void matmul_tiled_32x64_32x4_threads(
     }
 
     // Write back 8x2 outputs
-    if (row0 < M && col0 < N) C[row0 * N + col0] = (scalar_t)acc00;
-    if (row0 < M && col1 < N) C[row0 * N + col1] = (scalar_t)acc01;
+    if (row0 < M && col0 < N) C[row0 * N + col0] = (float)acc00;
+    if (row0 < M && col1 < N) C[row0 * N + col1] = (float)acc01;
 
-    if (row1 < M && col0 < N) C[row1 * N + col0] = (scalar_t)acc10;
-    if (row1 < M && col1 < N) C[row1 * N + col1] = (scalar_t)acc11;
+    if (row1 < M && col0 < N) C[row1 * N + col0] = (float)acc10;
+    if (row1 < M && col1 < N) C[row1 * N + col1] = (float)acc11;
 
-    if (row2 < M && col0 < N) C[row2 * N + col0] = (scalar_t)acc20;
-    if (row2 < M && col1 < N) C[row2 * N + col1] = (scalar_t)acc21;
+    if (row2 < M && col0 < N) C[row2 * N + col0] = (float)acc20;
+    if (row2 < M && col1 < N) C[row2 * N + col1] = (float)acc21;
 
-    if (row3 < M && col0 < N) C[row3 * N + col0] = (scalar_t)acc30;
-    if (row3 < M && col1 < N) C[row3 * N + col1] = (scalar_t)acc31;
+    if (row3 < M && col0 < N) C[row3 * N + col0] = (float)acc30;
+    if (row3 < M && col1 < N) C[row3 * N + col1] = (float)acc31;
 
-    if (row4 < M && col0 < N) C[row4 * N + col0] = (scalar_t)acc40;
-    if (row4 < M && col1 < N) C[row4 * N + col1] = (scalar_t)acc41;
+    if (row4 < M && col0 < N) C[row4 * N + col0] = (float)acc40;
+    if (row4 < M && col1 < N) C[row4 * N + col1] = (float)acc41;
 
-    if (row5 < M && col0 < N) C[row5 * N + col0] = (scalar_t)acc50;
-    if (row5 < M && col1 < N) C[row5 * N + col1] = (scalar_t)acc51;
+    if (row5 < M && col0 < N) C[row5 * N + col0] = (float)acc50;
+    if (row5 < M && col1 < N) C[row5 * N + col1] = (float)acc51;
 
-    if (row6 < M && col0 < N) C[row6 * N + col0] = (scalar_t)acc60;
-    if (row6 < M && col1 < N) C[row6 * N + col1] = (scalar_t)acc61;
+    if (row6 < M && col0 < N) C[row6 * N + col0] = (float)acc60;
+    if (row6 < M && col1 < N) C[row6 * N + col1] = (float)acc61;
 
-    if (row7 < M && col0 < N) C[row7 * N + col0] = (scalar_t)acc70;
-    if (row7 < M && col1 < N) C[row7 * N + col1] = (scalar_t)acc71;
+    if (row7 < M && col0 < N) C[row7 * N + col0] = (float)acc70;
+    if (row7 < M && col1 < N) C[row7 * N + col1] = (float)acc71;
 }
 
-torch::Tensor matmul_cuda_tiled_32x64_32x4_threads(torch::Tensor A, torch::Tensor B) {
-    TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
-    TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
-    TORCH_CHECK(A.dtype() == B.dtype(), "A and B must have the same dtype");
-    TORCH_CHECK(A.dim() == 2, "A must be 2D");
-    TORCH_CHECK(B.dim() == 2, "B must be 2D");
-    TORCH_CHECK(A.size(1) == B.size(0), "Inner dimensions must match");
-    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
-    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
-
-    const int M = A.size(0);
-    const int K = A.size(1);
-    const int N = B.size(1);
-
-    auto C = torch::zeros({M, N}, A.options());
-
-    dim3 threads(32, 4);                         // (x,y) = (32,4)
-    dim3 blocks((N + 63) / 64, (M + 31) / 32);  // each CTA computes a 32x64 tile
-
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        torch::kHalf,
-        torch::kBFloat16,
-        A.scalar_type(),
-        "matmul_tiled_32x64_32x4_threads",
-        [&] {
-            matmul_tiled_32x64_32x4_threads<scalar_t><<<blocks, threads>>>(
-                A.data_ptr<scalar_t>(),
-                B.data_ptr<scalar_t>(),
-                C.data_ptr<scalar_t>(),
-                M, K, N
-            );
-        }
-    );
-
-    return C;
-}
 
 /* Tiled matmul: 32x64 output tiles with 32x4 warp-aligned thread layout
    Each thread computes a 4x4 micro-tile (TM=TN=4), using tid-based remapping
@@ -945,9 +718,8 @@ torch::Tensor matmul_cuda_tiled_32x64_32x4_threads(torch::Tensor A, torch::Tenso
    Global loads still use tid directly (coalesced, 32 consecutive threads
    in the physical x-dim hit consecutive addresses — unchanged from before).
 */
-template <typename scalar_t>
-__global__ void matmul_tiled_32x64_tm4_tn4(
-    const scalar_t* A, const scalar_t* B, scalar_t* C,
+extern "C" __global__ void matmul_tiled_32x64_tm4_tn4(
+    const float* A, const float* B, float* C,
     int M, int K, int N
 ) {
     constexpr int BM = 32;
@@ -962,8 +734,8 @@ __global__ void matmul_tiled_32x64_tm4_tn4(
     constexpr int LROWS = BM / TM;   // 8
     constexpr int LCOLS = BN / TN;   // 16
 
-    __shared__ scalar_t A_shared[BM][BK];
-    __shared__ scalar_t B_shared[BK][BN];
+    __shared__ float A_shared[BM][BK];
+    __shared__ float B_shared[BK][BN];
 
     // --- Physical thread indices (used only for global loads) ---
     const int tx = threadIdx.x;              // 0..31
@@ -1000,7 +772,7 @@ __global__ void matmul_tiled_32x64_tm4_tn4(
             const int global_c = k0 + c;
             A_shared[r][c] = (global_r < M && global_c < K)
                 ? A[global_r * K + global_c]
-                : static_cast<scalar_t>(0);
+                : static_cast<float>(0);
         }
 
         // ----------------------------------------------------------
@@ -1016,7 +788,7 @@ __global__ void matmul_tiled_32x64_tm4_tn4(
             const int global_c = block_col + c;
             B_shared[r][c] = (global_r < K && global_c < N)
                 ? B[global_r * N + global_c]
-                : static_cast<scalar_t>(0);
+                : static_cast<float>(0);
         }
 
         __syncthreads();
@@ -1060,55 +832,9 @@ __global__ void matmul_tiled_32x64_tm4_tn4(
             const int global_r = row_start + i;
             const int global_c = col_start + j;
             if (global_r < M && global_c < N)
-                C[global_r * N + global_c] = (scalar_t)acc[i][j];
+                C[global_r * N + global_c] = (float)acc[i][j];
         }
     }
 }
 
-torch::Tensor matmul_cuda_tiled_32x64_tm4_tn4(torch::Tensor A, torch::Tensor B) {
-    TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
-    TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
-    TORCH_CHECK(A.dtype() == B.dtype(), "A and B must have the same dtype");
-    TORCH_CHECK(A.dim() == 2, "A must be 2D");
-    TORCH_CHECK(B.dim() == 2, "B must be 2D");
-    TORCH_CHECK(A.size(1) == B.size(0), "Inner dimensions must match");
-    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
-    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
 
-    const int M = A.size(0);
-    const int K = A.size(1);
-    const int N = B.size(1);
-
-    auto C = torch::zeros({M, N}, A.options());
-
-    dim3 threads(32, 4);                         // physical (x,y) = (32,4)
-    dim3 blocks((N + 63) / 64, (M + 31) / 32);  // each CTA computes a 32x64 tile
-
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        torch::kHalf,
-        torch::kBFloat16,
-        A.scalar_type(),
-        "matmul_tiled_32x64_tm4_tn4",
-        [&] {
-            matmul_tiled_32x64_tm4_tn4<scalar_t><<<blocks, threads>>>(
-                A.data_ptr<scalar_t>(),
-                B.data_ptr<scalar_t>(),
-                C.data_ptr<scalar_t>(),
-                M, K, N
-            );
-        }
-    );
-
-    return C;
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("matmul_cuda_naive_ijk", &matmul_cuda_naive_ijk, "Naive CUDA matmul: 2D grid (i->x, j->y), each thread (i,j) computes full k");
-    m.def("matmul_cuda_naive_ijk_jx", &matmul_cuda_naive_ijk_jx, "Naive CUDA matmul: 2D grid (j->x, i->y), each thread (i,j) computes full k");
-    m.def("matmul_cuda_tiled_32x32", &matmul_cuda_tiled_32x32, "Tiled CUDA matmul: 32x32 tiles with shared memory");
-    m.def("matmul_cuda_tiled_32x32_16x16_threads", &matmul_cuda_tiled_32x32_16x16_threads, "Optimized tiled CUDA matmul: 32x32 tiles, 16x16 threads, each thread computes 2x2 micro-tile");
-    m.def("matmul_cuda_tiled_32x32_32x8_threads", &matmul_cuda_tiled_32x32_32x8_threads, "Warp-aligned tiled CUDA matmul: 32x32 tiles, 32x8 threads, each thread computes 4x1 micro-tile, zero bank conflicts");
-    m.def("matmul_cuda_tiled_32x32_32x4_threads", &matmul_cuda_tiled_32x32_32x4_threads, "Ultra-warp-aligned tiled CUDA matmul: 32x32 tiles, 32x4 threads, each thread computes 8x1 micro-tile");
-    m.def("matmul_cuda_tiled_32x64_32x4_threads", &matmul_cuda_tiled_32x64_32x4_threads, "Larger tile matmul: 32x64 output tiles, 32x4 threads, each thread computes 8x2 micro-tile");
-    m.def("matmul_cuda_tiled_32x64_tm4_tn4", &matmul_cuda_tiled_32x64_tm4_tn4, "Symmetric tile matmul: 32x64 output tiles, 32x4 threads remapped to 8x16 logical grid, each thread computes 4x4 micro-tile");
-}

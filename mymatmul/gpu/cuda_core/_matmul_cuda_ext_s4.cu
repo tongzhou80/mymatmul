@@ -1,14 +1,5 @@
-#include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cuda_pipeline_primitives.h>
-
-// Dispatch for float, half, bfloat16 only
-#define AT_DISPATCH_FLOAT_HALF_BF16(TYPE, NAME, ...) \
-    AT_DISPATCH_SWITCH(TYPE, NAME,                   \
-        AT_DISPATCH_CASE(at::ScalarType::Float,      __VA_ARGS__) \
-        AT_DISPATCH_CASE(at::ScalarType::Half,       __VA_ARGS__) \
-        AT_DISPATCH_CASE(at::ScalarType::BFloat16,   __VA_ARGS__) \
-    )
 
 /*
  * Stage 4: Double-buffered matmul with async global→shared copies (cp.async)
@@ -25,11 +16,11 @@
  *
  * Constraint: M, N, K must be multiples of BM, BN, BK respectively.
  */
-template <typename scalar_t, int BM, int BN, int BK, int TM, int TN, int UNROLL>
-__global__ void matmul_s4(
-    const scalar_t* __restrict__ A,
-    const scalar_t* __restrict__ B,
-    scalar_t* __restrict__ C,
+template <int BM, int BN, int BK, int TM, int TN, int UNROLL>
+__device__ __forceinline__ void matmul_s4_impl(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
     int M, int K, int N
 ) {
     constexpr int THREADS  = (BM / TM) * (BN / TN);
@@ -38,19 +29,19 @@ __global__ void matmul_s4(
     // Adaptive load size: largest of {4, 8, 16} bytes that evenly divides per-thread load.
     // For a tile of total_bytes = BM*BK*sizeof(scalar_t), each thread loads
     // total_bytes/THREADS bytes. We pick the largest power-of-two load <= that and <= 16.
-    constexpr int A_THREAD_BYTES = BM * BK * (int)sizeof(scalar_t) / THREADS;
+    constexpr int A_THREAD_BYTES = BM * BK * (int)sizeof(float) / THREADS;
     constexpr int A_LOAD_BYTES   = (A_THREAD_BYTES >= 16) ? 16 : (A_THREAD_BYTES >= 8) ? 8 : 4;
-    constexpr int A_ELEM         = A_LOAD_BYTES / (int)sizeof(scalar_t);   // elements per copy
+    constexpr int A_ELEM         = A_LOAD_BYTES / (int)sizeof(float);   // elements per copy
     constexpr int A_GROUPS       = BM * BK / A_ELEM / THREADS;             // copies per thread
 
-    constexpr int B_THREAD_BYTES = BK * BN * (int)sizeof(scalar_t) / THREADS;
+    constexpr int B_THREAD_BYTES = BK * BN * (int)sizeof(float) / THREADS;
     constexpr int B_LOAD_BYTES   = (B_THREAD_BYTES >= 16) ? 16 : (B_THREAD_BYTES >= 8) ? 8 : 4;
-    constexpr int B_ELEM         = B_LOAD_BYTES / (int)sizeof(scalar_t);
+    constexpr int B_ELEM         = B_LOAD_BYTES / (int)sizeof(float);
     constexpr int B_GROUPS       = BK * BN / B_ELEM / THREADS;
 
     // Double-buffered shared memory
-    __shared__ scalar_t A_shared[2][BM][BK];
-    __shared__ scalar_t B_shared[2][BK][BN];
+    __shared__ float A_shared[2][BM][BK];
+    __shared__ float B_shared[2][BK][BN];
 
     const int tx  = threadIdx.x, ty = threadIdx.y;
     const int tid = ty * blockDim.x + tx;
@@ -150,29 +141,15 @@ __global__ void matmul_s4(
         #pragma unroll
         for (int j = 0; j < TN; j++) {
             const int gr = row_start + i, gc = col_start + j;
-            if (gr < M && gc < N) C[gr * N + gc] = (scalar_t)acc[i][j];
+            if (gr < M && gc < N) C[gr * N + gc] = acc[i][j];
         }
 }
 
-// ---- Launch wrapper macro (no UNROLL — load loops are 1-4 iters, compiler handles) ----
 #define MAKE_LAUNCHER_S4(NAME, BM, BN, BK, TM, TN, UNROLL)                         \
-torch::Tensor NAME(torch::Tensor A, torch::Tensor B) {                              \
-    TORCH_CHECK(A.is_cuda() && B.is_cuda(), "Inputs must be CUDA tensors");         \
-    TORCH_CHECK(A.dtype() == B.dtype(), "Dtype mismatch");                          \
-    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "Inputs must be 2D");                \
-    TORCH_CHECK(A.size(1) == B.size(0), "Inner dimensions must match");             \
-    TORCH_CHECK(A.is_contiguous() && B.is_contiguous(), "Must be contiguous");      \
-    constexpr int THREADS = (BM / TM) * (BN / TN);                                 \
-    const int M = A.size(0), K = A.size(1), N = B.size(1);                         \
-    auto C = torch::zeros({M, N}, A.options());                                     \
-    dim3 threads(32, THREADS / 32);                                                 \
-    dim3 blocks((N + BN - 1) / BN, (M + BM - 1) / BM);                            \
-    AT_DISPATCH_FLOAT_HALF_BF16(A.scalar_type(), #NAME, [&] {                      \
-        matmul_s4<scalar_t, BM, BN, BK, TM, TN, UNROLL><<<blocks, threads>>>(      \
-            A.data_ptr<scalar_t>(), B.data_ptr<scalar_t>(),                         \
-            C.data_ptr<scalar_t>(), M, K, N);                                       \
-    });                                                                             \
-    return C;                                                                       \
+extern "C" __global__ void NAME(                                                    \
+    const float* __restrict__ A, const float* __restrict__ B,                      \
+    float* __restrict__ C, int M, int K, int N) {                                   \
+    matmul_s4_impl<BM, BN, BK, TM, TN, UNROLL>(A, B, C, M, K, N);                 \
 }
 
 // ---- Stage 4 instantiations ----
@@ -202,8 +179,8 @@ MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u4,       64,  64, 16,  8
 MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u8,       64,  64, 16,  8,  8,   8)
 MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u16,      64,  64, 16,  8,  8,  16)
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("matmul_cuda_s4_tm4_tn4_bm32_bn64_bk16",        &matmul_cuda_s4_tm4_tn4_bm32_bn64_bk16);
+// (pybind11 module removed — kernels exposed as extern "C" __global__ for PyCUDA)
+/*
     m.def("matmul_cuda_s4_tm4_tn4_bm64_bn64_bk16",        &matmul_cuda_s4_tm4_tn4_bm64_bn64_bk16);
     m.def("matmul_cuda_s4_tm8_tn4_bm64_bn64_bk16",        &matmul_cuda_s4_tm8_tn4_bm64_bn64_bk16);
     m.def("matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u1",    &matmul_cuda_s4_tm8_tn8_bm128_bn64_bk16_u1);
@@ -220,5 +197,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u2",     &matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u2);
     m.def("matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u4",     &matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u4);
     m.def("matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u8",     &matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u8);
-    m.def("matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u16",    &matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u16);
-}
+*/

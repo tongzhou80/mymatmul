@@ -1,12 +1,21 @@
 """Stage 4b CUDA matmul kernels: Stage 4 + A_shared bank-conflict padding."""
 
-def _ext():
-    from . import _matmul_cuda_ext_s4b
-    return _matmul_cuda_ext_s4b
+import re
+from .._pycuda_loader import launch_matmul
 
-def _make(name):
-    def fn(A, B): return getattr(_ext(), name)(A, B)
-    fn.__name__ = name
+_EXT = "_matmul_cuda_ext_s4b"
+
+def _make(kernel_name):
+    m = re.search(r'tm(\d+)_tn(\d+)_bm(\d+)_bn(\d+)', kernel_name)
+    TM, TN, BM, BN = int(m[1]), int(m[2]), int(m[3]), int(m[4])
+    THREADS = (BM // TM) * (BN // TN)
+    block = (32, THREADS // 32, 1)
+    def fn(A, B):
+        M, _ = A.shape
+        _, N = B.shape
+        grid = ((N + BN - 1) // BN, (M + BM - 1) // BM, 1)
+        return launch_matmul(_EXT, kernel_name, A, B, block, grid)
+    fn.__name__ = kernel_name
     return fn
 
 for _u in [8, 16]:

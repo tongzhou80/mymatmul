@@ -1,5 +1,5 @@
 """Benchmark GPU matmul implementations and write results to benchmarks/results_gpu.csv."""
-
+"""We should use bench_gpu2.py which uses triton's timing API."""
 import argparse
 import csv
 import os

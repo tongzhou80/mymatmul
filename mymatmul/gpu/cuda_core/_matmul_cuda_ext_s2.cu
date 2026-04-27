@@ -1,4 +1,3 @@
-#include <torch/extension.h>
 #include <cuda_runtime.h>
 
 /*
@@ -49,7 +48,7 @@
 //     A tile (BM x BK = 8 x 32 = 256 elems): 256 / 128 threads = 2 per thread
 //     B tile (BK x BN = 32 x 32 = 1024 elems): 1024 / 128 threads = 8 per thread
 // ---------------------------------------------------------------------------
-__global__ void smem_tiled_bm8_bn32_bk32_threads32x4(
+extern "C" __global__ void smem_tiled_bm8_bn32_bk32_threads32x4(
     const float* __restrict__ A,
     const float* __restrict__ B,
     float* __restrict__ C,
@@ -135,7 +134,7 @@ __global__ void smem_tiled_bm8_bn32_bk32_threads32x4(
 //   vs Case 1: same TM/TN so same shared-memory A.I. (0.67),
 //   but global A.I. rises from 6.4 → 10.67 at the cost of a larger thread block.
 // ---------------------------------------------------------------------------
-__global__ void smem_tiled_bm16_bn32_bk32_threads32x8(
+extern "C" __global__ void smem_tiled_bm16_bn32_bk32_threads32x8(
     const float* __restrict__ A,
     const float* __restrict__ B,
     float* __restrict__ C,
@@ -208,69 +207,3 @@ __global__ void smem_tiled_bm16_bn32_bk32_threads32x8(
 }
 
 
-// ---------------------------------------------------------------------------
-// PyTorch dispatch wrappers
-// ---------------------------------------------------------------------------
-
-torch::Tensor matmul_s2_bm8_bn32_bk32_threads32x4(torch::Tensor A, torch::Tensor B) {
-    TORCH_CHECK(A.is_cuda() && B.is_cuda(), "Inputs must be CUDA tensors");
-    TORCH_CHECK(A.dtype() == torch::kFloat, "Only float32 is supported in Stage 2 kernels");
-    TORCH_CHECK(A.is_contiguous() && B.is_contiguous(), "Inputs must be contiguous");
-
-    const int M = A.size(0);
-    const int K = A.size(1);
-    const int N = B.size(1);
-
-    auto C = torch::zeros({M, N}, A.options());
-
-    constexpr int BM = 8, BN = 32;
-    dim3 threads(32, 4);
-    dim3 blocks((N + BN - 1) / BN, (M + BM - 1) / BM);
-
-    smem_tiled_bm8_bn32_bk32_threads32x4<<<blocks, threads>>>(
-        A.data_ptr<float>(),
-        B.data_ptr<float>(),
-        C.data_ptr<float>(),
-        M, K, N
-    );
-
-    return C;
-}
-
-torch::Tensor matmul_s2_bm16_bn32_bk32_threads32x8(torch::Tensor A, torch::Tensor B) {
-    TORCH_CHECK(A.is_cuda() && B.is_cuda(), "Inputs must be CUDA tensors");
-    TORCH_CHECK(A.dtype() == torch::kFloat, "Only float32 is supported in Stage 2 kernels");
-    TORCH_CHECK(A.is_contiguous() && B.is_contiguous(), "Inputs must be contiguous");
-
-    const int M = A.size(0);
-    const int K = A.size(1);
-    const int N = B.size(1);
-
-    auto C = torch::zeros({M, N}, A.options());
-
-    constexpr int BM = 16, BN = 32;
-    dim3 threads(32, 8);
-    dim3 blocks((N + BN - 1) / BN, (M + BM - 1) / BM);
-
-    smem_tiled_bm16_bn32_bk32_threads32x8<<<blocks, threads>>>(
-        A.data_ptr<float>(),
-        B.data_ptr<float>(),
-        C.data_ptr<float>(),
-        M, K, N
-    );
-
-    return C;
-}
-
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "Stage 2: Shared Memory Tiling — occupancy vs arithmetic intensity study";
-
-    m.def("matmul_s2_bm8_bn32_bk32_threads32x4",
-          &matmul_s2_bm8_bn32_bk32_threads32x4,
-          "Case 1: BM=8,BN=32,BK=32, 32x4 threads, TM=2 TN=1 — global AI=6.4, smem AI=0.67");
-
-    m.def("matmul_s2_bm16_bn32_bk32_threads32x8",
-          &matmul_s2_bm16_bn32_bk32_threads32x8,
-          "Case 2: BM=16,BN=32,BK=32, 32x8 threads, TM=2 TN=1 — global AI=10.67, smem AI=0.67");
-}

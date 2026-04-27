@@ -1,0 +1,2 @@
+kernel,sm_sol_pct,dram_sol_pct,l1_sol_pct,l2_sol_pct,occupancy_pct,smem_ld_conflicts,smem_st_conflicts
+cublas_fp32_notf32,80.53,17.62,42.69,30.32,16.65,0.0,0.0

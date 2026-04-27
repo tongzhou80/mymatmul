@@ -1,15 +1,4 @@
-#include <torch/extension.h>
 #include <cuda_runtime.h>
-
-// Dispatch for float, half, bfloat16 only — excludes double to avoid SMEM
-// overflow when instantiated for large tiles (e.g. BM=BN=128 at fp64 needs
-// 64KB shared memory which exceeds the 48KB SM limit).
-#define AT_DISPATCH_FLOAT_HALF_BF16(TYPE, NAME, ...) \
-    AT_DISPATCH_SWITCH(TYPE, NAME,                   \
-        AT_DISPATCH_CASE(at::ScalarType::Float,      __VA_ARGS__) \
-        AT_DISPATCH_CASE(at::ScalarType::Half,       __VA_ARGS__) \
-        AT_DISPATCH_CASE(at::ScalarType::BFloat16,   __VA_ARGS__) \
-    )
 
 /*
  * Stage 3 + explicit warp tiling
@@ -43,16 +32,15 @@
  *                  => WTHREAD_ROWS=8 WTHREAD_COLS=4
  */
 template <
-    typename scalar_t,
     int BM, int BN, int BK,
     int WM, int WN,
     int TM, int TN,
     int UNROLL
 >
-__global__ void matmul_s3_warp(
-    const scalar_t* __restrict__ A,
-    const scalar_t* __restrict__ B,
-    scalar_t* __restrict__ C,
+__device__ __forceinline__ void matmul_s3_warp_impl(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
     int M, int K, int N
 ) {
     constexpr int THREADS = (BM / TM) * (BN / TN);
@@ -85,8 +73,8 @@ __global__ void matmul_s3_warp(
     static_assert((BM * BK) % THREADS == 0, "A tile load must divide evenly across threads");
     static_assert((BK * BN) % THREADS == 0, "B tile load must divide evenly across threads");
 
-    __shared__ scalar_t A_shared[BM][BK];
-    __shared__ scalar_t B_shared[BK][BN];
+    __shared__ float A_shared[BM][BK];
+    __shared__ float B_shared[BK][BN];
 
     const int tx  = threadIdx.x;
     const int ty  = threadIdx.y;
@@ -125,7 +113,7 @@ __global__ void matmul_s3_warp(
             const int c = idx % BK;
             A_shared[r][c] = (block_row + r < M && k0 + c < K)
                 ? A[(block_row + r) * K + (k0 + c)]
-                : static_cast<scalar_t>(0);
+                : 0.0f;
         }
 
         // Cooperatively load B tile
@@ -136,7 +124,7 @@ __global__ void matmul_s3_warp(
             const int c = idx % BN;
             B_shared[r][c] = (k0 + r < K && block_col + c < N)
                 ? B[(k0 + r) * N + (block_col + c)]
-                : static_cast<scalar_t>(0);
+                : 0.0f;
         }
 
         __syncthreads();
@@ -178,7 +166,7 @@ __global__ void matmul_s3_warp(
             const int gr = row_start + i;
             const int gc = col_start + j;
             if (gr < M && gc < N) {
-                C[gr * N + gc] = (scalar_t)acc[i][j];
+                C[gr * N + gc] = acc[i][j];
             }
         }
     }
@@ -187,26 +175,10 @@ __global__ void matmul_s3_warp(
 // ---- Launch wrapper macro ----
 // Physical threads: x-dim=32 (warp-aligned), y-dim=THREADS/32
 #define MAKE_LAUNCHER_WARP(NAME, BM, BN, BK, WM, WN, TM, TN, UNROLL)                 \
-torch::Tensor NAME(torch::Tensor A, torch::Tensor B) {                                 \
-    TORCH_CHECK(A.is_cuda() && B.is_cuda(), "Inputs must be CUDA tensors");            \
-    TORCH_CHECK(A.dtype() == B.dtype(), "Dtype mismatch");                             \
-    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "Inputs must be 2D");                   \
-    TORCH_CHECK(A.size(1) == B.size(0), "Inner dimensions must match");                \
-    TORCH_CHECK(A.is_contiguous() && B.is_contiguous(), "Must be contiguous");         \
-    constexpr int THREADS = (BM / TM) * (BN / TN);                                    \
-    const int M = A.size(0), K = A.size(1), N = B.size(1);                            \
-    auto C = torch::zeros({M, N}, A.options());                                        \
-    dim3 threads(32, THREADS / 32);                                                    \
-    dim3 blocks((N + BN - 1) / BN, (M + BM - 1) / BM);                                 \
-    AT_DISPATCH_FLOAT_HALF_BF16(A.scalar_type(), #NAME, [&] {                         \
-        matmul_s3_warp<scalar_t, BM, BN, BK, WM, WN, TM, TN, UNROLL>                  \
-            <<<blocks, threads>>>(                                                     \
-                A.data_ptr<scalar_t>(),                                                \
-                B.data_ptr<scalar_t>(),                                                \
-                C.data_ptr<scalar_t>(),                                                \
-                M, K, N);                                                              \
-    });                                                                                \
-    return C;                                                                          \
+extern "C" __global__ void NAME(                                                       \
+    const float* __restrict__ A, const float* __restrict__ B,                         \
+    float* __restrict__ C, int M, int K, int N) {                                      \
+    matmul_s3_warp_impl<BM, BN, BK, WM, WN, TM, TN, UNROLL>(A, B, C, M, K, N);       \
 }
 
 // -----------------------------------------------------------------------------
@@ -255,25 +227,3 @@ MAKE_LAUNCHER_WARP(matmul_cuda_s3_warp_tm4_tn4_bm64_bn64_bk32_wm32_wn16_u8,
 MAKE_LAUNCHER_WARP(matmul_cuda_s3_warp_tm4_tn4_bm32_bn64_bk32_wm16_wn32_u8,
                    32, 64, 32, 16, 32, 4, 4, 8)
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("matmul_cuda_s3_warp_tm8_tn8_bm128_bn128_bk32_wm64_wn32_u8",
-          &matmul_cuda_s3_warp_tm8_tn8_bm128_bn128_bk32_wm64_wn32_u8);
-
-    m.def("matmul_cuda_s3_warp_tm8_tn8_bm128_bn128_bk32_wm32_wn64_u8",
-          &matmul_cuda_s3_warp_tm8_tn8_bm128_bn128_bk32_wm32_wn64_u8);
-
-    m.def("matmul_cuda_s3_warp_tm8_tn8_bm128_bn64_bk32_wm64_wn32_u8",
-          &matmul_cuda_s3_warp_tm8_tn8_bm128_bn64_bk32_wm64_wn32_u8);
-
-    m.def("matmul_cuda_s3_warp_tm8_tn8_bm128_bn64_bk32_wm32_wn64_u8",
-          &matmul_cuda_s3_warp_tm8_tn8_bm128_bn64_bk32_wm32_wn64_u8);
-
-    m.def("matmul_cuda_s3_warp_tm8_tn4_bm64_bn64_bk32_wm32_wn32_u8",
-          &matmul_cuda_s3_warp_tm8_tn4_bm64_bn64_bk32_wm32_wn32_u8);
-
-    m.def("matmul_cuda_s3_warp_tm4_tn4_bm64_bn64_bk32_wm32_wn16_u8",
-          &matmul_cuda_s3_warp_tm4_tn4_bm64_bn64_bk32_wm32_wn16_u8);
-
-    m.def("matmul_cuda_s3_warp_tm4_tn4_bm32_bn64_bk32_wm16_wn32_u8",
-          &matmul_cuda_s3_warp_tm4_tn4_bm32_bn64_bk32_wm16_wn32_u8);
-}
