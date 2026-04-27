@@ -44,6 +44,9 @@ IMPLEMENTATIONS = {
     **{f"s4_{k}_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4.matmul_s4_{k}_bk16_u{u}", None)
        for u in [1, 2, 4, 8, 16]
        for k in ["tm8_tn8_bm128_bn64", "tm8_tn8_bm128_bn128", "tm8_tn8_bm64_bn64"]},
+    # Stage 4pad: s4 bm64_bn64 with A_shared row padding (+1 float) to fix bank conflicts
+    **{f"s4pad_tm8_tn8_bm64_bn64_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4.matmul_s4pad_tm8_tn8_bm64_bn64_bk16_u{u}", None)
+       for u in [1, 2, 4, 8, 16]},
     # Stage 4b: Stage 4 + A_shared bank-conflict fix (BK+4 padding), BN=128 only
     **{f"s4b_tm8_tn8_bm128_bn128_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4b.matmul_s4b_tm8_tn8_bm128_bn128_bk16_u{u}", None)
        for u in [8, 16]},

@@ -16,7 +16,7 @@
  *
  * Constraint: M, N, K must be multiples of BM, BN, BK respectively.
  */
-template <int BM, int BN, int BK, int TM, int TN, int UNROLL>
+template <int BM, int BN, int BK, int TM, int TN, int UNROLL, int PAD_A = 0>
 __device__ __forceinline__ void matmul_s4_impl(
     const float* __restrict__ A,
     const float* __restrict__ B,
@@ -26,11 +26,16 @@ __device__ __forceinline__ void matmul_s4_impl(
     constexpr int THREADS  = (BM / TM) * (BN / TN);
     constexpr int LCOLS    = BN / TN;
 
-    // Adaptive load size: largest of {4, 8, 16} bytes that evenly divides per-thread load.
-    // For a tile of total_bytes = BM*BK*sizeof(scalar_t), each thread loads
-    // total_bytes/THREADS bytes. We pick the largest power-of-two load <= that and <= 16.
-    constexpr int A_THREAD_BYTES = BM * BK * (int)sizeof(float) / THREADS;
-    constexpr int A_LOAD_BYTES   = (A_THREAD_BYTES >= 16) ? 16 : (A_THREAD_BYTES >= 8) ? 8 : 4;
+    // Adaptive load size for A: largest of {4, 8, 16} bytes that evenly divides
+    // per-thread load AND keeps the cp.async destination 16-byte aligned.
+    // With padding, row stride is (BK+PAD_A)*4 bytes; if that is not a multiple
+    // of 16 (or 8), the destination of a multi-byte cp.async would be misaligned.
+    constexpr int A_STRIDE_BYTES  = (BK + PAD_A) * (int)sizeof(float);
+    constexpr int A_ALIGN_MAX     = (A_STRIDE_BYTES % 16 == 0) ? 16
+                                  : (A_STRIDE_BYTES %  8 == 0) ?  8 : 4;
+    constexpr int A_THREAD_BYTES  = BM * BK * (int)sizeof(float) / THREADS;
+    constexpr int A_LOAD_BYTES    = (A_THREAD_BYTES >= 16 && A_ALIGN_MAX >= 16) ? 16
+                                  : (A_THREAD_BYTES >=  8 && A_ALIGN_MAX >=  8) ?  8 : 4;
     constexpr int A_ELEM         = A_LOAD_BYTES / (int)sizeof(float);   // elements per copy
     constexpr int A_GROUPS       = BM * BK / A_ELEM / THREADS;             // copies per thread
 
@@ -39,8 +44,9 @@ __device__ __forceinline__ void matmul_s4_impl(
     constexpr int B_ELEM         = B_LOAD_BYTES / (int)sizeof(float);
     constexpr int B_GROUPS       = BK * BN / B_ELEM / THREADS;
 
-    // Double-buffered shared memory
-    __shared__ float A_shared[2][BM][BK];
+    // Double-buffered shared memory. PAD_A adds one float per A row so the
+    // row stride (BK+PAD_A) is odd, eliminating bank aliasing across rows.
+    __shared__ float A_shared[2][BM][BK + PAD_A];
     __shared__ float B_shared[2][BK][BN];
 
     const int tx  = threadIdx.x, ty = threadIdx.y;
@@ -178,6 +184,21 @@ MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u2,       64,  64, 16,  8
 MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u4,       64,  64, 16,  8,  8,   4)
 MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u8,       64,  64, 16,  8,  8,   8)
 MAKE_LAUNCHER_S4(matmul_cuda_s4_tm8_tn8_bm64_bn64_bk16_u16,      64,  64, 16,  8,  8,  16)
+
+// s4pad: same as s4 bm64_bn64 but with PAD_A=1 (A_shared row stride = BK+1 = 17)
+// to eliminate 4-way bank conflicts on A reads (row stride 16 aliases every 2 rows).
+#define MAKE_LAUNCHER_S4PAD(NAME, BM, BN, BK, TM, TN, UNROLL)                      \
+extern "C" __global__ void NAME(                                                    \
+    const float* __restrict__ A, const float* __restrict__ B,                      \
+    float* __restrict__ C, int M, int K, int N) {                                   \
+    matmul_s4_impl<BM, BN, BK, TM, TN, UNROLL, 1>(A, B, C, M, K, N);              \
+}
+
+MAKE_LAUNCHER_S4PAD(matmul_cuda_s4pad_tm8_tn8_bm64_bn64_bk16_u1,  64, 64, 16, 8, 8,  1)
+MAKE_LAUNCHER_S4PAD(matmul_cuda_s4pad_tm8_tn8_bm64_bn64_bk16_u2,  64, 64, 16, 8, 8,  2)
+MAKE_LAUNCHER_S4PAD(matmul_cuda_s4pad_tm8_tn8_bm64_bn64_bk16_u4,  64, 64, 16, 8, 8,  4)
+MAKE_LAUNCHER_S4PAD(matmul_cuda_s4pad_tm8_tn8_bm64_bn64_bk16_u8,  64, 64, 16, 8, 8,  8)
+MAKE_LAUNCHER_S4PAD(matmul_cuda_s4pad_tm8_tn8_bm64_bn64_bk16_u16, 64, 64, 16, 8, 8, 16)
 
 // (pybind11 module removed — kernels exposed as extern "C" __global__ for PyCUDA)
 /*
