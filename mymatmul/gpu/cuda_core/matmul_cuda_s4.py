@@ -26,8 +26,3 @@ for _k in ["tm8_tn8_bm128_bn64", "tm8_tn8_bm128_bn128", "tm8_tn8_bm64_bn64"]:
     for _u in [1, 2, 4, 8, 16]:
         _name = f"matmul_cuda_s4_{_k}_bk16_u{_u}"
         globals()[_name.replace("matmul_cuda_", "matmul_")] = _make(_name)
-
-# s4pad: A_shared row-padded by 1 float to eliminate bank conflicts (bm64_bn64 only)
-for _u in [1, 2, 4, 8, 16]:
-    _name = f"matmul_cuda_s4pad_tm8_tn8_bm64_bn64_bk16_u{_u}"
-    globals()[_name.replace("matmul_cuda_", "matmul_")] = _make(_name)
