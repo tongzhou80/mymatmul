@@ -118,7 +118,7 @@ def cuda_kernel_name(impl_name: str) -> str | None:
     if impl_name.startswith("s3w_"):
         # s3w_X -> matmul_cuda_s3_warp_X
         return "matmul_cuda_s3_warp_" + impl_name[4:]
-    if impl_name.startswith(("s3_", "s4_", "s4b_", "s4sw_")):
+    if impl_name.startswith(("s3_", "s4_", "s4b_", "s4sw_", "s4st_")):
         return "matmul_cuda_" + impl_name
     return _S01_NAMES.get(impl_name)  # None for cuBLAS / Triton
 
