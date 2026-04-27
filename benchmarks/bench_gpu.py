@@ -15,12 +15,6 @@ IMPLEMENTATIONS = {
     "torch_matmul": ("mymatmul.gpu.matmul_torch.matmul_torch",   None),
     # cuBLAS FP32 with TF32 disabled (pure FP32 SIMT, comparable to our s4 kernels)
     "cublas_fp32_notf32": ("mymatmul.gpu.matmul_torch.matmul_torch_fp32_notf32", None),
-    # Triton BF16 (tensor cores on Ada Lovelace — NOT comparable to our SIMT kernels)
-    "triton_matmul_autotuned":     ("mymatmul.gpu.matmul_triton.triton_matmul_autotuned",    None),
-    "triton_bm128_bn256_bk64":     ("mymatmul.gpu.matmul_triton.triton_matmul_bm128_bn256_bk64", None),
-    "triton_bm128_bn128_bk64":     ("mymatmul.gpu.matmul_triton.triton_matmul_bm128_bn128_bk64", None),
-    "triton_bm64_bn256_bk32":      ("mymatmul.gpu.matmul_triton.triton_matmul_bm64_bn256_bk32",  None),
-    "triton_bm128_bn64_bk64":      ("mymatmul.gpu.matmul_triton.triton_matmul_bm128_bn64_bk64",  None),
     # Triton FP32 SIMT (allow_tf32=False) — directly comparable to our s4 CUDA kernels
     "triton_fp32simt_bm128_bn128_bk16": ("mymatmul.gpu.matmul_triton.triton_fp32simt_bm128_bn128_bk16", None),
     "triton_fp32simt_bm128_bn64_bk16":  ("mymatmul.gpu.matmul_triton.triton_fp32simt_bm128_bn64_bk16",  None),
@@ -28,39 +22,37 @@ IMPLEMENTATIONS = {
     "triton_fp32simt_bm128_bn128_bk32": ("mymatmul.gpu.matmul_triton.triton_fp32simt_bm128_bn128_bk32", None),
     "triton_fp32simt_bm128_bn64_bk32":  ("mymatmul.gpu.matmul_triton.triton_fp32simt_bm128_bn64_bk32",  None),
     "triton_fp32simt_bm64_bn64_bk32":   ("mymatmul.gpu.matmul_triton.triton_fp32simt_bm64_bn64_bk32",   None),
-    "cuda_naive_ijk": ("mymatmul.gpu.matmul_cuda.matmul_cuda_naive_ijk", None),
-    "cuda_naive_ijk_jx": ("mymatmul.gpu.matmul_cuda.matmul_cuda_naive_ijk_jx", None),
-    "cuda_tiled_32x32": ("mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x32", None),
-    "cuda_tiled_32x32_16x16": ("mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x32_threads_16x16", None),
-    "cuda_tiled_32x32_32x8": ("mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x32_threads_32x8", None),
-    "cuda_tiled_32x32_32x4": ("mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x32_threads_32x4", None),
-    "cuda_tiled_32x64_32x4": ("mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x64_threads_32x4", None),
-    "cuda_tiled_32x64_tm4_tn4": ("mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x64_tm4_tn4", None),
+    "cuda_naive_ijk": ("mymatmul.gpu.cuda_core.matmul_cuda.matmul_cuda_naive_ijk", None),
+    "cuda_naive_ijk_jx": ("mymatmul.gpu.cuda_core.matmul_cuda.matmul_cuda_naive_ijk_jx", None),
+    "cuda_tiled_32x32": ("mymatmul.gpu.cuda_core.matmul_cuda.matmul_cuda_tiled_32x32", None),
+    "cuda_tiled_32x32_16x16": ("mymatmul.gpu.cuda_core.matmul_cuda.matmul_cuda_tiled_32x32_threads_16x16", None),
+    "cuda_tiled_32x32_32x8": ("mymatmul.gpu.cuda_core.matmul_cuda.matmul_cuda_tiled_32x32_threads_32x8", None),
+    "cuda_tiled_32x32_32x4": ("mymatmul.gpu.cuda_core.matmul_cuda.matmul_cuda_tiled_32x32_threads_32x4", None),
+    "cuda_tiled_32x64_32x4": ("mymatmul.gpu.cuda_core.matmul_cuda.matmul_cuda_tiled_32x64_threads_32x4", None),
+    "cuda_tiled_32x64_tm4_tn4": ("mymatmul.gpu.cuda_core.matmul_cuda.matmul_cuda_tiled_32x64_tm4_tn4", None),
     # Stage 3: BK=32, unroll=8
-    **{f"s3_{k}_bk32_u8": (f"mymatmul.gpu.matmul_cuda_s3.matmul_s3_{k}_bk32_u8", None)
+    **{f"s3_{k}_bk32_u8": (f"mymatmul.gpu.cuda_core.matmul_cuda_s3.matmul_s3_{k}_bk32_u8", None)
        for k in ["tm4_tn4_bm32_bn64","tm4_tn4_bm64_bn64","tm8_tn4_bm64_bn64","tm8_tn8_bm128_bn64","tm8_tn8_bm128_bn128"]},
     # Stage 3: BK=16, unroll=1,2,4,8
-    **{f"s3_{k}_bk16_u{u}": (f"mymatmul.gpu.matmul_cuda_s3.matmul_s3_{k}_bk16_u{u}", None)
+    **{f"s3_{k}_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s3.matmul_s3_{k}_bk16_u{u}", None)
        for u in [1, 2, 4, 8]
        for k in ["tm4_tn4_bm32_bn64","tm4_tn4_bm64_bn64","tm8_tn4_bm64_bn64","tm8_tn8_bm128_bn64","tm8_tn8_bm128_bn128"]},
     # Stage 4: double-buffered with cp.async, BK=16 (small configs: fixed full unroll)
-    **{f"s4_{k}_bk16": (f"mymatmul.gpu.matmul_cuda_s4.matmul_s4_{k}_bk16", None)
+    **{f"s4_{k}_bk16": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4.matmul_s4_{k}_bk16", None)
        for k in ["tm4_tn4_bm32_bn64","tm4_tn4_bm64_bn64","tm8_tn4_bm64_bn64"]},
     # Stage 4: large configs, sweep compute-loop unroll 1,2,4,8,16
-    **{f"s4_{k}_bk16_u{u}": (f"mymatmul.gpu.matmul_cuda_s4.matmul_s4_{k}_bk16_u{u}", None)
+    **{f"s4_{k}_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4.matmul_s4_{k}_bk16_u{u}", None)
        for u in [1, 2, 4, 8, 16]
        for k in ["tm8_tn8_bm128_bn64", "tm8_tn8_bm128_bn128", "tm8_tn8_bm64_bn64"]},
     # Stage 4b: Stage 4 + A_shared bank-conflict fix (BK+4 padding), BN=128 only
-    **{f"s4b_tm8_tn8_bm128_bn128_bk16_u{u}": (f"mymatmul.gpu.matmul_cuda_s4b.matmul_s4b_tm8_tn8_bm128_bn128_bk16_u{u}", None)
+    **{f"s4b_tm8_tn8_bm128_bn128_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4b.matmul_s4b_tm8_tn8_bm128_bn128_bk16_u{u}", None)
        for u in [8, 16]},
-    # Stage 5: Tensor Core WMMA
-    "s5_wmma_bm128_bn128": ("mymatmul.gpu.matmul_cuda_s5.matmul_s5_wmma_bm128_bn128", None),
     # Stage 4 + A-swizzle: XOR swizzle on A_shared to eliminate bank conflicts
-    **{f"s4sw_{k}_bk16_u{u}": (f"mymatmul.gpu.matmul_cuda_s4sw.matmul_s4sw_{k}_bk16_u{u}", None)
+    **{f"s4sw_{k}_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4sw.matmul_s4sw_{k}_bk16_u{u}", None)
        for u in [1, 2, 4, 8, 16]
        for k in ["tm8_tn8_bm128_bn128", "tm8_tn8_bm128_bn64", "tm8_tn8_bm64_bn64"]},
     # Stage 3 + warp tiling
-    **{f"s3w_{k}": (f"mymatmul.gpu.matmul_cuda_s3_warp.matmul_s3_warp_{k}", None)
+    **{f"s3w_{k}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s3_warp.matmul_s3_warp_{k}", None)
        for k in [
            "tm8_tn8_bm128_bn128_bk32_wm64_wn32_u8",
            "tm8_tn8_bm128_bn128_bk32_wm32_wn64_u8",
@@ -172,8 +164,8 @@ def run(impls, sizes):
                 continue
 
             # Create tensors directly on GPU
-            A_gpu = torch.randn(M, K, dtype=torch.bfloat16, device='cuda')
-            B_gpu = torch.randn(K, N, dtype=torch.bfloat16, device='cuda')
+            A_gpu = torch.randn(M, K, dtype=torch.float32, device='cuda')
+            B_gpu = torch.randn(K, N, dtype=torch.float32, device='cuda')
 
             # Validate result before benchmarking
             try:

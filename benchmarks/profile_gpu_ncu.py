@@ -17,10 +17,10 @@ import torch
 
 # Registry: name -> dotpath
 IMPLEMENTATIONS = {
-    "cuda_naive_ijk": "mymatmul.gpu.matmul_cuda.matmul_cuda_naive_ijk",
-    "cuda_naive_ijk_jx": "mymatmul.gpu.matmul_cuda.matmul_cuda_naive_ijk_jx",
-    "cuda_tiled_32x32": "mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x32",
-    "cuda_tiled_32x32_16x16": "mymatmul.gpu.matmul_cuda.matmul_cuda_tiled_32x32_threads_16x16",
+    "cuda_naive_ijk": "mymatmul.gpu.cuda_core.matmul_cuda.matmul_cuda_naive_ijk",
+    "cuda_naive_ijk_jx": "mymatmul.gpu.cuda_core.matmul_cuda.matmul_cuda_naive_ijk_jx",
+    "cuda_tiled_32x32": "mymatmul.gpu.cuda_core.matmul_cuda.matmul_cuda_tiled_32x32",
+    "cuda_tiled_32x32_16x16": "mymatmul.gpu.cuda_core.matmul_cuda.matmul_cuda_tiled_32x32_threads_16x16",
 }
 
 PROFILE_DIR = os.path.join(os.path.dirname(__file__), "profiles_ncu")
@@ -37,11 +37,11 @@ def create_profile_script(fn_name, fn, M, N, K, output_path):
     """Create a standalone Python script that ncu can profile."""
     script = f'''
 import torch
-from mymatmul.gpu.matmul_cuda import {fn.__name__}
+from mymatmul.gpu.cuda_core.matmul_cuda import {fn.__name__}
 
 # Create input tensors on GPU
-A_gpu = torch.randn({M}, {K}, dtype=torch.bfloat16, device='cuda')
-B_gpu = torch.randn({K}, {N}, dtype=torch.bfloat16, device='cuda')
+A_gpu = torch.randn({M}, {K}, dtype=torch.float32, device='cuda')
+B_gpu = torch.randn({K}, {N}, dtype=torch.float32, device='cuda')
 
 # Warm up
 torch.cuda.synchronize()

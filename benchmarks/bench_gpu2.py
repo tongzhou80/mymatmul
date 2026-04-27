@@ -33,8 +33,8 @@ def run(impls, sizes):
                 print(f"  {M}x{N}x{K}: skipped (max_size={max_size})")
                 continue
 
-            A_gpu = torch.randn(M, K, dtype=torch.bfloat16, device='cuda')
-            B_gpu = torch.randn(K, N, dtype=torch.bfloat16, device='cuda')
+            A_gpu = torch.randn(M, K, dtype=torch.float32, device='cuda')
+            B_gpu = torch.randn(K, N, dtype=torch.float32, device='cuda')
 
             try:
                 validate_fn(fn, A_gpu, B_gpu)

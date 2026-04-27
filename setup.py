@@ -37,19 +37,30 @@ ext_modules.append(cpp_ext)
 if cuda_available:
     try:
         from torch.utils.cpp_extension import CUDAExtension
-        # cuda_ext = CUDAExtension(
-        #     "mymatmul.gpu._matmul_cuda_ext",
-        #     sources=["mymatmul/gpu/_matmul_cuda_ext.cu"],
-        #     extra_compile_args={
-        #         'cxx': ["-O3"],
-        #         'nvcc': ["-O3", "-std=c++17"],
-        #     },
-        # )
-        # ext_modules.append(cuda_ext)
+
+        cuda_ext = CUDAExtension(
+            "mymatmul.gpu.cuda_core._matmul_cuda_ext",
+            sources=["mymatmul/gpu/cuda_core/_matmul_cuda_ext.cu"],
+            extra_compile_args={
+                'cxx': ["-O3"],
+                'nvcc': ["-O3", "-std=c++17"],
+            },
+        )
+        ext_modules.append(cuda_ext)
+
+        cuda_ext_s2 = CUDAExtension(
+            "mymatmul.gpu.cuda_core._matmul_cuda_ext_s2",
+            sources=["mymatmul/gpu/cuda_core/_matmul_cuda_ext_s2.cu"],
+            extra_compile_args={
+                'cxx': ["-O3"],
+                'nvcc': ["-O3", "-std=c++17", "-Xptxas", "-v"],
+            },
+        )
+        ext_modules.append(cuda_ext_s2)
 
         cuda_ext_s3 = CUDAExtension(
-            "mymatmul.gpu._matmul_cuda_ext_s3",
-            sources=["mymatmul/gpu/_matmul_cuda_ext_s3.cu"],
+            "mymatmul.gpu.cuda_core._matmul_cuda_ext_s3",
+            sources=["mymatmul/gpu/cuda_core/_matmul_cuda_ext_s3.cu"],
             extra_compile_args={
                 'cxx': ["-O3"],
                 'nvcc': ["-O3", "-std=c++17", "-Xptxas", "-v"],
@@ -57,9 +68,19 @@ if cuda_available:
         )
         ext_modules.append(cuda_ext_s3)
 
+        cuda_ext_s3_warp = CUDAExtension(
+            "mymatmul.gpu.cuda_core._matmul_cuda_ext_s3_warp",
+            sources=["mymatmul/gpu/cuda_core/_matmul_cuda_ext_s3_warp.cu"],
+            extra_compile_args={
+                'cxx': ["-O3"],
+                'nvcc': ["-O3", "-std=c++17", "-Xptxas", "-v"],
+            },
+        )
+        ext_modules.append(cuda_ext_s3_warp)
+
         cuda_ext_s4 = CUDAExtension(
-            "mymatmul.gpu._matmul_cuda_ext_s4",
-            sources=["mymatmul/gpu/_matmul_cuda_ext_s4.cu"],
+            "mymatmul.gpu.cuda_core._matmul_cuda_ext_s4",
+            sources=["mymatmul/gpu/cuda_core/_matmul_cuda_ext_s4.cu"],
             extra_compile_args={
                 'cxx': ["-O3"],
                 'nvcc': ["-O3", "-std=c++17", "-Xptxas", "-v"],
@@ -68,8 +89,8 @@ if cuda_available:
         ext_modules.append(cuda_ext_s4)
 
         cuda_ext_s4b = CUDAExtension(
-            "mymatmul.gpu._matmul_cuda_ext_s4b",
-            sources=["mymatmul/gpu/_matmul_cuda_ext_s4b.cu"],
+            "mymatmul.gpu.cuda_core._matmul_cuda_ext_s4b",
+            sources=["mymatmul/gpu/cuda_core/_matmul_cuda_ext_s4b.cu"],
             extra_compile_args={
                 'cxx': ["-O3"],
                 'nvcc': ["-O3", "-std=c++17", "-Xptxas", "-v"],
@@ -77,19 +98,19 @@ if cuda_available:
         )
         ext_modules.append(cuda_ext_s4b)
 
-        # cuda_ext2 = CUDAExtension(
-        #     "mymatmul.gpu._matmul_cuda_ext2",
-        #     sources=["mymatmul/gpu/_matmul_cuda_ext2.cu"],
-        #     extra_compile_args={
-        #         'cxx': ["-O3"],
-        #         'nvcc': ["-O3", "-std=c++17", "-Xptxas", "-v"],
-        #     },
-        # )
-        # ext_modules.append(cuda_ext2)
+        cuda_ext_s4sw = CUDAExtension(
+            "mymatmul.gpu.cuda_core._matmul_cuda_ext_s4sw",
+            sources=["mymatmul/gpu/cuda_core/_matmul_cuda_ext_s4sw.cu"],
+            extra_compile_args={
+                'cxx': ["-O3"],
+                'nvcc': ["-O3", "-std=c++17", "-Xptxas", "-v"],
+            },
+        )
+        ext_modules.append(cuda_ext_s4sw)
 
         cuda_ext_s5 = CUDAExtension(
-            "mymatmul.gpu._matmul_cuda_ext_s5",
-            sources=["mymatmul/gpu/_matmul_cuda_ext_s5.cu"],
+            "mymatmul.gpu.tensor_core._matmul_cuda_ext_s5",
+            sources=["mymatmul/gpu/tensor_core/_matmul_cuda_ext_s5.cu"],
             extra_compile_args={
                 'cxx': ["-O3"],
                 'nvcc': ["-O3", "-std=c++17", "-Xptxas", "-v"],
@@ -97,35 +118,6 @@ if cuda_available:
         )
         ext_modules.append(cuda_ext_s5)
 
-        cuda_ext_s2 = CUDAExtension(
-            "mymatmul.gpu._matmul_cuda_ext_s2",
-            sources=["mymatmul/gpu/_matmul_cuda_ext_s2.cu"],
-            extra_compile_args={
-                'cxx': ["-O3"],
-                'nvcc': ["-O3", "-std=c++17", "-Xptxas", "-v"],
-            },
-        )
-        ext_modules.append(cuda_ext_s2)
-
-        cuda_ext_s3_warp = CUDAExtension(
-            "mymatmul.gpu._matmul_cuda_ext_s3_warp",
-            sources=["mymatmul/gpu/_matmul_cuda_ext_s3_warp.cu"],
-            extra_compile_args={
-                'cxx': ["-O3"],
-                'nvcc': ["-O3", "-std=c++17", "-Xptxas", "-v"],
-            },
-        )
-        ext_modules.append(cuda_ext_s3_warp)
-
-        cuda_ext_s4sw = CUDAExtension(
-            "mymatmul.gpu._matmul_cuda_ext_s4sw",
-            sources=["mymatmul/gpu/_matmul_cuda_ext_s4sw.cu"],
-            extra_compile_args={
-                'cxx': ["-O3"],
-                'nvcc': ["-O3", "-std=c++17", "-Xptxas", "-v"],
-            },
-        )
-        ext_modules.append(cuda_ext_s4sw)
     except ImportError:
         print("Warning: PyTorch CUDA extension not available, skipping GPU extension")
 

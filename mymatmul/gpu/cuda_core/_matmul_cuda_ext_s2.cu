@@ -1,6 +1,5 @@
 #include <torch/extension.h>
 #include <cuda_runtime.h>
-#include <cuda_bf16.h>
 
 /*
  * Stage 2: Shared Memory Tiling
@@ -8,9 +7,8 @@
  * Educational kernels illustrating the tradeoff between arithmetic intensity
  * and occupancy for two tile / thread-layout configurations.
  *
- * Data type: bfloat16 input/output, float32 accumulation.
- * Shared memory holds bf16 tiles — half the footprint of float32 tiles —
- * which matters for the occupancy calculation.
+ * Data type: float32 input/output and accumulation.
+ * Shared memory holds float32 tiles.
  *
  * Each thread computes a small micro-tile (TM x TN output elements) with no
  * tx-remap: physical thread layout maps directly to the output tile.
@@ -22,12 +20,12 @@
  * Case 1: BM=8,  BN=32, BK=32, threads=32x4 → TM=2, TN=1
  *   Global A.I. = 8*32/(8+32)   = 6.4
  *   Shared A.I. = 2*1/(2+1)     = 0.67
- *   SMEM: (8*32 + 32*32) * 2B   = 2560 B
+ *   SMEM: (8*32 + 32*32) * 4B   = 5120 B
  *
  * Case 2: BM=16, BN=32, BK=32, threads=32x8 → TM=2, TN=1
  *   Global A.I. = 16*32/(16+32) = 10.67
  *   Shared A.I. = 2*1/(2+1)     = 0.67  (same as case 1)
- *   SMEM: (16*32 + 32*32) * 2B  = 3072 B
+ *   SMEM: (16*32 + 32*32) * 4B  = 6144 B
  *
  * Register and shared-memory usage can be inspected by compiling with:
  *   nvcc -arch=sm_89 -O3 -Xptxas -v
@@ -35,10 +33,10 @@
  *
  * Occupancy notes (RTX 4090, SM 8.9, 65536 regs / 48 KB SMEM per SM):
  *   Case 1 (128 threads, 4 warps/block):
- *     2560 B SMEM → up to 18 blocks fit on SMEM budget → 72 warps
+ *     5120 B SMEM → up to 9 blocks fit on SMEM budget → 36 warps
  *
  *   Case 2 (256 threads, 8 warps/block):
- *     3072 B SMEM → up to 15 blocks fit → 120 warps
+ *     6144 B SMEM → up to 7 blocks fit → 56 warps
  */
 
 
@@ -52,9 +50,9 @@
 //     B tile (BK x BN = 32 x 32 = 1024 elems): 1024 / 128 threads = 8 per thread
 // ---------------------------------------------------------------------------
 __global__ void smem_tiled_bm8_bn32_bk32_threads32x4(
-    const __nv_bfloat16* __restrict__ A,
-    const __nv_bfloat16* __restrict__ B,
-    __nv_bfloat16* __restrict__ C,
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
     int M, int K, int N
 ) {
     constexpr int BM = 8;
@@ -62,10 +60,9 @@ __global__ void smem_tiled_bm8_bn32_bk32_threads32x4(
     constexpr int BK = 32;
     constexpr int THREADS = 32 * 4;   // 128
 
-    // bf16 shared memory: 2 B per element
-    __shared__ __nv_bfloat16 A_shared[BM][BK];   // 8  * 32 * 2B = 512 B
-    __shared__ __nv_bfloat16 B_shared[BK][BN];   // 32 * 32 * 2B = 2048 B
-                                                   // total = 2560 B
+    __shared__ float A_shared[BM][BK];   // 8  * 32 * 4B = 1024 B
+    __shared__ float B_shared[BK][BN];   // 32 * 32 * 4B = 4096 B
+                                          // total = 5120 B
 
     const int tx = threadIdx.x;   // 0..31 → N dimension
     const int ty = threadIdx.y;   // 0..3  → M dimension (row pair index)
@@ -74,7 +71,6 @@ __global__ void smem_tiled_bm8_bn32_bk32_threads32x4(
     const int col      = blockIdx.x * BN + tx;
     const int row_base = blockIdx.y * BM + ty * 2;
 
-    // float32 accumulators for numerical stability
     float acc0 = 0.0f;
     float acc1 = 0.0f;
 
@@ -90,7 +86,7 @@ __global__ void smem_tiled_bm8_bn32_bk32_threads32x4(
             const int glo_col = k0 + c;
             A_shared[r][c] = (glo_row < M && glo_col < K)
                              ? A[glo_row * K + glo_col]
-                             : __float2bfloat16(0.0f);
+                             : 0.0f;
         }
 
         // --- Cooperative load of B tile (BK x BN = 32 x 32) ---
@@ -103,26 +99,25 @@ __global__ void smem_tiled_bm8_bn32_bk32_threads32x4(
             const int glo_col = blockIdx.x * BN + c;
             B_shared[r][c] = (glo_row < K && glo_col < N)
                              ? B[glo_row * N + glo_col]
-                             : __float2bfloat16(0.0f);
+                             : 0.0f;
         }
 
         __syncthreads();
 
         // --- Compute: TM=2 rows, TN=1 col, accumulate over BK ---
-        // Cast bf16 → float before FMA to keep accumulators in float32
         for (int kk = 0; kk < BK; kk++) {
-            const float b_val = __bfloat162float(B_shared[kk][tx]);
-            acc0 += __bfloat162float(A_shared[ty * 2    ][kk]) * b_val;
-            acc1 += __bfloat162float(A_shared[ty * 2 + 1][kk]) * b_val;
+            const float b_val = B_shared[kk][tx];
+            acc0 += A_shared[ty * 2    ][kk] * b_val;
+            acc1 += A_shared[ty * 2 + 1][kk] * b_val;
         }
 
         __syncthreads();
     }
 
-    // --- Write back: float32 → bf16 ---
+    // --- Write back ---
     if (col < N) {
-        if (row_base     < M) C[ row_base      * N + col] = __float2bfloat16(acc0);
-        if (row_base + 1 < M) C[(row_base + 1) * N + col] = __float2bfloat16(acc1);
+        if (row_base     < M) C[ row_base      * N + col] = acc0;
+        if (row_base + 1 < M) C[(row_base + 1) * N + col] = acc1;
     }
 }
 
@@ -141,9 +136,9 @@ __global__ void smem_tiled_bm8_bn32_bk32_threads32x4(
 //   but global A.I. rises from 6.4 → 10.67 at the cost of a larger thread block.
 // ---------------------------------------------------------------------------
 __global__ void smem_tiled_bm16_bn32_bk32_threads32x8(
-    const __nv_bfloat16* __restrict__ A,
-    const __nv_bfloat16* __restrict__ B,
-    __nv_bfloat16* __restrict__ C,
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
     int M, int K, int N
 ) {
     constexpr int BM = 16;
@@ -151,9 +146,9 @@ __global__ void smem_tiled_bm16_bn32_bk32_threads32x8(
     constexpr int BK = 32;
     constexpr int THREADS = 32 * 8;   // 256
 
-    __shared__ __nv_bfloat16 A_shared[BM][BK];   // 16 * 32 * 2B = 1024 B
-    __shared__ __nv_bfloat16 B_shared[BK][BN];   // 32 * 32 * 2B = 2048 B
-                                                   // total = 3072 B
+    __shared__ float A_shared[BM][BK];   // 16 * 32 * 4B = 2048 B
+    __shared__ float B_shared[BK][BN];   // 32 * 32 * 4B = 4096 B
+                                          // total = 6144 B
 
     const int tx = threadIdx.x;   // 0..31 → N dimension
     const int ty = threadIdx.y;   // 0..7  → M dimension (row pair index)
@@ -177,7 +172,7 @@ __global__ void smem_tiled_bm16_bn32_bk32_threads32x8(
             const int glo_col = k0 + c;
             A_shared[r][c] = (glo_row < M && glo_col < K)
                              ? A[glo_row * K + glo_col]
-                             : __float2bfloat16(0.0f);
+                             : 0.0f;
         }
 
         // --- Cooperative load of B tile (BK x BN = 32 x 32) ---
@@ -190,16 +185,16 @@ __global__ void smem_tiled_bm16_bn32_bk32_threads32x8(
             const int glo_col = blockIdx.x * BN + c;
             B_shared[r][c] = (glo_row < K && glo_col < N)
                              ? B[glo_row * N + glo_col]
-                             : __float2bfloat16(0.0f);
+                             : 0.0f;
         }
 
         __syncthreads();
 
         // --- Compute ---
         for (int kk = 0; kk < BK; kk++) {
-            const float b_val = __bfloat162float(B_shared[kk][tx]);
-            acc0 += __bfloat162float(A_shared[ty * 2    ][kk]) * b_val;
-            acc1 += __bfloat162float(A_shared[ty * 2 + 1][kk]) * b_val;
+            const float b_val = B_shared[kk][tx];
+            acc0 += A_shared[ty * 2    ][kk] * b_val;
+            acc1 += A_shared[ty * 2 + 1][kk] * b_val;
         }
 
         __syncthreads();
@@ -207,8 +202,8 @@ __global__ void smem_tiled_bm16_bn32_bk32_threads32x8(
 
     // --- Write back ---
     if (col < N) {
-        if (row_base     < M) C[ row_base      * N + col] = __float2bfloat16(acc0);
-        if (row_base + 1 < M) C[(row_base + 1) * N + col] = __float2bfloat16(acc1);
+        if (row_base     < M) C[ row_base      * N + col] = acc0;
+        if (row_base + 1 < M) C[(row_base + 1) * N + col] = acc1;
     }
 }
 
@@ -219,7 +214,7 @@ __global__ void smem_tiled_bm16_bn32_bk32_threads32x8(
 
 torch::Tensor matmul_s2_bm8_bn32_bk32_threads32x4(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(A.is_cuda() && B.is_cuda(), "Inputs must be CUDA tensors");
-    TORCH_CHECK(A.dtype() == torch::kBFloat16, "Only bfloat16 is supported in Stage 2 kernels");
+    TORCH_CHECK(A.dtype() == torch::kFloat, "Only float32 is supported in Stage 2 kernels");
     TORCH_CHECK(A.is_contiguous() && B.is_contiguous(), "Inputs must be contiguous");
 
     const int M = A.size(0);
@@ -233,9 +228,9 @@ torch::Tensor matmul_s2_bm8_bn32_bk32_threads32x4(torch::Tensor A, torch::Tensor
     dim3 blocks((N + BN - 1) / BN, (M + BM - 1) / BM);
 
     smem_tiled_bm8_bn32_bk32_threads32x4<<<blocks, threads>>>(
-        reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(B.data_ptr()),
-        reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+        A.data_ptr<float>(),
+        B.data_ptr<float>(),
+        C.data_ptr<float>(),
         M, K, N
     );
 
@@ -244,7 +239,7 @@ torch::Tensor matmul_s2_bm8_bn32_bk32_threads32x4(torch::Tensor A, torch::Tensor
 
 torch::Tensor matmul_s2_bm16_bn32_bk32_threads32x8(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(A.is_cuda() && B.is_cuda(), "Inputs must be CUDA tensors");
-    TORCH_CHECK(A.dtype() == torch::kBFloat16, "Only bfloat16 is supported in Stage 2 kernels");
+    TORCH_CHECK(A.dtype() == torch::kFloat, "Only float32 is supported in Stage 2 kernels");
     TORCH_CHECK(A.is_contiguous() && B.is_contiguous(), "Inputs must be contiguous");
 
     const int M = A.size(0);
@@ -258,9 +253,9 @@ torch::Tensor matmul_s2_bm16_bn32_bk32_threads32x8(torch::Tensor A, torch::Tenso
     dim3 blocks((N + BN - 1) / BN, (M + BM - 1) / BM);
 
     smem_tiled_bm16_bn32_bk32_threads32x8<<<blocks, threads>>>(
-        reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(B.data_ptr()),
-        reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+        A.data_ptr<float>(),
+        B.data_ptr<float>(),
+        C.data_ptr<float>(),
         M, K, N
     );
 
