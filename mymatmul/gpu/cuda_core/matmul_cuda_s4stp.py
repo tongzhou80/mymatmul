@@ -1,9 +1,9 @@
-"""Stage 4 Strided (s4st): double-buffered cp.async with strided output assignment."""
+"""Stage 4 Strided+Padded (s4stp): s4st with A_shared[BM][BK+1] row padding."""
 
 import re
 from .._pycuda_loader import launch_matmul
 
-_EXT = "_matmul_cuda_ext_s4st"
+_EXT = "_matmul_cuda_ext_s4stp"
 
 def _make(kernel_name):
     m = re.search(r'tm(\d+)_tn(\d+)_bm(\d+)_bn(\d+)', kernel_name)
@@ -18,7 +18,6 @@ def _make(kernel_name):
     fn.__name__ = kernel_name
     return fn
 
-for _k in ["tm8_tn8_bm64_bn64", "tm8_tn8_bm128_bn128", "tm8_tn8_bm128_bn64", "tm8_tn8_bm64_bn128"]:
-    for _u in [1, 4, 8, 16]:
-        _name = f"matmul_cuda_s4st_{_k}_bk16_u{_u}"
-        globals()[_name.replace("matmul_cuda_", "matmul_")] = _make(_name)
+for _u in [1, 4, 8, 16]:
+    _name = f"matmul_cuda_s4stp_tm8_tn8_bm64_bn64_bk16_u{_u}"
+    globals()[_name.replace("matmul_cuda_", "matmul_")] = _make(_name)

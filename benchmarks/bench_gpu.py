@@ -47,7 +47,7 @@ IMPLEMENTATIONS = {
     # Stage 4 Strided: strided output assignment → consecutive B reads per warp step
     **{f"s4st_{k}_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4st.matmul_s4st_{k}_bk16_u{u}", None)
        for u in [1, 4, 8, 16]
-       for k in ["tm8_tn8_bm64_bn64", "tm8_tn8_bm128_bn128"]},
+       for k in ["tm8_tn8_bm64_bn64", "tm8_tn8_bm128_bn128", "tm8_tn8_bm128_bn64", "tm8_tn8_bm64_bn128"]},
     # Stage 4b: Stage 4 + A_shared bank-conflict fix (BK+4 padding), BN=128 only
     **{f"s4b_tm8_tn8_bm128_bn128_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4b.matmul_s4b_tm8_tn8_bm128_bn128_bk16_u{u}", None)
        for u in [8, 16]},
@@ -55,6 +55,9 @@ IMPLEMENTATIONS = {
     **{f"s4sw_{k}_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4sw.matmul_s4sw_{k}_bk16_u{u}", None)
        for u in [1, 2, 4, 8, 16]
        for k in ["tm8_tn8_bm128_bn128", "tm8_tn8_bm128_bn64", "tm8_tn8_bm64_bn64"]},
+    # Stage 4 Strided+Padded: s4st + A_shared[BM][BK+1] padding → zero A conflicts (educational)
+    **{f"s4stp_tm8_tn8_bm64_bn64_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4stp.matmul_s4stp_tm8_tn8_bm64_bn64_bk16_u{u}", None)
+       for u in [1, 4, 8, 16]},
     # Stage 3 + warp tiling
     **{f"s3w_{k}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s3_warp.matmul_s3_warp_{k}", None)
        for k in [
