@@ -13,6 +13,7 @@ import torch
 # max_size: skip sizes larger than this (leaves empty cells in the results table)
 IMPLEMENTATIONS = {
     "triton_fp32simt_autotuned": ("mymatmul.gpu.matmul_triton.triton_fp32simt_autotuned", None),
+    "triton_fp32simt_bm128_bn128_bk32_w8_s4": ("mymatmul.gpu.matmul_triton.triton_fp32simt_bm128_bn128_bk32_w8_s4", None),
     "torch_matmul": ("mymatmul.gpu.matmul_torch.matmul_torch",   None),
     # cuBLAS FP32 with TF32 disabled (pure FP32 SIMT, comparable to our s4 kernels)
     "cublas_fp32_notf32": ("mymatmul.gpu.matmul_torch.matmul_torch_fp32_notf32", None),
@@ -61,6 +62,9 @@ IMPLEMENTATIONS = {
     **{f"s4sw_{k}_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4sw.matmul_s4sw_{k}_bk16_u{u}", None)
        for u in [1, 2, 4, 8, 16]
        for k in ["tm8_tn8_bm128_bn128", "tm8_tn8_bm128_bn64", "tm8_tn8_bm64_bn64"]},
+    # s4st BK=32 dynamic smem: bm128_bn128_bk32 needs 64 KB (> 48 KB static limit)
+    **{f"s4st_bk32_tm8_tn8_bm128_bn128_bk32_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4st_bk32.matmul_s4st_bk32_tm8_tn8_bm128_bn128_bk32_u{u}", None)
+       for u in [1, 4, 8, 16, 32]},
     # Stage 4 Strided-2: 2-contiguous output assignment → float2 B smem loads, zero conflicts
     **{f"s4st2_tm8_tn8_bm128_bn128_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4st2.matmul_s4st2_tm8_tn8_bm128_bn128_bk16_u{u}", None)
        for u in [1, 4, 8, 16]},

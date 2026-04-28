@@ -158,6 +158,20 @@ def triton_fp32simt_autotuned(A, B):
     return C
 
 
+# Best autotuned config: BM=128, BN=128, BK=32, num_warps=8, num_stages=4
+def triton_fp32simt_bm128_bn128_bk32_w8_s4(A, B):
+    M, K = A.shape; _, N = B.shape
+    C = torch.empty((M, N), device=A.device, dtype=A.dtype)
+    grid = lambda meta: (triton.cdiv(M, 128) * triton.cdiv(N, 128),)
+    _matmul_kernel[grid](
+        A, B, C, M, N, K,
+        A.stride(0), A.stride(1), B.stride(0), B.stride(1), C.stride(0), C.stride(1),
+        BLOCK_M=128, BLOCK_N=128, BLOCK_K=32, GROUP_M=8, ALLOW_TF32=False,
+        num_warps=8, num_stages=4,
+    )
+    return C
+
+
 # FP32 SIMT configs (comparable to our s4 CUDA kernels)
 triton_fp32simt_bm128_bn128_bk16 = _make_triton_fp32_simt(128, 128, 16)
 triton_fp32simt_bm128_bn64_bk16  = _make_triton_fp32_simt(128,  64, 16)

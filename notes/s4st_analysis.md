@@ -7,8 +7,8 @@ thread-to-output mapping from "row-major block" to a strided layout.
 
 **s4 (standard)**: thread `(lty, ltx)` computes rows `lty, lty+1, ..., lty+(TM-1)` — consecutive.
 
-**s4st (strided)**: thread `(lty, ltx)` computes rows `lty, lty+LCOLS, lty+2*LCOLS, ...` — strided
-by the number of logical thread columns.
+**s4st (strided)**: thread `(lty, ltx)` computes rows `lty, lty+LROWS, lty+2*LROWS, ...` — strided
+by the number of logical thread rows.
 
 The motivation is to eliminate shared memory bank conflicts in B tile reads.
 
@@ -37,129 +37,98 @@ For **bm64_bn64** (LCOLS=8, 4 warps, 8×8 logical thread grid):
 
 ## Benchmark Results @ 4096³ (RTX 4090, fp32)
 
-| Kernel | GFLOPS |
-|---|---|
-| cuBLAS (no TF32) | ~55,742 |
-| s4st bm128_bn128 u16 | ~46,084 |
-| s4st bm128_bn64 u16 | ~41,000 |
-| s4st bm64_bn64 u16 | ~34,000 |
-| s4 bm128_bn128 u16 | ~40,000 |
-| s4sw bm128_bn128 u16 | ~40,000 |
-
-s4st bm128_bn128 u16 is our best result: **~83% of cuBLAS**.
-
----
-
-## NCU Profiling: s4st vs cuBLAS @ 4096³
-
-### Speed-of-Light & Occupancy
-
-| Metric | s4st bm128_bn128 u16 | cuBLAS (no TF32) |
+| Kernel | GFLOPS | Notes |
 |---|---|---|
-| SM% | 76.6 | 80.5 |
-| **L1/TEX%** | **76.6** | **42.7** |
-| L2% | 29.7 | 30.4 |
-| DRAM% | 18.9 | 17.6 |
-| Occupancy% | 16.7 | 16.7 |
-| Smem LD conflicts | 0 | 0 |
-| Smem ST conflicts | 0 | 0 |
+| cuBLAS (no TF32) | ~55,742 | reference |
+| **s4st2 bm128_bn128 bk16 u16** | **~45,777** | **best custom kernel** |
+| s4st bm128_bn128 bk32 u32 | ~45,653 | dynamic smem |
+| s4st bm128_bn128 bk16 u16 | ~44,577 | |
+| s4st bm128_bn64 bk32 u32 | ~45,298 | |
+| s4st bm128_bn64 bk16 u16 | ~44,165 | |
+| s4 bm128_bn128 u16 | ~40,000 | |
+| s4sw bm128_bn128 u16 | ~40,000 | |
 
-### Resource Usage
-
-| | s4st | cuBLAS |
-|---|---|---|
-| Threads/block | 256 | 256 |
-| Registers/thread | 242 | 202 |
-| Smem/block | 32 KB | 48 KB |
-| Occupancy limiter | regs | regs |
+s4st2 bm128_bn128 bk16 u16 is our best result: **~82% of cuBLAS**.
 
 ---
 
-## Bottleneck Analysis
+## NCU Profiling @ 4096³: Cross-Kernel Comparison
 
-Both kernels are at identical 16.7% occupancy (1 block/SM), both register-limited.
-With only 2 warps per scheduler, there is minimal latency hiding from warp switching.
+### Speed-of-Light, Occupancy, and Smem Instructions
 
-The critical difference is **L1/TEX throughput**: 76.6% vs 42.7%.
+| Kernel | GFLOPS | SM% | L1/TEX% | Occ% | Regs | smem_ld_inst |
+|---|---|---|---|---|---|---|
+| s4st bk16 u16 | 44,577 | 76.6 | 76.6 | 16.7 | 242 | 342M |
+| s4st bk32 u32 | 45,653 | 77.5 | 77.5 | 16.7 | 248 | 339M |
+| s4st2 (old unpack) u16 | 44,311 | 67.9 | 48.7 | 16.7 | 164 | 208M |
+| **s4st2 (direct) u16** | **45,777** | **70.5** | **50.7** | **16.7** | **168** | **208M** |
+| Triton w8s4 | ~48,000 | 70.2 | 48.1 | 16.7 | 188 | 171M |
+| cuBLAS (no TF32) | 55,742 | 80.5 | 42.7 | 16.7 | 202 | — |
 
-This means:
-- Our kernel saturates L1/TEX at the same SM throughput as cuBLAS
-- cuBLAS does **more FMAs per shared memory read** — it achieves higher arithmetic intensity
-  from shared memory by reusing data already in registers (larger effective tile per smem access)
-- We issue 256 smem reads × 16 kk iterations per tile per warp; cuBLAS issues far fewer per FMA
+### What SM% means
 
-### What warp-level shuffle tiling showed
+`sm__throughput.avg.pct_of_peak_sustained_elapsed` measures how much of the SM's
+instruction-issue capacity is utilized, averaged over the kernel's elapsed time.
 
-We explored reducing smem reads via `__shfl_sync` (load once per warp, broadcast to 32 threads).
-Theoretically ~5× fewer smem ops. In practice, ~3× *slower* than s4st because:
-- Shuffle latency (~20 cycles) adds overhead per kk iteration
-- Reduced smem reads didn't compensate for the shuffle synchronization cost
-- With only 2 warps/scheduler, no other warp hides the shuffle stalls
+Key observation: for s4st bk16/bk32, **SM% equals L1/TEX%**. This means every
+instruction-issue cycle is fully occupied processing smem requests — the smem pipe
+and the SM are in lockstep. The bottleneck is memory-side.
 
-### Path to closing the gap
-
-To approach cuBLAS performance from the cuda-core side:
-1. **Larger BK** (e.g. BK=32): halves the number of `__syncthreads()` and tile loops,
-   amortizes pipeline overhead — at the cost of a 2-way A bank conflict (BK=32 with BM=128,
-   stride 32 → rows 0 & 32 alias)
-2. **More registers/reuse per smem load**: load A/B once and accumulate across multiple kk
-   without re-reading smem — requires unrolling the BK loop and keeping fragments in registers
-3. **Higher occupancy**: currently bottlenecked by 242 regs/thread; register tiling (smaller
-   TM×TN with more blocks) trades per-block arithmetic intensity for more warps/SM
-
-cuBLAS likely uses a combination of these plus architecture-specific optimizations
-(e.g. LDMATRIX, HMMA, asynchronous copy pipelines with larger staging buffers).
+For s4st2 and Triton, **SM% > L1/TEX%** (70 vs 50). The smem pipe is no longer
+the bottleneck; the remaining throughput gap is due to compute-side stalls
+(register dependency latency, warp switch overhead).
 
 ---
 
-## BK=32 Experiment: The "Optimize One Thing, Break Another" Pattern
+## BK=32 Experiment
 
-### Analysis before benchmarking
+### Bank conflict analysis
 
 Increasing BK from 16 to 32 has two competing effects:
 
-**Benefit**: Half as many tile iterations, so half the `__syncthreads()` calls and pipeline
-overhead. For K=4096 with BM=128: 32 tiles instead of 64. Each tile has 2 syncs, so 64
-fewer barriers per block.
+**Benefit**: Half as many tile iterations — for K=4096 with BM=128: 32 tiles instead
+of 64. Each tile has 2 `__syncthreads()`, so 64 fewer barriers per block.
 
 **Cost**: A bank conflict is introduced.
 
-With BK=32, `A_shared` is `[BM][32]`, so each row has exactly 32 floats — one bank per
-column (`bank = col % 32 = col`). When two threads in a warp read column `kk`:
-- With bm128_bn128: warp has 2 lty values (2w, 2w+1). Both read `A_shared[row][kk]`.
-  `row*32 + kk` maps both to bank `kk`. **2-way A bank conflict** (vs 0 for BK=16).
+With BK=32, `A_shared` is `[BM][32]` — exactly one bank per column (`bank = col % 32 = col`).
+When two threads in a warp read column `kk` from different lty rows: both map to bank `kk`
+→ **2-way A bank conflict** (vs 0 for BK=16).
 
-With BK=16, `A_shared` is `[BM][16]`, so `bank = (row*16 + kk) % 32`. The two lty rows
-differ by 1, so their bank values differ by 16 — no conflict.
+With BK=16: `bank = (row*16 + kk) % 32`. The two lty rows in a warp differ by 1,
+so their bank values differ by 16 — no conflict.
 
-**Smem budget hard wall**: For bm128_bn128:
+### Smem budget hard wall
+
+For bm128_bn128:
 - `A_shared[2][128][32]` = 32768 bytes
 - `B_shared[2][32][128]` = 32768 bytes
 - Total = 65536 bytes = 64 KB, exceeding the 48 KB per-block default limit.
-- bm128_bn128_bk32 cannot be instantiated without dynamic smem + `cudaFuncSetAttribute`.
 
-So our main BK=32 candidate fails: the config that had zero bank conflicts (bm128_bn128)
-cannot use BK=32 due to smem budget. The configs that can (bm128_bn64, bm64_bn64) already
-have more limited tile coverage.
+**Solution**: dynamic shared memory + `cudaFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES, 65536)`.
+Ada Lovelace (RTX 4090) supports up to ~100 KB per block. This unlocks bm128_bn128_bk32
+and its zero-bank-conflict property transfers to BK=32 too (same bank arithmetic).
 
-### Benchmark results @ 4096^3 (RTX 4090)
+The dynamic smem kernel is in `cuda_core/_matmul_cuda_ext_s4st_bk32.cu`, wrapped by
+`matmul_cuda_s4st_bk32.py` which passes `smem_bytes=65536`.
+
+### Benchmark results @ 4096³
 
 | Kernel | GFLOPS | vs BK=16 best |
 |---|---|---|
-| s4st bm128_bn64 bk16 u16  | 44,165 | baseline |
-| s4st bm128_bn64 bk32 u8   | 42,407 | -4% |
-| s4st bm128_bn64 bk32 u16  | 41,020 | -7% |
-| s4st bm128_bn64 bk32 u32  | **45,298** | **+2.5%** |
-| s4st bm64_bn64  bk16 u16  | 42,337 | baseline |
-| s4st bm64_bn64  bk32 u16  | 39,406 | -7% |
-| s4st bm64_bn64  bk32 u32  | 43,352 | +2.4% |
+| s4st bm128_bn128 bk16 u16 | 44,577 | baseline |
+| s4st bm128_bn128 bk32 u32 | **45,653** | **+2.4%** |
+| s4st bm128_bn64 bk16 u16 | 44,165 | baseline |
+| s4st bm128_bn64 bk32 u32 | 45,298 | +2.5% |
+| s4st bm64_bn64 bk16 u16 | 42,337 | baseline |
+| s4st bm64_bn64 bk32 u32 | 43,352 | +2.4% |
 
-Full unroll (u32) with BK=32 wins slightly: the syncthreads reduction outweighs the A bank
-conflicts only when the loop is fully unrolled. At lower unroll factors the conflicts
-dominate.
+Full unroll (u32) wins: the syncthreads reduction only outweighs the A bank conflicts
+when the loop is fully unrolled and the register pressure from a larger unroll is
+acceptable.
 
-**Takeaway**: +2.5% for a non-trivial change, and only available for configs that can't
-achieve zero bank conflicts anyway (bm128_bn128 is smem-limited at BK=32).
+NCU for bk32 shows SM%=77.5, L1/TEX%=77.5 — still in lockstep, smem is the
+bottleneck, same profile as bk16 just with slightly fewer total wavefronts.
 
 ---
 
@@ -167,9 +136,9 @@ achieve zero bank conflicts anyway (bm128_bn128 is smem-limited at BK=32).
 
 ### What Triton does
 
-The best Triton config (BM=128, BN=128, BK=32, 8 warps) emits `ld.shared.v4.b32`
-for B tile reads — loading 4 consecutive floats (128 bits) per instruction, giving ~4x
-instruction-level throughput for B.
+The best Triton config (BM=128, BN=128, BK=32, 8 warps, 4 stages) emits
+`ld.shared.v4.b32` for B tile reads — loading 4 consecutive floats (128 bits)
+per instruction. Its smem_ld_inst is 171M vs our 342M (bk16) — half the instructions.
 
 ### Why our strided layout blocks this
 
@@ -177,37 +146,30 @@ In s4st, thread `ltx` reads B at positions:
 ```
 B_shared[kk][ltx + 0*LCOLS],  B_shared[kk][ltx + 1*LCOLS], ...
 ```
-These addresses have stride LCOLS=16 floats = 64 bytes between elements. `float4` loads
-require 16-byte-aligned **consecutive** addresses. Our stride is 64 bytes — cannot use
-vector loads.
-
-### Why Triton's layout enables it
-
-Triton assigns threads so that each thread owns consecutive output columns within its
-block. At B-read time, threads in a warp collectively cover consecutive B columns, making
-`ld.shared.v4.b32` natural.
+These addresses have stride LCOLS=16 floats = 64 bytes between elements.
+Float4 loads require 16-byte-aligned **consecutive** addresses. Our stride is
+64 bytes — vector loads are impossible.
 
 ### The coupling problem
-
-This is a direct illustration of how optimizations interact:
 
 | Optimization | What it enables | What it breaks |
 |---|---|---|
 | Strided output (s4st) | Zero B bank conflicts | Non-consecutive B reads, no float4 |
 | Contiguous output (s4) | Consecutive B reads, float4 possible | 2-way B bank conflicts at BN=64 |
-| BK=16 bm128_bn128 | Zero A and B conflicts | Smem too small for BK=32 |
+| BK=16 bm128_bn128 | Zero A and B conflicts | Smem too small for BK=32 (static) |
 | BK=32 bm128_bn64 | Fewer barriers | 2-way A conflicts |
 
-There is no layout that simultaneously achieves zero bank conflicts, vector B loads, and
-large BK without a fundamentally different access pattern — e.g., swizzle mapping or
-LDMATRIX instructions (which operate on a different memory model designed for tensor cores).
+There is no layout that simultaneously achieves zero bank conflicts, vector B loads,
+and large BK without a fundamentally different access pattern — e.g., swizzle mapping
+or LDMATRIX instructions (designed for tensor cores).
 
-### Why Triton avoids bank conflicts despite vector loads
+### How Triton avoids bank conflicts despite vector loads
 
-Triton applies a swizzle (XOR pattern) on shared memory layout automatically during code
-generation. Internally, `tl.dot` maps to `mma` tensor core instructions that use LDMATRIX,
-which is designed to work with the swizzle pattern. This is architecture-specific
-optimization that bypasses the manual bank-conflict reasoning we do for scalar loads.
+Triton applies a swizzle (XOR pattern) on shared memory layout automatically during
+code generation. Internally, `tl.dot` maps to `mma` tensor core instructions that
+use LDMATRIX, which is designed to work with the swizzle pattern. This is an
+architecture-specific optimization that bypasses the manual bank-conflict reasoning
+required for scalar loads.
 
 ---
 
@@ -216,56 +178,134 @@ optimization that bypasses the manual bank-conflict reasoning we do for scalar l
 ### Hypothesis
 
 With the s4st strided layout, thread ltx reads B_shared at stride LCOLS=16 — non-consecutive,
-blocking float2 loads. The idea: change to a "2-contiguous" layout where each thread ltx
-owns column pairs {2*ltx, 2*ltx+1}, {2*ltx+32, 2*ltx+33}, ... (stride 2*LCOLS=32 between
-pairs). At each step j (0..3), thread ltx reads `float2` from `B_shared[kk][2*ltx + j*32]`.
+blocking float2 loads. Change to a "2-contiguous" layout: each thread ltx owns column pairs
+`{2*ltx, 2*ltx+1}`, `{2*ltx+32, 2*ltx+33}`, ... (stride 2*LCOLS=32 between pairs). At step
+j (0..3), thread ltx reads `float2` from `B_shared[kk][2*ltx + j*32]`.
 
-**Bank conflict analysis**: B_shared is [BK][BN]=[16][128], bank=c%32. At step j=0:
-- ltx=0 → banks 0,1; ltx=1 → banks 2,3; ...; ltx=15 → banks 30,31.
-- All 32 banks distinct; lanes k and k+16 (same ltx) read same address → broadcast.
-- Zero conflicts. ✓
+**Bank conflict analysis** (BK=16, BN=128, LCOLS=16): bank = c%32. At step j:
+- 16 threads load float2 at cols 2*ltx + j*32, 2*ltx + j*32 + 1
+- ltx=0 → banks 0,1; ltx=1 → banks 2,3; ...; ltx=15 → banks 30,31
+- All 32 banks distinct; lanes with same ltx (across the warp's other half) access
+  the same address → broadcast, not a conflict.
+- **Zero conflicts**. ✓
 
-This was implemented as `s4st2` with 4×float2 B loads instead of 8×scalar.
+This is implemented as `s4st2` (see `cuda_core/_matmul_cuda_ext_s4st2.cu`).
 
-### Results @ 4096³
+### Attempt 1: unpack into intermediate array (worse)
 
-| Kernel | GFLOPS |
-|---|---|
-| s4st bm128_bn128 bk16 u16 | 44,874 |
-| s4st2 bm128_bn128 bk16 u16 | 44,311 (-1.3%) |
-| s4st2 bm128_bn128 bk16 u8 | 43,634 (-3%) |
+Initial COMPUTE_TILE unpacked `float2 _bv` into `float _b[TN]`, then ran the TM×TN
+FMA loop over the `_b` array:
+```c
+float _b[TN];
+for (int _j = 0; _j < TN/2; _j++) {
+    float2 _bv = *reinterpret_cast<const float2*>(...);
+    _b[2*_j] = _bv.x;  _b[2*_j+1] = _bv.y;
+}
+for (int _i = 0; _i < TM; _i++)
+    for (int _j = 0; _j < TN; _j++)
+        acc[_i][_j] += _a[_i] * _b[_j];
+```
 
-Float2 is slightly *worse*. Why?
+Results: 44,311 GFLOPS (-1.3% vs s4st bk16 u16). NCU: SM%=67.9, L1/TEX%=48.7, 164 regs.
 
-### The wavefront vs. instruction distinction
+**Why it was slower**: The intermediate `_b[TN]` array broke the dependency chain between
+load and FMA. The compiler had to hold all 8 loaded values before issuing any FMA,
+worsening the schedule. SM% dropped from 76.6 to 67.9 — the SM itself became underutilized.
 
-The bug in the hypothesis: **L1/TEX pressure is measured in wavefronts, not instructions**.
+Also, the core insight about wavefronts applies here:
 
-A warp's scalar smem load (32 threads × 1 float each = 32 accesses) takes 1 wavefront when
-all 32 banks are distinct. A float2 load (32 threads × 2 floats each = 64 accesses) takes
-**2 wavefronts** — hardware must process them in two 32-bank cycles.
+> The L1/TEX pipeline is measured in **wavefronts** (32-bank cycles), not instructions.
+> A float2 load issues 1 instruction but consumes 2 wavefronts.
+> 4×float2 = 8 wavefronts = same as 8×scalar.
+> Halving instruction count left memory traffic (wavefronts) unchanged.
 
-So 4×float2 = 4×2 = 8 wavefronts per kk — exactly the same as 8×scalar = 8 wavefronts.
-We halved instruction count but left memory traffic (wavefronts) unchanged.
+### Attempt 2: direct float2 FMA — the fix
 
-The small regression comes from float2 unpack overhead (`bv.x`, `bv.y` extractions into
-separate registers) and changed accumulator indexing slightly hurting compiler scheduling.
+Instead of unpacking into `_b[]`, use `bv.x` and `bv.y` directly inside the j-loop,
+consuming each value immediately in TM FMAs before loading the next:
+```c
+for (int _j = 0; _j < TN/2; _j++) {
+    float2 _bv = *reinterpret_cast<const float2*>(...);
+    for (int _i = 0; _i < TM; _i++) {
+        acc[_i][2*_j]   += _a[_i] * _bv.x;
+        acc[_i][2*_j+1] += _a[_i] * _bv.y;
+    }
+}
+```
 
-### Pattern
+Results: **45,777 GFLOPS** (+2.7% vs s4st bk16 u16, new best). NCU: SM%=70.5, L1/TEX%=50.7, 168 regs.
 
-This is now the third experiment where "reducing smem instructions" failed to reduce
-L1/TEX pressure:
-1. Warp shuffle: replaced smem reads with shfl_sync — but shfl goes through same datapath,
-   added more smem_ld_inst.
-2. Float2 loads: halved smem instructions — but wavefront count unchanged.
-3. (The only path to fewer wavefronts: fewer elements read per kk, which requires
-   larger register tiles or architectural change like LDMATRIX with tensor cores.)
+**Why it works**: Eliminating the intermediate array shortens the load→FMA dependency
+chain. The compiler can interleave the float2 load with the TM FMAs that follow, keeping
+the execution units busy. SM% rises to 70.5 — now matching Triton's 70.2.
+
+The L1/TEX% drops from 76.6 (s4st) to 50.7 (s4st2) because the wavefront count is now
+lower — the loads are fewer (4 float2 instructions vs 8 scalar per kk per thread) and
+the smem pipe is no longer the hard bottleneck.
+
+### Comparison with Triton
+
+| Kernel | SM% | L1/TEX% | Regs | smem_ld_inst |
+|---|---|---|---|---|
+| s4st bk16 u16 | 76.6 | 76.6 | 242 | 342M |
+| s4st bk32 u32 | 77.5 | 77.5 | 248 | 339M |
+| **s4st2 (direct) u16** | **70.5** | **50.7** | **168** | **208M** |
+| Triton w8s4 | 70.2 | 48.1 | 188 | 171M |
+
+s4st2 and Triton now have the **same SM%/L1/TEX% profile**: both are out of the
+smem-bottleneck regime and into the compute-stall regime. The remaining performance
+gap is:
+- Triton uses v4 smem loads (`ld.shared.v4.b32`) for smem_ld_inst=171M vs our 208M
+- Triton uses 3-stage pipeline (96 KB dynamic smem) vs our 2-stage
+- Triton uses 188 regs/thread; we use 168 with fewer accumulators
+
+To fully close the gap from the CUDA-core side would require either v4 B loads
+(which requires restructuring to 4-contiguous output assignment — 4×LCOLS stride
+between owned columns) or a 3-stage pipeline for more memory latency hiding.
+
+### Key lessons
+
+1. **Instruction count ≠ bandwidth**: reducing smem instructions doesn't reduce L1/TEX
+   wavefronts if the vector width is smaller than the bank group size.
+2. **Dependency chain length matters**: an intermediate accumulator array between
+   a smem load and subsequent FMAs can hurt the compiler's scheduling freedom enough
+   to reduce SM utilization by ~12%.
+3. **SM% vs L1/TEX% reveals the bottleneck**: when they're equal, smem is the
+   rate-limiter; when SM% > L1/TEX%, the smem pipe is cleared and instruction-level
+   stalls dominate.
 
 ---
 
-## TODO: Triton Best Config NCU Bank Conflicts
+## Bottleneck Analysis: s4st vs cuBLAS
 
-To verify that Triton's swizzle achieves zero bank conflicts, measure with NCU.
-Since `cuda_kernel_name()` returns None for Triton, the existing `profile_ncu_sol.py`
-skips it. A custom NCU invocation without `--kernel-name` (using SM% heuristic) would
-be needed to capture the Triton matmul kernel's conflict counters.
+Both kernels are at 16.7% occupancy (1 block/SM), both register-limited.
+
+The critical difference is **L1/TEX throughput**: s4st is at 76.6%, cuBLAS at 42.7%.
+cuBLAS does more FMAs per shared memory read — higher arithmetic intensity from smem by
+reusing data across a larger effective tile. cuBLAS likely uses tensor cores (HMMA) with
+LDMATRIX for structured smem reads, achieving 4× the FLOPs per smem access.
+
+Our best custom kernel (s4st2) is now in a different regime — L1/TEX% ~50%, same as Triton.
+The remaining ~15% gap to cuBLAS comes from cuBLAS using tensor cores (8× FLOPs per smem
+access) rather than SIMT FP32 FMAs.
+
+### What warp-level shuffle tiling showed
+
+Explored reducing smem reads via `__shfl_sync` (load once per warp, broadcast to 32 threads).
+~3× slower than s4st because:
+- Shuffle latency (~20 cycles) adds overhead per kk iteration
+- Reduced smem reads didn't compensate for the shuffle synchronization cost
+- With only 2 warps/scheduler, no other warp hides the shuffle stalls
+
+---
+
+## Summary: Optimization History
+
+| Stage | Change | GFLOPS | Change |
+|---|---|---|---|
+| s4 | double-buffered cp.async | ~40,000 | baseline |
+| s4st | strided layout, zero bank conflicts | ~44,577 | +11% |
+| s4st bk32 u32 | dynamic smem, larger tiles | ~45,653 | +2.4% |
+| s4st2 (direct) | float2 B loads, no temp array | **~45,777** | **+2.7%** |
+| Triton w8s4 | v4 loads, 3-stage pipeline | ~48,000 | reference |
+| cuBLAS | tensor cores | ~55,742 | reference |

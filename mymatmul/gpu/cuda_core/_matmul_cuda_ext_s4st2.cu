@@ -80,13 +80,13 @@ __device__ __forceinline__ void matmul_s4st2_impl(
         __pipeline_commit();                                                            \
     } while (0)
 
-    // 2-contiguous B reads: thread ltx reads B at cols 2*ltx + j*2*LCOLS (float2).
-    // A reads unchanged vs s4st.
+    // 2-contiguous B reads: use float2 directly without intermediate _b[] array.
+    // Each bv is immediately consumed by TM FMAs before the next load.
 #define COMPUTE_TILE(buf_)                                                              \
     do {                                                                                \
         _Pragma("unroll UNROLL")                                                        \
         for (int _kk = 0; _kk < BK; _kk++) {                                           \
-            float _a[TM], _b[TN];                                                       \
+            float _a[TM];                                                               \
             _Pragma("unroll")                                                           \
             for (int _i = 0; _i < TM; _i++)                                            \
                 _a[_i] = A_shared[(buf_)][lty + _i * LROWS][_kk];                      \
@@ -94,14 +94,12 @@ __device__ __forceinline__ void matmul_s4st2_impl(
             for (int _j = 0; _j < TN / 2; _j++) {                                      \
                 float2 _bv = *reinterpret_cast<const float2*>(                          \
                     &B_shared[(buf_)][_kk][2 * ltx + _j * 2 * LCOLS]);                 \
-                _b[2 * _j]     = _bv.x;                                                 \
-                _b[2 * _j + 1] = _bv.y;                                                 \
-            }                                                                           \
-            _Pragma("unroll")                                                           \
-            for (int _i = 0; _i < TM; _i++)                                            \
                 _Pragma("unroll")                                                       \
-                for (int _j = 0; _j < TN; _j++)                                        \
-                    acc[_i][_j] += _a[_i] * _b[_j];                                    \
+                for (int _i = 0; _i < TM; _i++) {                                      \
+                    acc[_i][2 * _j]     += _a[_i] * _bv.x;                             \
+                    acc[_i][2 * _j + 1] += _a[_i] * _bv.y;                             \
+                }                                                                       \
+            }                                                                           \
         }                                                                               \
     } while (0)
 

@@ -84,7 +84,7 @@ def get_kernel(ext_name: str, kernel_name: str) -> drv.Function:
 
 
 def launch_matmul(ext_name: str, kernel_name: str, A, B,
-                  block: tuple, grid: tuple, out_dtype=None):
+                  block: tuple, grid: tuple, out_dtype=None, smem_bytes: int = 0):
     """Launch a PyCUDA matmul kernel and return a new output tensor.
 
     The kernel signature must be:
@@ -93,6 +93,7 @@ def launch_matmul(ext_name: str, kernel_name: str, A, B,
 
     block and grid are (x, y, z) tuples as required by PyCUDA.
     out_dtype defaults to A.dtype.
+    smem_bytes: if > 0, sets MAX_DYNAMIC_SHARED_SIZE_BYTES and passes shared=smem_bytes.
     """
     import numpy as np
     import torch
@@ -101,7 +102,9 @@ def launch_matmul(ext_name: str, kernel_name: str, A, B,
     dtype = out_dtype if out_dtype is not None else A.dtype
     C = torch.zeros((M, N), device="cuda", dtype=dtype)
     fn = get_kernel(ext_name, kernel_name)
+    if smem_bytes > 0:
+        fn.set_attribute(drv.function_attribute.MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_bytes)
     fn(np.intp(A.data_ptr()), np.intp(B.data_ptr()), np.intp(C.data_ptr()),
        np.int32(M), np.int32(K), np.int32(N),
-       block=block, grid=grid)
+       block=block, grid=grid, shared=smem_bytes)
     return C
