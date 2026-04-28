@@ -211,6 +211,58 @@ optimization that bypasses the manual bank-conflict reasoning we do for scalar l
 
 ---
 
+## Float2 B Loads Experiment (s4st2)
+
+### Hypothesis
+
+With the s4st strided layout, thread ltx reads B_shared at stride LCOLS=16 — non-consecutive,
+blocking float2 loads. The idea: change to a "2-contiguous" layout where each thread ltx
+owns column pairs {2*ltx, 2*ltx+1}, {2*ltx+32, 2*ltx+33}, ... (stride 2*LCOLS=32 between
+pairs). At each step j (0..3), thread ltx reads `float2` from `B_shared[kk][2*ltx + j*32]`.
+
+**Bank conflict analysis**: B_shared is [BK][BN]=[16][128], bank=c%32. At step j=0:
+- ltx=0 → banks 0,1; ltx=1 → banks 2,3; ...; ltx=15 → banks 30,31.
+- All 32 banks distinct; lanes k and k+16 (same ltx) read same address → broadcast.
+- Zero conflicts. ✓
+
+This was implemented as `s4st2` with 4×float2 B loads instead of 8×scalar.
+
+### Results @ 4096³
+
+| Kernel | GFLOPS |
+|---|---|
+| s4st bm128_bn128 bk16 u16 | 44,874 |
+| s4st2 bm128_bn128 bk16 u16 | 44,311 (-1.3%) |
+| s4st2 bm128_bn128 bk16 u8 | 43,634 (-3%) |
+
+Float2 is slightly *worse*. Why?
+
+### The wavefront vs. instruction distinction
+
+The bug in the hypothesis: **L1/TEX pressure is measured in wavefronts, not instructions**.
+
+A warp's scalar smem load (32 threads × 1 float each = 32 accesses) takes 1 wavefront when
+all 32 banks are distinct. A float2 load (32 threads × 2 floats each = 64 accesses) takes
+**2 wavefronts** — hardware must process them in two 32-bank cycles.
+
+So 4×float2 = 4×2 = 8 wavefronts per kk — exactly the same as 8×scalar = 8 wavefronts.
+We halved instruction count but left memory traffic (wavefronts) unchanged.
+
+The small regression comes from float2 unpack overhead (`bv.x`, `bv.y` extractions into
+separate registers) and changed accumulator indexing slightly hurting compiler scheduling.
+
+### Pattern
+
+This is now the third experiment where "reducing smem instructions" failed to reduce
+L1/TEX pressure:
+1. Warp shuffle: replaced smem reads with shfl_sync — but shfl goes through same datapath,
+   added more smem_ld_inst.
+2. Float2 loads: halved smem instructions — but wavefront count unchanged.
+3. (The only path to fewer wavefronts: fewer elements read per kk, which requires
+   larger register tiles or architectural change like LDMATRIX with tensor cores.)
+
+---
+
 ## TODO: Triton Best Config NCU Bank Conflicts
 
 To verify that Triton's swizzle achieves zero bank conflicts, measure with NCU.

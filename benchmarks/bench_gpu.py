@@ -61,6 +61,9 @@ IMPLEMENTATIONS = {
     **{f"s4sw_{k}_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4sw.matmul_s4sw_{k}_bk16_u{u}", None)
        for u in [1, 2, 4, 8, 16]
        for k in ["tm8_tn8_bm128_bn128", "tm8_tn8_bm128_bn64", "tm8_tn8_bm64_bn64"]},
+    # Stage 4 Strided-2: 2-contiguous output assignment → float2 B smem loads, zero conflicts
+    **{f"s4st2_tm8_tn8_bm128_bn128_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4st2.matmul_s4st2_tm8_tn8_bm128_bn128_bk16_u{u}", None)
+       for u in [1, 4, 8, 16]},
     # s4st + intra-warp shuffle to reduce smem reads (experimental)
     "s4st_shfl_tm8_tn8_bm128_bn128_bk16": (
         "mymatmul.gpu.cuda_core.matmul_cuda_s4st_shfl.matmul_s4st_shfl_tm8_tn8_bm128_bn128_bk16", None),
