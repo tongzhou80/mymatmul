@@ -22,3 +22,8 @@ for _k in ["tm8_tn8_bm64_bn64", "tm8_tn8_bm128_bn128", "tm8_tn8_bm128_bn64", "tm
     for _u in [1, 4, 8, 16]:
         _name = f"matmul_cuda_s4st_{_k}_bk16_u{_u}"
         globals()[_name.replace("matmul_cuda_", "matmul_")] = _make(_name)
+
+for _k in ["tm8_tn8_bm64_bn64", "tm8_tn8_bm128_bn64"]:
+    for _u in [1, 4, 8, 16, 32]:
+        _name = f"matmul_cuda_s4st_{_k}_bk32_u{_u}"
+        globals()[_name.replace("matmul_cuda_", "matmul_")] = _make(_name)

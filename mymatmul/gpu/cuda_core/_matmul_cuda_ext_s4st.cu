@@ -158,3 +158,20 @@ MAKE_LAUNCHER_S4ST(matmul_cuda_s4st_tm8_tn8_bm64_bn128_bk16_u1,       64, 128, 1
 MAKE_LAUNCHER_S4ST(matmul_cuda_s4st_tm8_tn8_bm64_bn128_bk16_u4,       64, 128, 16,  8,  8,   4)
 MAKE_LAUNCHER_S4ST(matmul_cuda_s4st_tm8_tn8_bm64_bn128_bk16_u8,       64, 128, 16,  8,  8,   8)
 MAKE_LAUNCHER_S4ST(matmul_cuda_s4st_tm8_tn8_bm64_bn128_bk16_u16,      64, 128, 16,  8,  8,  16)
+
+// BK=32: halves tile count / syncthreads overhead, but introduces 2-way A bank conflicts
+// (bank = col%32 = kk for BK=32 → both warp lty rows hit same bank kk)
+MAKE_LAUNCHER_S4ST(matmul_cuda_s4st_tm8_tn8_bm64_bn64_bk32_u1,        64,  64, 32,  8,  8,   1)
+MAKE_LAUNCHER_S4ST(matmul_cuda_s4st_tm8_tn8_bm64_bn64_bk32_u4,        64,  64, 32,  8,  8,   4)
+MAKE_LAUNCHER_S4ST(matmul_cuda_s4st_tm8_tn8_bm64_bn64_bk32_u8,        64,  64, 32,  8,  8,   8)
+MAKE_LAUNCHER_S4ST(matmul_cuda_s4st_tm8_tn8_bm64_bn64_bk32_u16,       64,  64, 32,  8,  8,  16)
+MAKE_LAUNCHER_S4ST(matmul_cuda_s4st_tm8_tn8_bm64_bn64_bk32_u32,       64,  64, 32,  8,  8,  32)
+
+// bm128_bn128_bk32 would need 64KB smem (2×128×32×4 + 2×32×128×4 = 65536B > 48KB limit)
+// → not instantiated; use bm128_bn64 or bm64_bn64 for BK=32 experiments
+
+MAKE_LAUNCHER_S4ST(matmul_cuda_s4st_tm8_tn8_bm128_bn64_bk32_u1,      128,  64, 32,  8,  8,   1)
+MAKE_LAUNCHER_S4ST(matmul_cuda_s4st_tm8_tn8_bm128_bn64_bk32_u4,      128,  64, 32,  8,  8,   4)
+MAKE_LAUNCHER_S4ST(matmul_cuda_s4st_tm8_tn8_bm128_bn64_bk32_u8,      128,  64, 32,  8,  8,   8)
+MAKE_LAUNCHER_S4ST(matmul_cuda_s4st_tm8_tn8_bm128_bn64_bk32_u16,     128,  64, 32,  8,  8,  16)
+MAKE_LAUNCHER_S4ST(matmul_cuda_s4st_tm8_tn8_bm128_bn64_bk32_u32,     128,  64, 32,  8,  8,  32)

@@ -12,6 +12,7 @@ import torch
 # Registry: name -> (dotpath, max_size or None for no limit)
 # max_size: skip sizes larger than this (leaves empty cells in the results table)
 IMPLEMENTATIONS = {
+    "triton_fp32simt_autotuned": ("mymatmul.gpu.matmul_triton.triton_fp32simt_autotuned", None),
     "torch_matmul": ("mymatmul.gpu.matmul_torch.matmul_torch",   None),
     # cuBLAS FP32 with TF32 disabled (pure FP32 SIMT, comparable to our s4 kernels)
     "cublas_fp32_notf32": ("mymatmul.gpu.matmul_torch.matmul_torch_fp32_notf32", None),
@@ -48,6 +49,11 @@ IMPLEMENTATIONS = {
     **{f"s4st_{k}_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4st.matmul_s4st_{k}_bk16_u{u}", None)
        for u in [1, 4, 8, 16]
        for k in ["tm8_tn8_bm64_bn64", "tm8_tn8_bm128_bn128", "tm8_tn8_bm128_bn64", "tm8_tn8_bm64_bn128"]},
+    # Stage 4 Strided BK=32: halves tile count but adds 2-way A bank conflicts
+    # (bm128_bn128_bk32 needs 64KB smem → exceeds 48KB limit, not instantiated)
+    **{f"s4st_{k}_bk32_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4st.matmul_s4st_{k}_bk32_u{u}", None)
+       for u in [1, 4, 8, 16, 32]
+       for k in ["tm8_tn8_bm64_bn64", "tm8_tn8_bm128_bn64"]},
     # Stage 4b: Stage 4 + A_shared bank-conflict fix (BK+4 padding), BN=128 only
     **{f"s4b_tm8_tn8_bm128_bn128_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4b.matmul_s4b_tm8_tn8_bm128_bn128_bk16_u{u}", None)
        for u in [8, 16]},
