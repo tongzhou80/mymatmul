@@ -499,7 +499,7 @@ ptxas A-load vectorization (which would force 255 regs).
 
 ---
 
-## s4st_tn16_f2: Float2 B Loads with TN=16
+## s4st2_tn16: Float2 B Loads with TN=16
 
 ### Design
 
@@ -596,11 +596,11 @@ the last few B loads return.
 |---|---|---|
 | cuBLAS (no TF32) | 55.7 | tensor cores |
 | Triton autotuned (BN=256 added) | **47.8** | BM=128,BN=128,BK=32,w8,s3 wins |
-| **s4st_tn16_f2_u8** | **47.4** | new best CUDA SIMT |
+| **s4st2_tn16_u8** | **47.4** | new best CUDA SIMT |
 | s4st2_u16 | 45.5 | prev best CUDA SIMT |
 | s4st_tn16_u1 | 42.9 | |
 
-s4st_tn16_f2_u8 closes the gap to Triton to within 1%. The remaining gap is Triton's
+s4st2_tn16_u8 closes the gap to Triton to within 1%. The remaining gap is Triton's
 larger BK=32 (more arithmetic intensity per tile) and 3-stage pipeline.
 
 s4st2 remains the better kernel for small matrices (BN=128 → more blocks → better SM
