@@ -89,7 +89,7 @@ _autotune_configs = [
         num_stages=ns, num_warps=nw,
     )
     for bm in [64, 128]
-    for bn in [64, 128]
+    for bn in [64, 128, 256]
     for bk in [16, 32, 64]
     for ns in [2, 3, 4]
     for nw in [4, 8]
@@ -179,3 +179,5 @@ triton_fp32simt_bm64_bn64_bk16   = _make_triton_fp32_simt(64,   64, 16)
 triton_fp32simt_bm128_bn128_bk32 = _make_triton_fp32_simt(128, 128, 32)
 triton_fp32simt_bm128_bn64_bk32  = _make_triton_fp32_simt(128,  64, 32)
 triton_fp32simt_bm64_bn64_bk32   = _make_triton_fp32_simt(64,   64, 32)
+# BN=256 configs; BK=16 fits in 48KB smem with double buffering (2×(128×16+16×256)×4=49152B)
+triton_fp32simt_bm128_bn256_bk16 = _make_triton_fp32_simt(128, 256, 16)
