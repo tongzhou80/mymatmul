@@ -68,6 +68,15 @@ IMPLEMENTATIONS = {
     # Stage 4 Strided-2: 2-contiguous output assignment → float2 B smem loads, zero conflicts
     **{f"s4st2_tm8_tn8_bm128_bn128_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4st2.matmul_s4st2_tm8_tn8_bm128_bn128_bk16_u{u}", None)
        for u in [1, 4, 8, 16]},
+    # s4st2 BK=32 dynamic smem: float2 B loads + larger tile (64 KB)
+    **{f"s4st2_bk32_tm8_tn8_bm128_bn128_bk32_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4st2_bk32.matmul_s4st2_bk32_tm8_tn8_bm128_bn128_bk32_u{u}", None)
+       for u in [1, 4, 8, 16, 32]},
+    # Stage 4 Strided-4: float4 B reads + 8×4 warp layout, 2-way A conflict (no swizzle)
+    **{f"s4st4_tm8_tn8_bm128_bn128_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4st4.matmul_s4st4_tm8_tn8_bm128_bn128_bk16_u{u}", None)
+       for u in [1, 4, 8, 16]},
+    # Stage 4 Strided-4 XOR: float4 B reads + 8×4 warp layout + XOR A swizzle (zero conflicts)
+    **{f"s4st4_xor_tm8_tn8_bm128_bn128_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4st4_xor.matmul_s4st4_xor_tm8_tn8_bm128_bn128_bk16_u{u}", None)
+       for u in [1, 4, 8, 16]},
     # s4st + intra-warp shuffle to reduce smem reads (experimental)
     "s4st_shfl_tm8_tn8_bm128_bn128_bk16": (
         "mymatmul.gpu.cuda_core.matmul_cuda_s4st_shfl.matmul_s4st_shfl_tm8_tn8_bm128_bn128_bk16", None),

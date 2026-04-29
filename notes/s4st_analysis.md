@@ -299,13 +299,123 @@ Explored reducing smem reads via `__shfl_sync` (load once per warp, broadcast to
 
 ---
 
+---
+
+## Float4 B Loads Experiment (s4st4 / s4st4_xor)
+
+### Motivation
+
+s4st2 achieves smem_ld_inst=208M vs Triton's 171M. The gap is 37M instructions — all from
+B-side smem loads (Triton uses v4 = float4 loads). Hypothesis: switch from float2 to float4 B
+loads to close this instruction gap.
+
+### Why float4 requires a different warp layout
+
+With the existing 16×2 warp layout (LCOLS=16 distinct ltx per warp):
+- float2 B reads: 16 threads × 2 floats = 32 floats → exactly 32 banks → zero conflicts ✓
+- float4 B reads: 16 threads × 4 floats = 64 floats → wraps 32 banks twice → 2-way B conflict ✗
+
+Fix: **8×4 warp layout** (LCOLS_W=8 distinct ltx per warp):
+- float4 B reads: 8 threads × 4 floats = 32 floats → exactly 32 banks → zero B conflicts ✓
+- Same THREADS=256, TM=8, TN=8, BM=128, BN=128 — only the warp-internal grouping changes.
+- B read stride: `4*ltx + j*4*LCOLS` (j=0,1) — correctly covers all 128 BN columns without overlap.
+
+Thread mapping:
+```c
+warp_id = tid / 32;  lane = tid % 32
+ltx = (warp_id % 2) * 8 + lane % 8   // 0..15
+lty = (warp_id / 2) * 4 + lane / 8   // 0..15
+```
+
+### A bank conflict with 8×4 layout
+
+Warp 0 has lty ∈ {0,1,2,3} (consecutive rows). With BK=16:
+- bank(A_shared[row][kk]) = (row * 16 + kk) % 32
+- row=0: bank=kk;  row=1: bank=(kk+16)%32;  row=2: bank=kk ← conflict;  row=3: bank=(kk+16)%32 ← conflict
+- → 2-way A bank conflict (rows {0,2} alias, {1,3} alias).
+
+This is the same 2-way A conflict that s4st bk32 has and that s4st2 bk16 avoids.
+
+### XOR swizzle attempt (s4st4_xor)
+
+Apply `physical_col = kk XOR ((row & 2) * 4)` at both store and load time. This rotates
+alternate row-pairs by 8 columns, giving banks {kk, (kk+16)%32, kk^8, (kk^8+16)%32} for
+rows 0,1,2,3 — all distinct, zero A conflicts.
+
+### Benchmark results @ 4096³ (3-run average)
+
+| Kernel | GFLOPS | Notes |
+|---|---|---|
+| s4st2 bk16 u16 | ~45,763 | reference |
+| s4st4 (no XOR) u16 | ~44,600 | −2.5% vs s4st2 |
+| s4st4_xor u16 | ~40,700 | −11% vs s4st2 |
+
+### NCU profile @ 4096³
+
+| Kernel | SM% | L1/TEX% | smem_ld_wf | smem_ld_inst | LD-conf |
+|---|---|---|---|---|---|
+| s4st2 bk16 u16 | 70.4 | 50.7 | 402M | 207M | 0 |
+| s4st4 (no XOR) u16 | 71.4 | 49.8 | 402M | 140M | 0 |
+| s4st4_xor u16 | 72.5 | 55.6 | 469M | 241M | 0 |
+
+### What the data shows
+
+**s4st4 (no XOR)**: Float4 B loads reduce smem_ld_inst by 32% (207M→140M) but wavefronts
+are unchanged (402M). Why? Float2 generates 1 wf per step (16-unique-ltx × 2 = 32 floats =
+32 banks). Float4 also generates 1 wf per step (8-unique-ltx × 4 = 32 floats = 32 banks).
+With half as many steps, total B wf halves — but the 2-way A bank conflict adds wf that
+exactly compensates. Net: same smem bandwidth, fewer instructions. Despite fewer instructions,
+GFLOPS is −2.5%, because we're in compute-stall regime (SM% > L1/TEX%), not
+instruction-issue-bound.
+
+**s4st4_xor**: The XOR swizzle was supposed to eliminate A conflicts, but it causes MORE
+instructions (241M, up from 140M) and MORE wavefronts (469M, up from 402M) than s4st4.
+The root cause: `_kk ^ ((_row & 2) * 4)` involves a runtime-valued lty, so the compiler
+cannot vectorize A reads into float4. It falls back to scalar or float2 loads, multiplying
+A-side instructions and erasing all gains.
+
+Crucially, the conflict counter (LD-conf) reads 0 for s4st4 despite the theoretical 2-way A
+conflict. The hardware likely handles the two broadcast-groups-to-same-bank as sequential
+wavefronts without incrementing the conflict register. This is consistent with smem_ld_wf
+being the same as s4st2 (the extra wavefronts appear in the base wf count, not the conflict
+delta).
+
+### Conclusion
+
+Float4 B loads are not viable from the CUDA C side:
+- Without swizzle: instruction reduction doesn't translate to throughput gain (same wf, A conflict latency).
+- With XOR swizzle: compiler can't vectorize A reads, making things worse.
+
+Triton achieves float4 smem reads via LDMATRIX / mma instructions that are architecture-aware
+and swizzle-compatible. That path requires tensor core instructions (WMMA/PTX mma), not SIMT FP32.
+
+---
+
+## s4st2 bk32 Re-evaluation (3-run average @ 4096³)
+
+| Kernel | Avg GFLOPS |
+|---|---|
+| s4st  bk16 u16 | 44,751 |
+| s4st  bk32 u32 | 45,559 |
+| s4st2 bk16 u16 | 45,763 |
+| s4st2 bk32 u16 | 44,384 |
+| s4st2 bk32 u32 | 45,740 |
+
+**s4st2 bk16 u16 ≈ s4st2 bk32 u32** (within 25 GFLOPS = noise). BK=32 does not compound
+with float2 because s4st2 already left the smem-bottlenecked regime. The simpler s4st2 bk16
+(static smem, no cudaFuncSetAttribute) is the preferred best kernel.
+
+---
+
 ## Summary: Optimization History
 
 | Stage | Change | GFLOPS | Change |
 |---|---|---|---|
 | s4 | double-buffered cp.async | ~40,000 | baseline |
-| s4st | strided layout, zero bank conflicts | ~44,577 | +11% |
-| s4st bk32 u32 | dynamic smem, larger tiles | ~45,653 | +2.4% |
-| s4st2 (direct) | float2 B loads, no temp array | **~45,777** | **+2.7%** |
+| s4st | strided layout, zero bank conflicts | ~44,751 | +12% |
+| s4st bk32 u32 | dynamic smem, larger tiles | ~45,559 | +1.8% |
+| s4st2 bk16 u16 | float2 B loads, no temp array | **~45,763** | **+2.3%** |
+| s4st2 bk32 u32 | float2 + larger tile | ~45,740 | ≈ s4st2 bk16 |
+| s4st4 (float4) | 8×4 warp layout, float4 B | ~44,600 | −2.5% vs s4st2 |
 | Triton w8s4 | v4 loads, 3-stage pipeline | ~48,000 | reference |
 | cuBLAS | tensor cores | ~55,742 | reference |
