@@ -9,5 +9,5 @@ build/
 .vscode/
 *.nsys-rep
 *.sqlite
-notes/
+notes/tmux_text*.md
 benchmarks/results.csv

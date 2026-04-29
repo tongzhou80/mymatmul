@@ -407,7 +407,7 @@ with float2 because s4st2 already left the smem-bottlenecked regime. The simpler
 
 ---
 
-## Summary: Optimization History
+## Summary: Optimization History (up to s4st2)
 
 | Stage | Change | GFLOPS | Change |
 |---|---|---|---|
@@ -419,3 +419,189 @@ with float2 because s4st2 already left the smem-bottlenecked regime. The simpler
 | s4st4 (float4) | 8×4 warp layout, float4 B | ~44,600 | −2.5% vs s4st2 |
 | Triton w8s4 | v4 loads, 3-stage pipeline | ~48,000 | reference |
 | cuBLAS | tensor cores | ~55,742 | reference |
+
+---
+
+---
+
+## TN=16 Kernel Family (s4st_tn16)
+
+### Motivation: Higher Arithmetic Intensity from Smem
+
+Increasing TN from 8 to 16 (and BN from 128 to 256) changes the per-kk smem load count:
+
+| Config | FMAs/kk | A loads/kk | B loads/kk | FMA/load ratio |
+|---|---|---|---|---|
+| TN=8, BN=128 (s4st2) | 64 | 8 | 8 (float2) | 4.0 |
+| TN=16, BN=256 (s4st_tn16) | 128 | 8 | 16 (scalar) | **5.33** |
+
+More FMAs per smem load means the FMA pipe can stay busier relative to the smem pipe.
+The cost: BN=256 halves the number of blocks for small matrices (bad for N<2048), and
+the 16 scalar B loads per kk add register pressure.
+
+### Inline PTX Implementation
+
+`_matmul_cuda_ext_s4st_tn16.cu` uses a `LD_S(reg, base, byte_off)` macro:
+```c
+asm("ld.shared.f32 %0, [%1+" #byte_off "];" : "=f"(reg) : "r"(base));
+```
+All per-element offsets are compile-time constants; only `A_addr` and `B_addr` base
+pointers increment per-kk. This means ptxas never needs extra registers for offset arithmetic.
+
+### Profiling Results @ 4096³
+
+| Kernel | Regs | smem_ld_wf | SM% | TFLOPS |
+|---|---|---|---|---|
+| tn16_u1 | 194 | 402M | 81.5 | 42.9 |
+| tn16_u2 | 255 | 335M | ~64 | 41.9 |
+| tn16_u4 | 255 | 335M | ~64 | ~42.5 |
+| s4st2_u16 (prev best) | 168 | 208M inst | 70.5 | 45.5 |
+
+tn16_u1 achieves 81.5% SM — the highest of any variant — because 194 registers stay
+below the hardware register-pressure cliff. But u2+ all jump to 255 registers and drop
+to ~64% SM, losing the advantage.
+
+---
+
+## The 255-Register Cliff
+
+Every kernel that reaches 255 registers (the sm_89 maximum) converges to ~64% SM,
+regardless of instruction ordering (u2, u4, m2 hand-crafted interleaving, all identical
+within 1%). The drop is ~17 percentage points from the ~81% achievable at 194 registers.
+
+Key evidence that this is hardware-level, not scheduling quality:
+- All 255-reg kernels land at 63–65% SM regardless of load/FMA interleaving style
+- Occupancy is the same (1 block/SM → 8 warps/SM) for both 194-reg and 255-reg kernels
+- Register file utilization: 255 regs × 256 threads = 65,280 entries out of 65,536 (99.6%)
+
+Most plausible cause: the physical register file has banked read ports. At near-full
+utilization, multiple concurrent FMA operand reads conflict on the same bank, serializing
+what should be parallel register reads. This is consistent with the consistent floor value
+and independence from instruction scheduling.
+
+### Alternative Pipeline Variants
+
+Two variants were designed to escape the 255-reg cliff while improving latency hiding:
+
+**m2 (hand-crafted 2-way interleaving)**: `_matmul_cuda_ext_s4st_tn16_m2.cu`
+Unrolls 2 kk iterations in one loop body: all 48 loads (kk+0 and kk+1), then 256 FMAs.
+Result: 255 regs, 64.5% SM, 41.4 TFLOPS. Same cliff as compiler unroll.
+
+**p1 (register-prefetch pipeline)**: `_matmul_cuda_ext_s4st_tn16_p1.cu`
+Prefetches kk=0 before the loop; each loop body issues next-kk loads then FMAs on
+current kk. Register count: 193, just below the cliff.
+Result: 193 regs, 79% SM, 41.1 TFLOPS. Below the cliff but underperforms u1 (81.5%)
+due to prologue/epilogue overhead and the rename copies adding instruction overhead.
+
+Neither variant beats tn16_u1. The conclusion: u1 with 194 registers is naturally in
+the sweet spot — just below the cliff, with the loop back-edge incidentally preventing
+ptxas A-load vectorization (which would force 255 regs).
+
+---
+
+## s4st_tn16_f2: Float2 B Loads with TN=16
+
+### Design
+
+Replace the 16 scalar B loads per kk with 8 float2 loads using 2-contiguous output
+assignment (same as s4st2): thread ltx owns column pairs `{2*ltx, 2*ltx+1}`,
+`{2*ltx+32, 2*ltx+33}`, ... Bank conflict analysis is identical to s4st2: zero conflicts.
+
+Per-kk summary:
+- A: 8 scalar loads (unchanged)
+- B: 8 float2 loads (vs 16 scalar)
+- FMAs: 128
+- FMA/load instruction ratio: 128/16 = **8.0** (vs 5.33 for scalar tn16)
+
+### Register Count Surprise
+
+| Kernel | Regs |
+|---|---|
+| tn16_u1 (scalar, inline PTX) | 194 |
+| tn16_f2_u1 (float2 B, C++ indexing) | **168** |
+| tn16_f2_u2 | 255 |
+| tn16_f2_u4 | 255 |
+| tn16_f2_u8 | 255 |
+| tn16_f2_u16 | 255 |
+
+f2_u1 uses only 168 registers. With the `#pragma unroll`-ed j-loop (8 float2 steps),
+the compiler allocates `_bv` as a 2-register slot reused per j-step, whereas the scalar
+version may keep multiple `b_j` values live simultaneously to hide load latency.
+
+Despite 168 registers and fewer instructions (271M vs 405M), f2_u1 performs *worse*
+(39.5 vs 42.9 TFLOPS): the float2 loop structure interleaves each load with its
+immediate FMAs (`load bv; FMA×16; load bv; FMA×16; ...`), creating tight load-use
+dependency on every step — no latency hiding.
+
+### Wavefronts vs Instructions
+
+| Kernel | smem_ld_wf | smem_ld_inst |
+|---|---|---|
+| tn16_u1 (scalar) | 402M | 405M |
+| tn16_f2_u1 (float2 B) | 402M | 271M |
+| tn16_f2_u2 | 335M | 204M |
+| tn16_f2_u4/u8 | 335M | 170M |
+
+**Float2 B reduces instructions but NOT wavefronts.** Each `ld.shared.v2.f32` with
+16 unique addresses (all 32 banks used by 16 threads × 2 elements) requires 2 memory
+cycles — one for .x, one for .y. Thus 8 float2 instructions = 16 wavefronts = same
+as 16 scalar instructions.
+
+By contrast, ptxas-vectorized A loads (enabled at u2+ where two consecutive kk A values
+are visible in the same code region) DO reduce wavefronts: A_shared[row][kk] and
+A_shared[row][kk+1] are adjacent 4-byte elements; with heavy broadcast (16 threads
+→ 2 unique addresses), the v2 load needs only 1 wavefront. 8 scalar A loads → 4 float2
+A loads = 4 wavefronts (down from 8). This explains the 402M→335M drop at u2+.
+
+### Benchmark Results @ 4096³
+
+| Kernel | Regs | SM% | L1% | TFLOPS |
+|---|---|---|---|---|
+| tn16_u1 (baseline) | 194 | 81.5 | 81.5 | 42.9 |
+| tn16_f2_u1 | 168 | 59.4 | 50.1 | 39.5 |
+| tn16_f2_u2 | 255 | 61.4 | 41.6 | 42.5 |
+| tn16_f2_u4 | 255 | 67.4 | 39.8 | 46.0 |
+| **tn16_f2_u8** | **255** | **~69** | **~39** | **47.4** |
+| tn16_f2_u16 | 255 | — | — | 44.9 |
+
+f2_u8 is the new best CUDA kernel: **47.4 TFLOPS at 4096³ (+11% over s4st_tn16_u1)**.
+
+### Why f2_u8 Wins Despite the Register Cliff
+
+f2_u8 has 255 regs and only 67–69% SM — worse than tn16_u1's 81.5%. Yet it's faster.
+The key: L1/TEX% drops from 81.5% (tn16_u1) to ~39% (f2_u8). The smem pipe is no
+longer the bottleneck. With far fewer load instructions (170M vs 405M), each active
+cycle has more FMAs relative to loads, so the FMA pipeline runs at higher effective
+density even though peak SM% is lower.
+
+The optimal unroll is u8 = BK/2. At u16 (full unroll, BK/16 = 1 outer loop iteration),
+performance drops, likely because the instruction scheduler has trouble finding good
+orderings across the enormous inlined body and/or I-cache pressure increases.
+
+### Why Higher Unroll Always Helps (in this regime)
+
+The standard latency-hiding argument ("128 FMAs >> 20-cycle smem latency, u1 is enough")
+fails here because it assumes other warps hide the latency. With 4 warps per SM (low
+occupancy) and high register pressure, warp-level latency hiding is nearly disabled.
+The only mechanism is intra-warp ILP via unrolling: with u2+, ptxas can schedule kk+1
+loads while executing kk FMAs (since they're inlined into the same code region and are
+independent). With u1, each kk iteration starts with a short stall (~4 cycles) while
+the last few B loads return.
+
+---
+
+## Final Benchmark Comparison @ 4096³
+
+| Kernel | TFLOPS | Notes |
+|---|---|---|
+| cuBLAS (no TF32) | 55.7 | tensor cores |
+| Triton autotuned (BN=256 added) | **47.8** | BM=128,BN=128,BK=32,w8,s3 wins |
+| **s4st_tn16_f2_u8** | **47.4** | new best CUDA SIMT |
+| s4st2_u16 | 45.5 | prev best CUDA SIMT |
+| s4st_tn16_u1 | 42.9 | |
+
+s4st_tn16_f2_u8 closes the gap to Triton to within 1%. The remaining gap is Triton's
+larger BK=32 (more arithmetic intensity per tile) and 3-stage pipeline.
+
+s4st2 remains the better kernel for small matrices (BN=128 → more blocks → better SM
+utilization at N≤2048). The two kernels are complementary by matrix size.
