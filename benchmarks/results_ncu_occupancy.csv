@@ -1,0 +1,11 @@
+kernel,threads_per_block,registers_per_thread,smem_static_bytes,smem_dynamic_bytes,theoretical_occ_pct,achieved_occ_pct,limit_registers,limit_shared_mem,limit_block_size,limit_warps,bottleneck
+cublas_fp32_notf32,256.0,202.0,0.0,49152.0,16.67,16.65,1.0,1.0,24.0,6.0,regs
+triton_fp32simt_bm128_bn64_bk32,128.0,168.0,0.0,49152.0,16.67,16.52,3.0,2.0,24.0,12.0,smem
+s3_tm8_tn8_bm128_bn128_bk32_u8,256.0,38.0,0.0,0.0,100.0,67.7,6.0,16.0,24.0,6.0,regs
+s4_tm8_tn8_bm128_bn128_bk16_u8,256.0,38.0,0.0,0.0,100.0,67.54,6.0,16.0,24.0,6.0,regs
+s4_tm8_tn8_bm128_bn128_bk16_u16,256.0,38.0,0.0,0.0,100.0,67.08,6.0,16.0,24.0,6.0,regs
+s4_tm8_tn8_bm128_bn64_bk16_u16,256.0,38.0,0.0,0.0,100.0,67.39,6.0,16.0,24.0,6.0,regs
+s4_tm8_tn8_bm64_bn64_bk16_u16,64.0,250.0,16384.0,0.0,16.67,16.55,4.0,5.0,24.0,24.0,regs
+s4b_tm8_tn8_bm128_bn128_bk16_u16,256.0,38.0,0.0,0.0,100.0,67.41,6.0,16.0,24.0,6.0,regs
+s4sw_tm8_tn8_bm128_bn128_bk16_u8,256.0,38.0,0.0,0.0,100.0,67.44,6.0,16.0,24.0,6.0,regs
+s3w_tm8_tn8_bm128_bn128_bk32_wm64_wn32_u8,256.0,38.0,0.0,0.0,100.0,67.66,6.0,16.0,24.0,6.0,regs

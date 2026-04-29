@@ -2,7 +2,12 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 *.so
+*.cubin
 dist/
 build/
 .eggs/
+.vscode/
+*.nsys-rep
+*.sqlite
+notes/
 benchmarks/results.csv
