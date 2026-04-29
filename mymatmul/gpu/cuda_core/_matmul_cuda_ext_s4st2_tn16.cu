@@ -2,11 +2,11 @@
 #include <cuda_pipeline_primitives.h>
 
 /*
- * s4st_tn16_f2: TN=16, BN=256 with float2 B smem loads.
+ * s4st2_tn16: TN=16, BN=256 with float2 B smem loads.
  *
  * Layout vs s4st_tn16:
  *   s4st_tn16:  thread ltx owns B cols ltx, ltx+LCOLS, ..., ltx+(TN-1)*LCOLS  (scalar)
- *   s4st_tn16_f2: thread ltx owns B col PAIRS 2*ltx+j*2*LCOLS, 2*ltx+j*2*LCOLS+1  (float2)
+ *   s4st2_tn16: thread ltx owns B col PAIRS 2*ltx+j*2*LCOLS, 2*ltx+j*2*LCOLS+1  (float2)
  *
  * Per kk iteration:
  *   A: 8 scalar loads (unchanged, loop back-edge prevents vectorization)
@@ -24,7 +24,7 @@
  */
 
 template <int BM, int BN, int BK, int TM, int TN, int UNROLL>
-__device__ __forceinline__ void matmul_s4st_tn16_f2_impl(
+__device__ __forceinline__ void matmul_s4st2_tn16_impl(
     const float* __restrict__ A,
     const float* __restrict__ B,
     float* __restrict__ C,
@@ -139,14 +139,14 @@ __device__ __forceinline__ void matmul_s4st_tn16_f2_impl(
 extern "C" __global__ void NAME(                                               \
     const float* __restrict__ A, const float* __restrict__ B,                 \
     float* __restrict__ C, int M, int K, int N) {                              \
-    matmul_s4st_tn16_f2_impl<BM, BN, BK, TM, TN, UNROLL>(A, B, C, M, K, N); \
+    matmul_s4st2_tn16_impl<BM, BN, BK, TM, TN, UNROLL>(A, B, C, M, K, N); \
 }
 
 //                               NAME                                          BM   BN  BK  TM  TN  UNROLL
-MAKE_LAUNCHER(matmul_cuda_s4st_tn16_f2_tm8_tn16_bm128_bn256_bk16_u1,  128, 256, 16,  8, 16,  1)
-MAKE_LAUNCHER(matmul_cuda_s4st_tn16_f2_tm8_tn16_bm128_bn256_bk16_u2,  128, 256, 16,  8, 16,  2)
-MAKE_LAUNCHER(matmul_cuda_s4st_tn16_f2_tm8_tn16_bm128_bn256_bk16_u4,  128, 256, 16,  8, 16,  4)
-MAKE_LAUNCHER(matmul_cuda_s4st_tn16_f2_tm8_tn16_bm128_bn256_bk16_u8,  128, 256, 16,  8, 16,  8)
-MAKE_LAUNCHER(matmul_cuda_s4st_tn16_f2_tm8_tn16_bm128_bn256_bk16_u16, 128, 256, 16,  8, 16, 16)
+MAKE_LAUNCHER(matmul_cuda_s4st2_tn16_tm8_tn16_bm128_bn256_bk16_u1,  128, 256, 16,  8, 16,  1)
+MAKE_LAUNCHER(matmul_cuda_s4st2_tn16_tm8_tn16_bm128_bn256_bk16_u2,  128, 256, 16,  8, 16,  2)
+MAKE_LAUNCHER(matmul_cuda_s4st2_tn16_tm8_tn16_bm128_bn256_bk16_u4,  128, 256, 16,  8, 16,  4)
+MAKE_LAUNCHER(matmul_cuda_s4st2_tn16_tm8_tn16_bm128_bn256_bk16_u8,  128, 256, 16,  8, 16,  8)
+MAKE_LAUNCHER(matmul_cuda_s4st2_tn16_tm8_tn16_bm128_bn256_bk16_u16, 128, 256, 16,  8, 16, 16)
 
 #undef MAKE_LAUNCHER

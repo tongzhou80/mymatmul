@@ -16,6 +16,9 @@ import pycuda.driver as drv
 NVCC = "/usr/local/cuda/bin/nvcc"
 SM_ARCH = "sm_89"   # RTX 4090 (Ada Lovelace)
 
+# Per-extension extra nvcc flags (e.g. register caps).
+_EXTRA_FLAGS: dict[str, list[str]] = {}
+
 _lock = threading.Lock()
 _ctx: drv.Context | None = None
 _modules: dict[str, drv.Module] = {}
@@ -55,9 +58,11 @@ def _cubin_path(cu_path: str) -> str:
     return cu_path[:-3] + f"_{SM_ARCH}.cubin"
 
 
-def _compile(cu_path: str, cubin: str) -> None:
-    cmd = [NVCC, f"-arch={SM_ARCH}", "-O3", "--std=c++17", "--cubin",
-           cu_path, "-o", cubin]
+def _compile(cu_path: str, cubin: str, extra_flags: list[str] | None = None) -> None:
+    cmd = [NVCC, f"-arch={SM_ARCH}", "-O3", "--std=c++17", "--cubin"]
+    if extra_flags:
+        cmd.extend(extra_flags)
+    cmd += [cu_path, "-o", cubin]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"nvcc failed:\n{r.stderr}")
@@ -72,7 +77,7 @@ def get_module(ext_name: str) -> drv.Module:
         cubin = _cubin_path(cu_path)
         if not os.path.exists(cubin) or os.path.getmtime(cu_path) > os.path.getmtime(cubin):
             print(f"[pycuda] compiling {os.path.basename(cu_path)} ...", end=" ", flush=True)
-            _compile(cu_path, cubin)
+            _compile(cu_path, cubin, _EXTRA_FLAGS.get(ext_name))
             print("done")
         mod = drv.module_from_file(cubin)
         _modules[ext_name] = mod

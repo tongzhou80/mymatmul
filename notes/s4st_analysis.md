@@ -439,25 +439,62 @@ More FMAs per smem load means the FMA pipe can stay busier relative to the smem 
 The cost: BN=256 halves the number of blocks for small matrices (bad for N<2048), and
 the 16 scalar B loads per kk add register pressure.
 
-### Inline PTX Implementation
+### Kernel Variants
 
-`_matmul_cuda_ext_s4st_tn16.cu` uses a `LD_S(reg, base, byte_off)` macro:
+Three variants share the same tile geometry (TM=8, TN=16, BM=128, BN=256, BK=16):
+
+- **`s4st_tn16_ptx`** (`_matmul_cuda_ext_s4st_tn16_ptx.cu`): inline PTX `LD_S` macro for smem loads
+- **`s4st_tn16`** (`_matmul_cuda_ext_s4st_tn16.cu`): pure C++ array indexing, no inline PTX
+- **`s4st2_tn16`** (`_matmul_cuda_ext_s4st2_tn16.cu`): pure C++ with float2 B loads (2-contiguous layout)
+
+### Inline PTX Implementation (s4st_tn16_ptx)
+
+`_matmul_cuda_ext_s4st_tn16_ptx.cu` uses a `LD_S(reg, base, byte_off)` macro:
 ```c
 asm("ld.shared.f32 %0, [%1+" #byte_off "];" : "=f"(reg) : "r"(base));
 ```
 All per-element offsets are compile-time constants; only `A_addr` and `B_addr` base
 pointers increment per-kk. This means ptxas never needs extra registers for offset arithmetic.
 
+### PTX vs Pure C++: Why Manual Scheduling Matters at u1
+
+At u1, the PTX version outperforms the C++ version by 16% despite identical algorithms:
+
+| Kernel | Regs | SM% | TFLOPS |
+|---|---|---|---|
+| s4st_tn16_ptx u1 | 194 | 81.5 | 42.9 |
+| s4st_tn16 (C++) u1 | 168 | — | 36.9 |
+
+The difference is register liveness. The PTX version declares all 24 loaded values
+(`a0..a7`, `b0..b15`) as named scalar variables before any FMA, forcing ptxas to allocate
+all 24 in registers simultaneously and emit all loads before the first FMA:
+```
+ld.shared × 24   (all A and B values loaded)
+fma.rn   × 128   (all FMAs)
+```
+
+The C++ version at u1 has no such constraint. With only 128 FMAs visible in the loop body,
+it optimizes for register pressure by reusing registers: load `b[j]`, do 8 FMAs, reuse
+that register for `b[j+1]`. Result: 168 registers, but tight load-use coupling — the first
+FMA for each `b[j]` stalls waiting for the load to return (~23 cycles smem latency).
+
+At u2+, both converge to 255 registers. The compiler, with 2 consecutive kk iterations
+visible as straight-line code, naturally discovers the same front-loading pattern the PTX
+version forces at u1. The PTX advantage vanishes.
+
 ### Profiling Results @ 4096³
 
 | Kernel | Regs | smem_ld_wf | SM% | TFLOPS |
 |---|---|---|---|---|
-| tn16_u1 | 194 | 402M | 81.5 | 42.9 |
-| tn16_u2 | 255 | 335M | ~64 | 41.9 |
-| tn16_u4 | 255 | 335M | ~64 | ~42.5 |
+| tn16_ptx u1 | 194 | 402M | 81.5 | 42.9 |
+| tn16_ptx u2 | 255 | 335M | 65.6 | 42.1 |
+| tn16_ptx u4 | 255 | 335M | ~64 | ~43.9 |
+| tn16 (C++) u1 | 168 | — | — | 36.9 |
+| tn16 (C++) u4 | 255 | — | — | 43.8 |
+| tn16 (C++) u8 | 255 | — | — | 44.3 |
 | s4st2_u16 (prev best) | 168 | 208M inst | 70.5 | 45.5 |
 
-tn16_u1 achieves 81.5% SM — the highest of any variant — because 194 registers stay
+tn16_ptx_u1 achieves 81.5% SM — the highest of any variant — because 194 registers stay
 below the hardware register-pressure cliff. But u2+ all jump to 255 registers and drop
 to ~64% SM, losing the advantage.
 
@@ -484,14 +521,62 @@ and independence from instruction scheduling.
 Two variants were designed to escape the 255-reg cliff while improving latency hiding:
 
 **m2 (hand-crafted 2-way interleaving)**: `_matmul_cuda_ext_s4st_tn16_m2.cu`
-Unrolls 2 kk iterations in one loop body: all 48 loads (kk+0 and kk+1), then 256 FMAs.
-Result: 255 regs, 64.5% SM, 41.4 TFLOPS. Same cliff as compiler unroll.
+Unrolls 2 kk iterations in one loop body: all 48 loads (kk+0 and kk+1) issued first,
+then 256 FMAs.
+Expected register count: 218 (u1's 194 + 24 named kk+1 vars).
+Actual register count: **255**.
+
+#### Why m2 uses 255, not 218
+
+The extra 37 registers come from the interference graph. In m2's loop body the order is:
+1. Load `a0..a7`, `b0..b15` (kk+0)
+2. Load `c0..c7`, `d0..d15` (kk+1)
+3. 128 FMAs for kk+0 (a/b consumed at the end)
+4. 128 FMAs for kk+1 (c/d consumed)
+
+At step 3, `c0..c7` and `d0..d15` are **simultaneously live** alongside all 128 accumulators
+for the entire duration of the kk+0 FMAs. Those 24 vars each interfere with every one of
+the 128 accumulators — 24 × 128 = 3,072 extra interference edges in ptxas's allocation
+graph, inflating the overhead from ~40 extra registers (expected 218) to ~77 extra (actual 255).
+
+Peak simultaneously live values:
+- PTX u1: 128 acc + 24 loaded = **152**
+- m2: 128 acc + 48 loaded (kk+0 and kk+1 both live) = **176**
+
+NCU confirms m2 sits at the same 255-register cliff despite hand-crafted scheduling:
+
+| Kernel | Regs | SM% | TFLOPS |
+|---|---|---|---|
+| tn16_ptx u1 | 194 | 81.5 | 42.9 |
+| tn16_ptx u2 | 255 | 65.6 | 42.1 |
+| m2 (hand-crafted) | 255 | 59.7 | 41.4 |
+
+m2 is slightly worse than ptx u2 at the same 255-register cliff. Carefully ordering
+loads and FMAs by hand does not help once register pressure is the binding constraint.
+
+#### -maxrregcount experiments on m2
+
+Since m2 hits 255 due to interference-graph inflation rather than actual required
+simultaneously-live count (176), capping registers was expected to force register reuse
+without spill.
+
+| Cap | Regs | Spill | TFLOPS |
+|---|---|---|---|
+| none | 255 | 0 | 41.4 |
+| 240 | 240 | 0 | ~41.4 |
+| 220 | 220 | 0 | 39.4 |
+| 200 | 200 | 0 | — |
+
+m2 fits in 200 regs with zero spill — confirming the inflation was ptxas overhead, not
+actual need. However, **caps hurt performance**: with a tighter budget, ptxas has less
+freedom for bank assignment in the physical register file, so instruction latency increases
+and SM% stays at ~59% while TFLOPS drops. The cap trades away scheduling freedom for a
+lower register number that provides no occupancy benefit (still 1 block/SM).
 
 **p1 (register-prefetch pipeline)**: `_matmul_cuda_ext_s4st_tn16_p1.cu`
-Prefetches kk=0 before the loop; each loop body issues next-kk loads then FMAs on
-current kk. Register count: 193, just below the cliff.
-Result: 193 regs, 79% SM, 41.1 TFLOPS. Below the cliff but underperforms u1 (81.5%)
-due to prologue/epilogue overhead and the rename copies adding instruction overhead.
+Prefetches kk=0 before the loop; each iteration issues next-kk loads then current-kk FMAs.
+Result: 193 regs, 79% SM, 41.1 TFLOPS. Just below the cliff but underperforms u1 (81.5%)
+due to prologue/epilogue overhead and the register rename copies adding instruction overhead.
 
 Neither variant beats tn16_u1. The conclusion: u1 with 194 registers is naturally in
 the sweet spot — just below the cliff, with the loop back-edge incidentally preventing
@@ -587,6 +672,42 @@ The only mechanism is intra-warp ILP via unrolling: with u2+, ptxas can schedule
 loads while executing kk FMAs (since they're inlined into the same code region and are
 independent). With u1, each kk iteration starts with a short stall (~4 cycles) while
 the last few B loads return.
+
+---
+
+## Design Philosophy: Trust nvcc for Scheduling, Design the Structure
+
+The TN=16 experiments revealed a sharp boundary between what manual optimization
+can reliably control and what the compiler handles better:
+
+**What manual design controls predictably:**
+- Tile geometry (BM, BN, BK, TM, TN): determines arithmetic intensity and occupancy
+- Output layout (strided vs contiguous): determines bank conflict profile
+- Pipeline structure (single-buf, double-buf, 2-stage interleave): determines memory latency hiding
+- Unroll factor: determines how much ILP the compiler can exploit within a code region
+
+**Where manual PTX scheduling stops helping:**
+- Instruction interleaving within the inner loop body: at u1, inline PTX forces front-loading
+  and beats C++ by 16%. But at u2+, the compiler discovers the same pattern automatically.
+- Register count reduction via hand-crafting (m2): ptxas's interference-graph inflation
+  means the hand-crafted 2-way variant still hits 255 regs. Trying to cap with
+  `-maxrregcount` reduces bank-assignment freedom and hurts performance.
+- Any optimization that requires predicting ptxas's allocation and scheduling decisions
+  becomes a black box at unroll factors above 2.
+
+**Why higher unroll almost always wins (in this regime):**
+With only 4 warps/SM (low occupancy), warp-level latency hiding is weak. The only
+mechanism for hiding 20-cycle smem latency is intra-warp ILP: ptxas can schedule kk+N
+loads during kk+0 FMAs only when both code regions are visible in the same straight-line
+block. More unrolling = larger visible code region = deeper software pipeline.
+
+At u8, the compiler achieves a deeper pipeline than any hand-crafted variant, using all
+255 registers for maximum in-flight values. The result (47.4 TFLOPS for f2_u8) beats every
+hand-crafted kernel by a significant margin, despite the register-file cliff.
+
+**Practical conclusion**: design the tile shape, memory access pattern, and pipeline
+structure. Choose the unroll factor empirically (try u2, u4, u8, u16). Leave instruction
+scheduling and register allocation to nvcc.
 
 ---
 

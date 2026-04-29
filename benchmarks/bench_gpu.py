@@ -81,9 +81,12 @@ IMPLEMENTATIONS = {
     # s4st + intra-warp shuffle to reduce smem reads (experimental)
     "s4st_shfl_tm8_tn8_bm128_bn128_bk16": (
         "mymatmul.gpu.cuda_core.matmul_cuda_s4st_shfl.matmul_s4st_shfl_tm8_tn8_bm128_bn128_bk16", None),
-    # s4st TN=16: TM=8, TN=16, BN=256, PTX immediate-offset smem loads; higher FMA:load ratio
-    **{f"s4st_tn16_tm8_tn16_bm128_bn256_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4st_tn16.matmul_s4st_tn16_tm8_tn16_bm128_bn256_bk16_u{u}", None)
+    # s4st TN=16 PTX: inline PTX immediate-offset smem loads; higher FMA:load ratio
+    **{f"s4st_tn16_ptx_tm8_tn16_bm128_bn256_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4st_tn16_ptx.matmul_s4st_tn16_ptx_tm8_tn16_bm128_bn256_bk16_u{u}", None)
        for u in [1, 2, 4, 8, 16]},
+    # s4st TN=16 pure C++ (no inline PTX): compiler has full scheduling freedom
+    **{f"s4st_tn16_tm8_tn16_bm128_bn256_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4st_tn16.matmul_s4st_tn16_tm8_tn16_bm128_bn256_bk16_u{u}", None)
+       for u in [1, 2, 4, 8]},
     # s4st TN=16 m2: hand-crafted 2-way interleaving (loads×2 → FMAs×2), unroll 1 outer loop
     "s4st_tn16_m2_tm8_tn16_bm128_bn256_bk16": (
         "mymatmul.gpu.cuda_core.matmul_cuda_s4st_tn16_m2.matmul_s4st_tn16_m2_tm8_tn16_bm128_bn256_bk16", None),
