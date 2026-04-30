@@ -96,6 +96,8 @@ IMPLEMENTATIONS = {
     # s4st TN=16 f2: float2 B smem loads (u1=168 regs; u2/u4=255 regs)
     **{f"s4st2_tn16_bm128_bn256_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4st2_tn16.matmul_s4st2_tn16_tm8_tn16_bm128_bn256_bk16_u{u}", None)
        for u in [1, 2, 4, 8, 16]},
+    # Stage 5: auto-tuned over BM/BN/BK/UNROLL (68 configs, 16x16 thread layout, float2 B)
+    "s5_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5.matmul_s5", None),
     # Stage 4 Strided+Padded: s4st + A_shared[BM][BK+1] padding → zero A conflicts (educational)
     **{f"s4stp_tm8_tn8_bm64_bn64_bk16_u{u}": (f"mymatmul.gpu.cuda_core.matmul_cuda_s4stp.matmul_s4stp_tm8_tn8_bm64_bn64_bk16_u{u}", None)
        for u in [1, 4, 8, 16]},

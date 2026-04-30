@@ -88,11 +88,12 @@ _autotune_configs = [
         {'BLOCK_M': bm, 'BLOCK_N': bn, 'BLOCK_K': bk, 'GROUP_M': 8},
         num_stages=ns, num_warps=nw,
     )
-    for bm in [64, 128]
+    for bm in [64, 128, 256]
     for bn in [64, 128, 256]
-    for bk in [16, 32, 64]
+    for bk in [16, 32]
     for ns in [2, 3, 4]
     for nw in [4, 8]
+    if not (bm == 256 and bn == 256)   # register spill: acc[256][256]/nthreads > 255 regs
 ]
 
 

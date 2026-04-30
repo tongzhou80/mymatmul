@@ -1,0 +1,103 @@
+"""Stage 5: auto-tuned CUDA matmul over (BM, BN, BK, UNROLL) tile configurations."""
+
+import time
+import torch
+from .._pycuda_loader import launch_matmul, get_module
+
+_EXT = "_matmul_cuda_ext_s5"
+
+_BMS     = [64, 128, 256]
+_BNS     = [64, 128, 256]
+_BKS     = [16, 32]
+_UNROLLS = [2, 4, 8, 16]
+
+_MAX_SMEM = 100352  # sm_89 hard limit
+
+
+def _smem(bm, bn, bk):
+    return (2 * bm * bk + 2 * bk * bn) * 4
+
+
+_CONFIGS = [
+    (bm, bn, bk, u)
+    for bm in _BMS for bn in _BNS for bk in _BKS for u in _UNROLLS
+    if _smem(bm, bn, bk) <= _MAX_SMEM
+    and not (bm == 256 and bn == 256)   # acc[16][16]=256 regs → register spill
+]  # 64 configs
+
+
+def _kname(bm, bn, bk, u):
+    return f"matmul_cuda_s5_bm{bm}_bn{bn}_bk{bk}_u{u}"
+
+
+def _block():
+    return (32, 8, 1)   # 256 threads, warp-aligned
+
+
+def _grid(M, N, bm, bn):
+    return ((N + bn - 1) // bn, (M + bm - 1) // bm, 1)
+
+
+# Cache: (M, N, K) -> (bm, bn, bk, u)
+_best: dict = {}
+
+
+def _tune(M, N, K):
+    A = torch.randn(M, K, device="cuda", dtype=torch.float32)
+    B = torch.randn(K, N, device="cuda", dtype=torch.float32)
+
+    # Ensure cubin is compiled before timing loop.
+    get_module(_EXT)
+
+    best_t = float("inf")
+    best_cfg = _CONFIGS[0]
+
+    n_configs = len(_CONFIGS)
+    for idx, cfg in enumerate(_CONFIGS):
+        bm, bn, bk, u = cfg
+        kn    = _kname(*cfg)
+        block = _block()
+        grid  = _grid(M, N, bm, bn)
+        sb    = _smem(bm, bn, bk)
+        try:
+            # 2 warmup
+            for _ in range(2):
+                launch_matmul(_EXT, kn, A, B, block, grid, smem_bytes=sb)
+            torch.cuda.synchronize()
+            # 3 timed runs
+            t0 = time.perf_counter()
+            for _ in range(3):
+                launch_matmul(_EXT, kn, A, B, block, grid, smem_bytes=sb)
+            torch.cuda.synchronize()
+            t = (time.perf_counter() - t0) / 3
+        except Exception as e:
+            print(f"  [{idx+1}/{n_configs}] BM={bm} BN={bn} BK={bk} U={u}  FAILED: {e}")
+            continue
+
+        gflops = 2 * M * N * K / t / 1e12
+        print(f"  [{idx+1:2d}/{n_configs}] BM={bm:3d} BN={bn:3d} BK={bk:2d} U={u:2d}"
+              f"  {gflops:6.1f} TFLOPS")
+
+        if t < best_t:
+            best_t   = t
+            best_cfg = cfg
+
+    return best_cfg
+
+
+def matmul_s5(A, B):
+    M, K = A.shape
+    _, N = B.shape
+    key  = (M, N, K)
+    if key not in _best:
+        print(f"[s5] autotuning {M}x{K}x{N} over {len(_CONFIGS)} configs ...")
+        _best[key] = _tune(M, N, K)
+        bm, bn, bk, u = _best[key]
+        print(f"[s5] best: BM={bm} BN={bn} BK={bk} U={u}")
+
+    bm, bn, bk, u = _best[key]
+    return launch_matmul(
+        _EXT, _kname(bm, bn, bk, u), A, B,
+        _block(), _grid(M, N, bm, bn),
+        smem_bytes=_smem(bm, bn, bk),
+    )
