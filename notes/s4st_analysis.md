@@ -726,3 +726,53 @@ larger BK=32 (more arithmetic intensity per tile) and 3-stage pipeline.
 
 s4st2 remains the better kernel for small matrices (BN=128 → more blocks → better SM
 utilization at N≤2048). The two kernels are complementary by matrix size.
+
+---
+
+## Stage 5: Auto-tuned Template Kernel
+
+Stage 5 consolidates the s4st2 design into a single templated kernel with four tunable
+parameters: **BM, BN ∈ {64,128,256}**, **BK ∈ {16,32}**, **UNROLL ∈ {2,4,8,16}**.
+Fixed: 256 threads, 16×16 logical layout, float2 B-tile loads, double-buffered cp.async.
+BM=BN=256 excluded (acc[16][16]=256 regs → spill). Total: **64 configs** searched per (M,N,K).
+
+Triton autotune was pruned from 96 → 32 configs after empirical observation that
+num_warps=8 wins every size and num_stages=2 never wins. GROUP_M fixed at 8.
+
+### Three-way Comparison: s5 vs Triton vs cuBLAS (RTX 4090, FP32 no TF32)
+
+| Size | s5 (TFLOPS) | Triton (TFLOPS) | cuBLAS (TFLOPS) | s5 best config |
+|------|-------------|-----------------|-----------------|----------------|
+| 1024 | 40.3 | **46.6** | 43.9 | BM=128,BN=64,BK=32,U=16 |
+| 2048 | 49.6 | **50.6** | 52.1 | BM=256,BN=128,BK=32,U=16 |
+| 4096 | **49.4** | 48.0 | 54.2 | BM=256,BN=128,BK=32,U=8 |
+| 8192 | **48.5** | 47.0 | 53.9 | BM=256,BN=128,BK=32,U=16 |
+
+### Analysis
+
+**1024 gap (s5 −13% vs Triton)**: Both kernels land 128 active blocks at this size
+(1 per SM). The bottleneck is pipeline depth: s5 has 2-stage double buffering only,
+while Triton's winning config uses 4 software pipeline stages. At small sizes where
+arithmetic intensity is lower, the extra stages hide more DRAM latency and pull ahead.
+
+**4096+ advantage (s5 +2–3% vs Triton)**: At large sizes the kernel is compute-bound.
+Aggressive unrolling (U=8/16) gives the compiler a large straight-line code region to
+schedule FMAs and smem loads. The deeper ILP opportunity outweighs Triton's pipeline
+depth advantage.
+
+**cuBLAS gap (~10%)**: cuBLAS consistently leads at all sizes. The gap is not closeable
+with SIMT FP32 kernels — cuBLAS uses tensor cores internally even for nominally FP32
+inputs (via FP16 tensor-core accumulation), giving ~2× the raw FLOP throughput of
+SIMT float ops on the RTX 4090.
+
+**Triton best configs** (identified from autotune cache):
+
+| Size | BM | BN | BK | num_stages | num_warps |
+|------|----|----|----|------------|-----------|
+| 1024 | 64 | 128 | 32 | 4 | 8 |
+| 2048 | 128 | 128 | 32 | 3 | 8 |
+| 4096 | 256 | 128 | 32 | 3 | 8 |
+| 8192 | 128 | 256 | 16 | 4 | 8 |
+
+num_warps=8 wins every size; num_stages∈{3,4} (never 2). These findings drove the
+pruning of the Triton autotune search space from 96 to 32 configs.

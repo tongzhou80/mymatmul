@@ -80,19 +80,20 @@ def _make_triton_fp32_simt(block_m, block_n, block_k, group_m=8):
 
 
 # ---------------------------------------------------------------------------
-# Autotuned FP32 SIMT — sweeps block sizes, pipeline stages, and warp count
+# Autotuned FP32 SIMT — sweeps block sizes and pipeline stages.
+# Pruned from empirical results: num_warps=8 wins every size; num_stages∈{2} never wins.
+# 32 configs (down from 96), ~3× faster autotuning with same quality.
 # ---------------------------------------------------------------------------
 
 _autotune_configs = [
     triton.Config(
         {'BLOCK_M': bm, 'BLOCK_N': bn, 'BLOCK_K': bk, 'GROUP_M': 8},
-        num_stages=ns, num_warps=nw,
+        num_stages=ns, num_warps=8,
     )
     for bm in [64, 128, 256]
     for bn in [64, 128, 256]
     for bk in [16, 32]
-    for ns in [2, 3, 4]
-    for nw in [4, 8]
+    for ns in [3, 4]
     if not (bm == 256 and bn == 256)   # register spill: acc[256][256]/nthreads > 255 regs
 ]
 
