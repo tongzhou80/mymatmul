@@ -98,6 +98,8 @@ IMPLEMENTATIONS = {
        for u in [1, 2, 4, 8, 16]},
     # Stage 5: auto-tuned over BM/BN/BK/UNROLL (64 configs, 16x16 thread layout, float2 B)
     "s5_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5.matmul_s5", None),
+    # Stage 5 W4: warp-tiled (4x2 inter-warp, 4x8 intra-warp) with float4 B smem loads
+    "s5_w4_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4.matmul_s5_w4", None),
     # Stage 5 + L2 grouped block ordering: auto-tuned over BM/BN/BK/UNROLL/GROUP_M
     "s5_l2_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_l2.matmul_s5_l2", None),
     # Stage 4 Strided+Padded: s4st + A_shared[BM][BK+1] padding → zero A conflicts (educational)
