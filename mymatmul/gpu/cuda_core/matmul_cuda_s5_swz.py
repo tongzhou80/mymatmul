@@ -1,33 +1,34 @@
-"""Stage 5 W4: warp-tiled (4×2 inter-warp, 4×8 intra-warp) with float4 B smem loads."""
+"""Stage 5 SWZ: s5 BK=32 with A-tile swizzle to eliminate 2-way bank conflicts."""
 
 import time
 import torch
 from .._pycuda_loader import launch_matmul, get_module
 
-_EXT = "_matmul_cuda_ext_s5_w4"
+_EXT = "_matmul_cuda_ext_s5_swz"
 
 _BMS     = [64, 128, 256]
 _BNS     = [64, 128, 256]
-_BKS     = [16, 32]
 _UNROLLS = [2, 4, 8, 16]
 
 _MAX_SMEM = 100352
 
+BK = 32
 
-def _smem(bm, bn, bk):
-    return (2 * bm * bk + 2 * bk * bn) * 4
+
+def _smem(bm, bn):
+    return (2 * bm * BK + 2 * BK * bn) * 4
 
 
 _CONFIGS = [
-    (bm, bn, bk, u)
-    for bm in _BMS for bn in _BNS for bk in _BKS for u in _UNROLLS
-    if _smem(bm, bn, bk) <= _MAX_SMEM
+    (bm, bn, u)
+    for bm in _BMS for bn in _BNS for u in _UNROLLS
+    if _smem(bm, bn) <= _MAX_SMEM
     and not (bm == 256 and bn == 256)
-]  # 64 configs (same set as s5)
+]  # 28 configs
 
 
-def _kname(bm, bn, bk, u):
-    return f"matmul_cuda_s5_w4_bm{bm}_bn{bn}_bk{bk}_u{u}"
+def _kname(bm, bn, u):
+    return f"matmul_cuda_s5_swz_bm{bm}_bn{bn}_u{u}"
 
 
 def _block():
@@ -52,11 +53,11 @@ def _tune(M, N, K):
     n = len(_CONFIGS)
 
     for idx, cfg in enumerate(_CONFIGS):
-        bm, bn, bk, u = cfg
+        bm, bn, u = cfg
         kn    = _kname(*cfg)
         block = _block()
         grid  = _grid(M, N, bm, bn)
-        sb    = _smem(bm, bn, bk)
+        sb    = _smem(bm, bn)
         try:
             for _ in range(2):
                 launch_matmul(_EXT, kn, A, B, block, grid, smem_bytes=sb)
@@ -67,12 +68,11 @@ def _tune(M, N, K):
             torch.cuda.synchronize()
             t = (time.perf_counter() - t0) / 3
         except Exception as e:
-            print(f"  [{idx+1}/{n}] BM={bm} BN={bn} BK={bk} U={u}  FAILED: {e}")
+            print(f"  [{idx+1}/{n}] BM={bm} BN={bn} U={u}  FAILED: {e}")
             continue
 
         gflops = 2 * M * N * K / t / 1e12
-        if bk == 16 and u == 16:
-            print(f"  [{idx+1:3d}/{n}] BM={bm:3d} BN={bn:3d} BK={bk:2d} U={u:2d}   {gflops:6.1f} TFLOPS")
+        print(f"  [{idx+1:2d}/{n}] BM={bm:3d} BN={bn:3d} U={u:2d}   {gflops:6.1f} TFLOPS")
 
         if t < best_t:
             best_t   = t
@@ -81,27 +81,27 @@ def _tune(M, N, K):
     return best_cfg
 
 
-def matmul_s5_w4_bm256_bn128_bk16_u16(A, B):
+def matmul_s5_swz_bm256_bn128_u16(A, B):
     M, K = A.shape; _, N = B.shape
-    bm, bn, bk, u = 256, 128, 16, 16
+    bm, bn, u = 256, 128, 16
     get_module(_EXT)
-    return launch_matmul(_EXT, _kname(bm, bn, bk, u), A, B,
-                         _block(), _grid(M, N, bm, bn), smem_bytes=_smem(bm, bn, bk))
+    return launch_matmul(_EXT, _kname(bm, bn, u), A, B,
+                         _block(), _grid(M, N, bm, bn), smem_bytes=_smem(bm, bn))
 
 
-def matmul_s5_w4(A, B):
+def matmul_s5_swz(A, B):
     M, K = A.shape
     _, N = B.shape
     key  = (M, N, K)
     if key not in _best:
-        print(f"[s5_w4] autotuning {M}x{K}x{N} over {len(_CONFIGS)} configs ...")
+        print(f"[s5_swz] autotuning {M}x{K}x{N} over {len(_CONFIGS)} configs ...")
         _best[key] = _tune(M, N, K)
-        bm, bn, bk, u = _best[key]
-        print(f"[s5_w4] best: BM={bm} BN={bn} BK={bk} U={u}")
+        bm, bn, u = _best[key]
+        print(f"[s5_swz] best: BM={bm} BN={bn} U={u}")
 
-    bm, bn, bk, u = _best[key]
+    bm, bn, u = _best[key]
     return launch_matmul(
-        _EXT, _kname(bm, bn, bk, u), A, B,
+        _EXT, _kname(bm, bn, u), A, B,
         _block(), _grid(M, N, bm, bn),
-        smem_bytes=_smem(bm, bn, bk),
+        smem_bytes=_smem(bm, bn),
     )

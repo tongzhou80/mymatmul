@@ -98,8 +98,16 @@ IMPLEMENTATIONS = {
        for u in [1, 2, 4, 8, 16]},
     # Stage 5: auto-tuned over BM/BN/BK/UNROLL (64 configs, 16x16 thread layout, float2 B)
     "s5_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5.matmul_s5", None),
+    "s5_bm256_bn128_bk32_u16": ("mymatmul.gpu.cuda_core.matmul_cuda_s5.matmul_s5_bm256_bn128_bk32_u16", None),
     # Stage 5 W4: warp-tiled (4x2 inter-warp, 4x8 intra-warp) with float4 B smem loads
     "s5_w4_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4.matmul_s5_w4", None),
+    "s5_w4_bm256_bn128_bk16_u16": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4.matmul_s5_w4_bm256_bn128_bk16_u16", None),
+    # Stage 5 W4P: s5_w4 with 4-buffer paired loading (halved barrier stalls)
+    "s5_w4p_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4p.matmul_s5_w4p", None),
+    "s5_w4p_bm256_bn128_u16": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4p.matmul_s5_w4p_bm256_bn128_u16", None),
+    # Stage 5 SWZ: s5 BK=32 with A-tile swizzle (eliminates 2-way bank conflict)
+    "s5_swz_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_swz.matmul_s5_swz", None),
+    "s5_swz_bm256_bn128_u16": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_swz.matmul_s5_swz_bm256_bn128_u16", None),
     # Stage 5 + L2 grouped block ordering: auto-tuned over BM/BN/BK/UNROLL/GROUP_M
     "s5_l2_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_l2.matmul_s5_l2", None),
     # Stage 4 Strided+Padded: s4st + A_shared[BM][BK+1] padding → zero A conflicts (educational)

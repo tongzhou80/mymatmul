@@ -85,6 +85,14 @@ def _tune(M, N, K):
     return best_cfg
 
 
+def matmul_s5_bm256_bn128_bk32_u16(A, B):
+    M, K = A.shape; _, N = B.shape
+    bm, bn, bk, u = 256, 128, 32, 16
+    get_module(_EXT)
+    return launch_matmul(_EXT, _kname(bm, bn, bk, u), A, B,
+                         _block(), _grid(M, N, bm, bn), smem_bytes=_smem(bm, bn, bk))
+
+
 def matmul_s5(A, B):
     M, K = A.shape
     _, N = B.shape
