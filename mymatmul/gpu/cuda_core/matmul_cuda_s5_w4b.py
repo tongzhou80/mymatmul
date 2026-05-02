@@ -1,10 +1,10 @@
-"""Stage 5 W4: warp-tiled (4×2 inter-warp, 4×8 intra-warp) with float4 B smem loads."""
+"""Stage 5 W4B: s5_w4 with A-tile row padding (+4 floats) to eliminate bank conflicts."""
 
 import time
 import torch
 from .._pycuda_loader import launch_matmul, get_module
 
-_EXT = "_matmul_cuda_ext_s5_w4"
+_EXT = "_matmul_cuda_ext_s5_w4b"
 
 _BMS     = [64, 128, 256]
 _BNS     = [64, 128, 256]
@@ -15,7 +15,7 @@ _MAX_SMEM = 100352
 
 
 def _smem(bm, bn, bk):
-    return (2 * bm * bk + 2 * bk * bn) * 4
+    return (2 * bm * (bk + 4) + 2 * bk * bn) * 4
 
 
 _CONFIGS = [
@@ -24,11 +24,11 @@ _CONFIGS = [
     if _smem(bm, bn, bk) <= _MAX_SMEM
     and not (bm == 256 and bn == 256)
     and not (bk == 8 and (bm < 128 or bn < 128))
-]  # 76 configs
+]
 
 
 def _kname(bm, bn, bk, u):
-    return f"matmul_cuda_s5_w4_bm{bm}_bn{bn}_bk{bk}_u{u}"
+    return f"matmul_cuda_s5_w4b_bm{bm}_bn{bn}_bk{bk}_u{u}"
 
 
 def _block():
@@ -72,7 +72,6 @@ def _tune(M, N, K):
             continue
 
         gflops = 2 * M * N * K / t / 1e12
-        #if bk == 16 and u == 16:
         print(f"  [{idx+1:3d}/{n}] BM={bm:3d} BN={bn:3d} BK={bk:2d} U={u:2d}   {gflops:6.1f} TFLOPS")
 
         if t < best_t:
@@ -82,29 +81,23 @@ def _tune(M, N, K):
     return best_cfg
 
 
-def matmul_s5_w4_bm256_bn128_bk16_u16(A, B):
+def matmul_s5_w4b_bm256_bn128_bk16_u16(A, B):
     M, K = A.shape; _, N = B.shape
     bm, bn, bk, u = 256, 128, 16, 16
     get_module(_EXT)
     return launch_matmul(_EXT, _kname(bm, bn, bk, u), A, B,
                          _block(), _grid(M, N, bm, bn), smem_bytes=_smem(bm, bn, bk))
 
-def matmul_s5_w4_bm256_bn128_bk8_u16(A, B):
-    M, K = A.shape; _, N = B.shape
-    bm, bn, bk, u = 256, 128, 8, 16
-    get_module(_EXT)
-    return launch_matmul(_EXT, _kname(bm, bn, bk, u), A, B,
-                         _block(), _grid(M, N, bm, bn), smem_bytes=_smem(bm, bn, bk))
 
-def matmul_s5_w4(A, B):
+def matmul_s5_w4b(A, B):
     M, K = A.shape
     _, N = B.shape
     key  = (M, N, K)
     if key not in _best:
-        print(f"[s5_w4] autotuning {M}x{K}x{N} over {len(_CONFIGS)} configs ...")
+        print(f"[s5_w4b] autotuning {M}x{K}x{N} over {len(_CONFIGS)} configs ...")
         _best[key] = _tune(M, N, K)
         bm, bn, bk, u = _best[key]
-        print(f"[s5_w4] best: BM={bm} BN={bn} BK={bk} U={u}")
+        print(f"[s5_w4b] best: BM={bm} BN={bn} BK={bk} U={u}")
 
     bm, bn, bk, u = _best[key]
     return launch_matmul(

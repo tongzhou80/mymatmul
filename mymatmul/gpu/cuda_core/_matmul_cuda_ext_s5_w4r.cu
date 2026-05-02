@@ -2,50 +2,43 @@
 #include <cuda_pipeline_primitives.h>
 
 /*
- * Stage 5 W4: warp-tiled variant with float4 B smem loads.
+ * Stage 5 W4R: s5_w4 + register double-buffering of the inner kk loop.
  *
- * Changes from s5:
- *   - Inter-warp layout : 4×2 (M×N) — 8 warps partition the BM×BN block into
- *     4 rows × 2 cols of warp tiles, each warp owns (BM/4) × (BN/2) output.
- *   - Intra-warp layout : 4×8 (M×N) — each warp's 32 threads are arranged 4 rows
- *     × 8 cols; thread (intra_lty, intra_ltx) does strided assignment within its
- *     warp tile, stride LWARP_M=4 in M and stride LWARP_N×4=32 in N.
- *   - B smem load       : float4 (4 consecutive N elements per instruction) instead
- *     of float2, so TN/4 loads per kk instead of TN/2.
+ * Problem in s5_w4: each _kk iteration loads _a[TM] from A_shared and
+ * _bv[TN/4] from B_shared, then immediately FMAs on those registers.
+ * The ~20-30 cycle smem latency is not hidden → short_sb stalls.
  *
- * Per-thread output tile: TM = BM/16, TN = BN/16 — identical to s5.
- * acc[TM][TN] layout:
- *   acc[i][j*4 .. j*4+3] = 4 consecutive N elements at
- *     M: block_row + warp_row*(BM/4) + intra_lty + i*4
- *     N: block_col + warp_col*(BN/2) + 4*intra_ltx + j*32,  j=0..TN/4-1
+ * Fix: split COMPUTE_TILE into prologue + pipelined body + epilogue:
+ *   prologue  : load kk=0  → reg buf [0]
+ *   body kk   : prefetch kk+1 → reg buf [1-cur]   (before FMAs)
+ *               FMA on reg buf [cur]
+ *   epilogue  : FMA on reg buf [(BK-1)&1]
  *
- * Bank conflict analysis (BK=16):
- *   A_shared[r][kk]: bank=(r*16+kk)%32. Intra-warp rows differ by 1, giving
- *   bank offsets {0,16,0,16} for lty 0..3 → same 2-way conflict as s5.
- *   B_shared[kk][warp_col*(BN/2)+4*intra_ltx+j*32]: col divisible by 4 →
- *   float4 banks {4k,4k+1,4k+2,4k+3} for intra_ltx=k, all distinct → 0 conflicts.
+ * For BM=256, BN=128 (TM=16, TN=8): each kk prefetches 18 smem loads,
+ * then issues 128 FMAs.  128 FMA cycles >> 30 cycle smem latency → fully
+ * hidden.
  *
- * Constraints: BN must be divisible by 64 (= WARP_N*LWARP_N*4 = 2*8*4).
- *   BN ∈ {64,128,256} all satisfy this.
+ * Register cost vs s5_w4: +TM + (TN/4)*4 floats for the second buffer.
+ *   BM=256/BN=128: +16 + 8 = +24 regs  (~200 total, well below 255).
  */
 
 template <int BM, int BN, int BK, int UNROLL>
-__device__ __forceinline__ void matmul_s5_w4_impl(
+__device__ __forceinline__ void matmul_s5_w4r_impl(
     const float* __restrict__ A,
     const float* __restrict__ B,
     float* __restrict__ C,
     int M, int K, int N
 ) {
-    constexpr int WARP_M  = 4;          // warp rows  (inter-warp M)
-    constexpr int WARP_N  = 2;          // warp cols  (inter-warp N)
-    constexpr int LWARP_M = 4;          // thread rows inside a warp (M)
-    constexpr int LWARP_N = 8;          // thread cols inside a warp (N)
+    constexpr int WARP_M  = 4;
+    constexpr int WARP_N  = 2;
+    constexpr int LWARP_M = 4;
+    constexpr int LWARP_N = 8;
 
-    constexpr int WARP_TILE_M = BM / WARP_M;   // BM/4
-    constexpr int WARP_TILE_N = BN / WARP_N;   // BN/2
+    constexpr int WARP_TILE_M = BM / WARP_M;
+    constexpr int WARP_TILE_N = BN / WARP_N;
 
-    constexpr int TM      = WARP_TILE_M / LWARP_M;   // BM/16  (same as s5)
-    constexpr int TN      = WARP_TILE_N / LWARP_N;   // BN/16  (same as s5)
+    constexpr int TM      = WARP_TILE_M / LWARP_M;
+    constexpr int TN      = WARP_TILE_N / LWARP_N;
     constexpr int THREADS = 256;
 
     constexpr int A_ELEM   = 4;
@@ -59,23 +52,19 @@ __device__ __forceinline__ void matmul_s5_w4_impl(
 
     const int tid = threadIdx.y * blockDim.x + threadIdx.x;
 
-    // Inter-warp position
     const int warp_id  = tid / 32;
-    const int warp_row = warp_id / WARP_N;     // 0..3  (M)
-    const int warp_col = warp_id % WARP_N;     // 0..1  (N)
+    const int warp_row = warp_id / WARP_N;
+    const int warp_col = warp_id % WARP_N;
 
-    // Intra-warp position
     const int tiw       = tid % 32;
-    const int intra_lty = tiw / LWARP_N;        // 0..3  (M within warp)
-    const int intra_ltx = tiw % LWARP_N;        // 0..7  (N within warp)
+    const int intra_lty = tiw / LWARP_N;
+    const int intra_ltx = tiw % LWARP_N;
 
     const int block_row = blockIdx.y * BM;
     const int block_col = blockIdx.x * BN;
 
     float acc[TM][TN] = {};
 
-    // Tile load: all 256 threads cooperatively fill the full BM×BK A tile
-    // and BK×BN B tile — same as s5, no warp-level splitting here.
 #define ISSUE_TILE(k0_, buf_)                                                           \
     do {                                                                                \
         _Pragma("unroll")                                                               \
@@ -97,27 +86,61 @@ __device__ __forceinline__ void matmul_s5_w4_impl(
         __pipeline_commit();                                                             \
     } while (0)
 
-    // float4 B load: each thread reads 4 consecutive N elements per j-step.
-    // TN/4 j-steps per kk, stride 4*LWARP_N=32 between steps.
+    // Register double-buffered compute: prefetch kk+1 before FMA on kk.
+    // When fully unrolled (UNROLL >= BK), _cur/_nxt are compile-time constants
+    // and the compiler statically selects reg buf [0] vs [1] at each iteration.
 #define COMPUTE_TILE(buf_)                                                              \
     do {                                                                                \
+        float _a[2][TM];                                                               \
+        float4 _bv[2][TN / 4];                                                         \
+        /* Prologue: load kk=0 into reg buf [0] */                                    \
+        _Pragma("unroll")                                                               \
+        for (int _i = 0; _i < TM; _i++)                                               \
+            _a[0][_i] = A_shared[(buf_)][warp_row * WARP_TILE_M + intra_lty           \
+                                         + _i * LWARP_M][0];                           \
+        _Pragma("unroll")                                                               \
+        for (int _j = 0; _j < TN / 4; _j++)                                           \
+            _bv[0][_j] = *reinterpret_cast<const float4*>(                             \
+                &B_shared[(buf_)][0]                                                   \
+                          [warp_col * WARP_TILE_N + 4 * intra_ltx                     \
+                           + _j * (4 * LWARP_N)]);                                     \
+        /* Pipelined body: prefetch kk+1, FMA on kk */                                \
         _Pragma("unroll UNROLL")                                                        \
-        for (int _kk = 0; _kk < BK; _kk++) {                                           \
-            float _a[TM];                                                               \
+        for (int _kk = 0; _kk < BK - 1; _kk++) {                                     \
+            const int _cur = _kk & 1;                                                  \
+            const int _nxt = 1 - _cur;                                                 \
             _Pragma("unroll")                                                           \
-            for (int _i = 0; _i < TM; _i++)                                            \
-                _a[_i] = A_shared[(buf_)][warp_row * WARP_TILE_M + intra_lty + _i * LWARP_M][_kk]; \
+            for (int _i = 0; _i < TM; _i++)                                           \
+                _a[_nxt][_i] = A_shared[(buf_)][warp_row * WARP_TILE_M + intra_lty   \
+                                                 + _i * LWARP_M][_kk + 1];            \
             _Pragma("unroll")                                                           \
-            for (int _j = 0; _j < TN / 4; _j++) {                                      \
-                float4 _bv = *reinterpret_cast<const float4*>(                          \
-                    &B_shared[(buf_)][_kk]                                              \
-                              [warp_col * WARP_TILE_N + 4 * intra_ltx + _j * (4 * LWARP_N)]); \
+            for (int _j = 0; _j < TN / 4; _j++)                                      \
+                _bv[_nxt][_j] = *reinterpret_cast<const float4*>(                     \
+                    &B_shared[(buf_)][_kk + 1]                                         \
+                              [warp_col * WARP_TILE_N + 4 * intra_ltx                 \
+                               + _j * (4 * LWARP_N)]);                                 \
+            _Pragma("unroll")                                                           \
+            for (int _j = 0; _j < TN / 4; _j++) {                                    \
                 _Pragma("unroll")                                                       \
-                for (int _i = 0; _i < TM; _i++) {                                      \
-                    acc[_i][_j * 4 + 0] += _a[_i] * _bv.x;                            \
-                    acc[_i][_j * 4 + 1] += _a[_i] * _bv.y;                            \
-                    acc[_i][_j * 4 + 2] += _a[_i] * _bv.z;                            \
-                    acc[_i][_j * 4 + 3] += _a[_i] * _bv.w;                            \
+                for (int _i = 0; _i < TM; _i++) {                                    \
+                    acc[_i][_j * 4 + 0] += _a[_cur][_i] * _bv[_cur][_j].x;          \
+                    acc[_i][_j * 4 + 1] += _a[_cur][_i] * _bv[_cur][_j].y;          \
+                    acc[_i][_j * 4 + 2] += _a[_cur][_i] * _bv[_cur][_j].z;          \
+                    acc[_i][_j * 4 + 3] += _a[_cur][_i] * _bv[_cur][_j].w;          \
+                }                                                                       \
+            }                                                                           \
+        }                                                                               \
+        /* Epilogue: FMA on last reg buf */                                            \
+        {                                                                               \
+            const int _last = (BK - 1) & 1;                                           \
+            _Pragma("unroll")                                                           \
+            for (int _j = 0; _j < TN / 4; _j++) {                                    \
+                _Pragma("unroll")                                                       \
+                for (int _i = 0; _i < TM; _i++) {                                    \
+                    acc[_i][_j * 4 + 0] += _a[_last][_i] * _bv[_last][_j].x;        \
+                    acc[_i][_j * 4 + 1] += _a[_last][_i] * _bv[_last][_j].y;        \
+                    acc[_i][_j * 4 + 2] += _a[_last][_i] * _bv[_last][_j].z;        \
+                    acc[_i][_j * 4 + 3] += _a[_last][_i] * _bv[_last][_j].w;        \
                 }                                                                       \
             }                                                                           \
         }                                                                               \
@@ -144,7 +167,6 @@ __device__ __forceinline__ void matmul_s5_w4_impl(
 #undef ISSUE_TILE
 #undef COMPUTE_TILE
 
-    // Writeback: float4 stores where possible, scalar fallback at boundaries.
     #pragma unroll
     for (int i = 0; i < TM; i++)
         #pragma unroll
@@ -163,10 +185,10 @@ __device__ __forceinline__ void matmul_s5_w4_impl(
 
 #define MAKE_LAUNCHER(BM_, BN_, BK_, U_)                                            \
 extern "C" __global__ __launch_bounds__(256)                                        \
-void matmul_cuda_s5_w4_bm##BM_##_bn##BN_##_bk##BK_##_u##U_(                       \
+void matmul_cuda_s5_w4r_bm##BM_##_bn##BN_##_bk##BK_##_u##U_(                       \
     const float* __restrict__ A, const float* __restrict__ B,                      \
     float* __restrict__ C, int M, int K, int N) {                                  \
-    matmul_s5_w4_impl<BM_, BN_, BK_, U_>(A, B, C, M, K, N);                       \
+    matmul_s5_w4r_impl<BM_, BN_, BK_, U_>(A, B, C, M, K, N);                       \
 }
 
 // BM=64
@@ -212,6 +234,6 @@ MAKE_LAUNCHER(256, 128, 16,  2) MAKE_LAUNCHER(256, 128, 16,  4)
 MAKE_LAUNCHER(256, 128, 16,  8) MAKE_LAUNCHER(256, 128, 16, 16)
 MAKE_LAUNCHER(256, 128, 32,  2) MAKE_LAUNCHER(256, 128, 32,  4)
 MAKE_LAUNCHER(256, 128, 32,  8) MAKE_LAUNCHER(256, 128, 32, 16)
-// BM=256, BN=256 excluded: acc[16][16]=256 regs → spill
+// BM=256, BN=256 excluded: acc[16][16]=256 regs + double reg bufs → spill
 
 #undef MAKE_LAUNCHER

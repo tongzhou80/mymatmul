@@ -99,15 +99,32 @@ IMPLEMENTATIONS = {
     # Stage 5: auto-tuned over BM/BN/BK/UNROLL (64 configs, 16x16 thread layout, float2 B)
     "s5_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5.matmul_s5", None),
     "s5_bm256_bn128_bk32_u16": ("mymatmul.gpu.cuda_core.matmul_cuda_s5.matmul_s5_bm256_bn128_bk32_u16", None),
+    "s5_bm256_bn128_bk16_u16": ("mymatmul.gpu.cuda_core.matmul_cuda_s5.matmul_s5_bm256_bn128_bk16_u16", None),
     # Stage 5 W4: warp-tiled (4x2 inter-warp, 4x8 intra-warp) with float4 B smem loads
     "s5_w4_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4.matmul_s5_w4", None),
     "s5_w4_bm256_bn128_bk16_u16": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4.matmul_s5_w4_bm256_bn128_bk16_u16", None),
+    "s5_w4_bm256_bn128_bk8_u16": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4.matmul_s5_w4_bm256_bn128_bk8_u16", None),
+    # Stage 5 W4B: s5_w4 + A-tile row padding (+4 floats) to eliminate 2-way bank conflicts
+    "s5_w4b_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4b.matmul_s5_w4b", None),
+    "s5_w4b_bm256_bn128_bk16_u16": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4b.matmul_s5_w4b_bm256_bn128_bk16_u16", None),
+    # Stage 5 W4R: s5_w4 + register double-buffering of inner kk loop (hides smem load latency)
+    "s5_w4r_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4r.matmul_s5_w4r", None),
+    "s5_w4r_bm256_bn128_bk16_u16": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4r.matmul_s5_w4r_bm256_bn128_bk16_u16", None),
     # Stage 5 W4P: s5_w4 with 4-buffer paired loading (halved barrier stalls)
     "s5_w4p_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4p.matmul_s5_w4p", None),
     "s5_w4p_bm256_bn128_u16": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4p.matmul_s5_w4p_bm256_bn128_u16", None),
     # Stage 5 SWZ: s5 BK=32 with A-tile swizzle (eliminates 2-way bank conflict)
     "s5_swz_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_swz.matmul_s5_swz", None),
     "s5_swz_bm256_bn128_u16": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_swz.matmul_s5_swz_bm256_bn128_u16", None),
+    # Stage 5 PTX: s5 with raw PTX cp.async.cg.shared.global.L2::128B
+    "s5_ptx_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_ptx.matmul_s5_ptx", None),
+    "s5_ptx_bm256_bn128_bk32_u16": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_ptx.matmul_s5_ptx_bm256_bn128_bk32_u16", None),
+    # Blog series article 1: 128-thread, 64×256 tile, BK=16, no pipelining
+    "blog1": ("mymatmul.gpu.cuda_core.matmul_cuda_blog1.matmul_blog1", None),
+    # Blog series article 3: 128-thread, 128×128 tile, cp.async + register pipelining (N=4096 only)
+    "blog3": ("mymatmul.gpu.cuda_core.matmul_cuda_blog3.matmul_blog3", None),
+    # Blog3 variant: 256-thread, 256×128 tile, TI=16 (N=4096 only)
+    "blog3b": ("mymatmul.gpu.cuda_core.matmul_cuda_blog3b.matmul_blog3b", None),
     # Stage 5 + L2 grouped block ordering: auto-tuned over BM/BN/BK/UNROLL/GROUP_M
     "s5_l2_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_l2.matmul_s5_l2", None),
     # Stage 4 Strided+Padded: s4st + A_shared[BM][BK+1] padding → zero A conflicts (educational)

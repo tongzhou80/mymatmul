@@ -2,7 +2,7 @@
 #include <cuda_pipeline_primitives.h>
 
 /*
- * Stage 5 W4: warp-tiled variant with float4 B smem loads.
+ * Stage 5 W4B: warp-tiled variant with float4 B smem loads.
  *
  * Changes from s5:
  *   - Inter-warp layout : 4×2 (M×N) — 8 warps partition the BM×BN block into
@@ -30,7 +30,7 @@
  */
 
 template <int BM, int BN, int BK, int UNROLL>
-__device__ __forceinline__ void matmul_s5_w4_impl(
+__device__ __forceinline__ void matmul_s5_w4b_impl(
     const float* __restrict__ A,
     const float* __restrict__ B,
     float* __restrict__ C,
@@ -54,8 +54,8 @@ __device__ __forceinline__ void matmul_s5_w4_impl(
     constexpr int B_GROUPS = BK * BN / B_ELEM / THREADS;
 
     extern __shared__ float smem[];
-    auto A_shared = reinterpret_cast<float (*)[BM][BK]>(smem);
-    auto B_shared = reinterpret_cast<float (*)[BK][BN]>(smem + 2 * BM * BK);
+    auto A_shared = reinterpret_cast<float (*)[BM][BK+4]>(smem);
+    auto B_shared = reinterpret_cast<float (*)[BK][BN]>(smem + 2 * BM * (BK+4));
 
     const int tid = threadIdx.y * blockDim.x + threadIdx.x;
 
@@ -163,10 +163,10 @@ __device__ __forceinline__ void matmul_s5_w4_impl(
 
 #define MAKE_LAUNCHER(BM_, BN_, BK_, U_)                                            \
 extern "C" __global__ __launch_bounds__(256)                                        \
-void matmul_cuda_s5_w4_bm##BM_##_bn##BN_##_bk##BK_##_u##U_(                       \
+void matmul_cuda_s5_w4b_bm##BM_##_bn##BN_##_bk##BK_##_u##U_(                       \
     const float* __restrict__ A, const float* __restrict__ B,                      \
     float* __restrict__ C, int M, int K, int N) {                                  \
-    matmul_s5_w4_impl<BM_, BN_, BK_, U_>(A, B, C, M, K, N);                       \
+    matmul_s5_w4b_impl<BM_, BN_, BK_, U_>(A, B, C, M, K, N);                       \
 }
 
 // BM=64
