@@ -8,7 +8,7 @@ _EXT = "_matmul_cuda_ext_s5_w4"
 
 _BMS     = [64, 128, 256]
 _BNS     = [64, 128, 256]
-_BKS     = [8, 16, 32]
+_BKS     = [16, 32]
 _UNROLLS = [2, 4, 8, 16]
 
 _MAX_SMEM = 100352
@@ -23,8 +23,7 @@ _CONFIGS = [
     for bm in _BMS for bn in _BNS for bk in _BKS for u in _UNROLLS
     if _smem(bm, bn, bk) <= _MAX_SMEM
     and not (bm == 256 and bn == 256)
-    and not (bk == 8 and (bm < 128 or bn < 128))
-]  # 76 configs
+]
 
 
 def _kname(bm, bn, bk, u):
