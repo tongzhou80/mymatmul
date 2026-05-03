@@ -110,6 +110,15 @@ IMPLEMENTATIONS = {
     # Stage 5 W4R: s5_w4 + register double-buffering of inner kk loop (hides smem load latency)
     "s5_w4r_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4r.matmul_s5_w4r", None),
     "s5_w4r_bm256_bn128_bk16_u16": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4r.matmul_s5_w4r_bm256_bn128_bk16_u16", None),
+    "s5_w4r_bm256_bn128_bk16_u8": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4r.matmul_s5_w4r_bm256_bn128_bk16_u8", None),
+    # Stage 5 W4R2: s5_w4r with 128 threads (2×2 inter-warp); BM=BN=128 → 2 blocks/SM
+    "s5_w4r2_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4r2.matmul_s5_w4r2", None),
+    "s5_w4r2_bm128_bn128_bk16_u8": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4r2.matmul_s5_w4r2_bm128_bn128_bk16_u8", None),
+    "s5_w4r2_bm128_bn128_bk16_u16": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4r2.matmul_s5_w4r2_bm128_bn128_bk16_u16", None),
+    # Stage 5 W4R2S: s5_w4r2 + GROUP_M=2 block swizzle (1D grid, B-tile L2 reuse)
+    "s5_w4r2s_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4r2s.matmul_s5_w4r2s", None),
+    "s5_w4r2s_bm128_bn128_bk16_u8": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4r2s.matmul_s5_w4r2s_bm128_bn128_bk16_u8", None),
+    "s5_w4r2s_bm128_bn128_bk16_u16": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4r2s.matmul_s5_w4r2s_bm128_bn128_bk16_u16", None),
     # Stage 5 W4P: s5_w4 with 4-buffer paired loading (halved barrier stalls)
     "s5_w4p_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4p.matmul_s5_w4p", None),
     "s5_w4p_bm256_bn128_u16": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4p.matmul_s5_w4p_bm256_bn128_u16", None),

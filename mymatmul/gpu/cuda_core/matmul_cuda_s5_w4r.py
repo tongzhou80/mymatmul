@@ -87,6 +87,13 @@ def matmul_s5_w4r_bm256_bn128_bk16_u16(A, B):
     return launch_matmul(_EXT, _kname(bm, bn, bk, u), A, B,
                          _block(), _grid(M, N, bm, bn), smem_bytes=_smem(bm, bn, bk))
 
+def matmul_s5_w4r_bm256_bn128_bk16_u8(A, B):
+    M, K = A.shape; _, N = B.shape
+    bm, bn, bk, u = 256, 128, 16, 8
+    get_module(_EXT)
+    return launch_matmul(_EXT, _kname(bm, bn, bk, u), A, B,
+                         _block(), _grid(M, N, bm, bn), smem_bytes=_smem(bm, bn, bk))
+
 
 def matmul_s5_w4r(A, B):
     M, K = A.shape
