@@ -120,7 +120,7 @@ def cuda_kernel_name(impl_name: str) -> str | None:
         return "matmul_cuda_s3_warp_" + impl_name[4:]
     if impl_name.startswith(("s3_", "s4_", "s4b_", "s4sw_", "s4st_", "s4st2_", "s4st4_", "s4stp_", "s4st_shfl_",
                               "s5_bm", "s5_w4_bm", "s5_w4b_bm", "s5_w4r_bm", "s5_w4r2_bm", "s5_w4r2s_bm", "s5_w4p_bm", "s5_swz_bm", "s5_ptx_bm",
-                              "s6_bm")):
+                              "s6_bm", "s7_bm")):
         return "matmul_cuda_" + impl_name
     if impl_name.startswith("triton_"):
         return "_matmul_kernel"

@@ -88,6 +88,43 @@ def get_kernel(ext_name: str, kernel_name: str) -> drv.Function:
     return get_module(ext_name).get_function(kernel_name)
 
 
+def get_module_jit(cu_path: str, cubin_path: str, extra_flags: list[str]) -> drv.Module:
+    """Compile and load a module with an explicit cubin path and extra flags.
+
+    Used by stage 7 to JIT-compile per-(M,N,K) cubins from a shared template.
+    The cubin_path acts as the cache key.
+    """
+    with _lock:
+        if cubin_path in _modules:
+            return _modules[cubin_path]
+        _ensure_ctx()
+        if not os.path.exists(cubin_path) or os.path.getmtime(cu_path) > os.path.getmtime(cubin_path):
+            print(f"[pycuda] compiling {os.path.basename(cubin_path)} ...", end=" ", flush=True)
+            _compile(cu_path, cubin_path, extra_flags)
+            print("done")
+        mod = drv.module_from_file(cubin_path)
+        _modules[cubin_path] = mod
+        return mod
+
+
+def launch_matmul_raw(mod: drv.Module, kernel_name: str, A, B,
+                      block: tuple, grid: tuple, smem_bytes: int = 0):
+    """Launch a kernel whose signature is (const float* A, const float* B, float* C).
+
+    Used by stage 7 kernels where M/N/K are baked in as compile-time constants.
+    """
+    import numpy as np
+    M, _K = A.shape
+    _K2, N = B.shape
+    C = torch.zeros((M, N), device="cuda", dtype=A.dtype)
+    fn = mod.get_function(kernel_name)
+    if smem_bytes > 0:
+        fn.set_attribute(drv.function_attribute.MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_bytes)
+    fn(np.intp(A.data_ptr()), np.intp(B.data_ptr()), np.intp(C.data_ptr()),
+       block=block, grid=grid, shared=smem_bytes)
+    return C
+
+
 def launch_matmul(ext_name: str, kernel_name: str, A, B,
                   block: tuple, grid: tuple, out_dtype=None, smem_bytes: int = 0):
     """Launch a PyCUDA matmul kernel and return a new output tensor.
