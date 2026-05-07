@@ -2,31 +2,24 @@
 """
 NCU occupancy analysis: registers, shared memory, and limiting factors.
 
-Pass one or more impl names (from _all_impls()) or CUDA kernel names.
-
-For each kernel, collects:
-  - threads per block (launch config)
-  - registers per thread
-  - static + dynamic shared memory per block (bytes)
-  - theoretical occupancy (warps/SM at full utilisation)
-  - achieved occupancy (%)
-  - the resource that limits occupancy: registers / shared_mem / block_size / warps
+Profiles a specific CUDA kernel by name.  The kernel name is used to look up
+the impl module and config, then the kernel is launched directly (no autotuning).
 
 Usage:
-    sudo python profile_ncu_occupancy.py tc1 tc4 cublas_bf16 --size 4096
-    sudo python profile_ncu_occupancy.py matmul_cuda_tc1_bm256_bn64_bk32_nw4 --size 4096
-    sudo python profile_ncu_occupancy.py --size 4096 --out results_occupancy.csv
+    sudo python profile_ncu_occupancy.py matmul_cuda_tc3_padB_bm128_bn128_bk16_nw4 --size 4096
+    sudo python profile_ncu_occupancy.py matmul_cuda_tc1_bm256_bn64_bk32_nw8 --size 4096
+    sudo python profile_ncu_occupancy.py matmul_cuda_tc1_bm256_bn64_bk32_nw8 matmul_cuda_tc3_padB_bm128_bn128_bk16_nw4 --size 4096 --out results_occ.csv
 """
 
 import argparse
 import csv
+import inspect
 import os
 import subprocess
 import sys
 import tempfile
 from io import StringIO
 
-# SM throughput identifies the main matmul kernel among all kernels launched.
 _SM_THROUGHPUT = "sm__throughput.avg.pct_of_peak_sustained_elapsed"
 
 METRICS = {
@@ -43,40 +36,54 @@ METRICS = {
 }
 
 
-def infer_impl(name: str, all_i: dict) -> tuple[str, str, str] | None:
-    """Accept either an impl name or a CUDA kernel name; return (impl_name, dotpath, dtype_str)."""
+def find_impl_module(kname: str, all_i: dict):
+    """Return (impl_name, module_path, dtype_str) for a CUDA kernel name."""
     import torch
-    if name in all_i:
-        dotpath, _, dtype = all_i[name]
-        dtype_str = "torch.bfloat16" if dtype == torch.bfloat16 else "torch.float32"
-        return name, dotpath, dtype_str
-    # Try stripping matmul_cuda_ prefix and matching progressively shorter suffixes
     prefix = "matmul_cuda_"
-    stem = name[len(prefix):] if name.startswith(prefix) else name
+    stem = kname[len(prefix):] if kname.startswith(prefix) else kname
     parts = stem.split("_")
     for n in range(len(parts), 0, -1):
         candidate = "_".join(parts[:n])
         if candidate in all_i:
             dotpath, _, dtype = all_i[candidate]
+            module_path = dotpath.rsplit(".", 1)[0]
             dtype_str = "torch.bfloat16" if dtype == torch.bfloat16 else "torch.float32"
-            return candidate, dotpath, dtype_str
+            return candidate, module_path, dtype_str
     return None
 
 
-def make_target_script(dotpath: str, size: int, path: str, dtype: str = "torch.float32") -> None:
-    module_path, fn_name = dotpath.rsplit(".", 1)
+def make_target_script(module_path: str, kname: str, size: int, path: str, dtype: str) -> None:
+    """Write a script that directly launches the specific kernel via launch_matmul."""
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     script = f"""\
-import sys
+import sys, inspect
 sys.path.insert(0, {repr(repo_root)})
 import torch, importlib
-fn = getattr(importlib.import_module({repr(module_path)}), {repr(fn_name)})
+_mod = importlib.import_module({repr(module_path)})
+from mymatmul.gpu._pycuda_loader import launch_matmul, get_module
+get_module(_mod._EXT)
+
+kname = {repr(kname)}
+cfg = next((c for c in _mod._CONFIGS if _mod._kname(*c) == kname), None)
+if cfg is None:
+    raise ValueError(f"Kernel {{kname!r}} not found in _CONFIGS")
+
+bm, bn, bk, nw = cfg[0], cfg[1], cfg[2], cfg[3]
+block = _mod._block(nw)
+grid  = _mod._grid({size}, {size}, bm, bn)
+
+# _smem may take (bm,bn,bk) or (bm,bn,bk,pa,pb) depending on the module.
+# cfg = (bm,bn,bk,nw,...) — drop nw (index 3) to get smem args.
+_smem_n = len(inspect.signature(_mod._smem).parameters)
+_smem_args = cfg[:3] + cfg[4:]
+smem = _mod._smem(*_smem_args[:_smem_n])
+
 A = torch.randn({size}, {size}, dtype={dtype}, device='cuda')
 B = torch.randn({size}, {size}, dtype={dtype}, device='cuda')
 for _ in range(3):
-    fn(A, B)
+    launch_matmul(_mod._EXT, kname, A, B, block, grid, out_dtype={dtype}, smem_bytes=smem)
 torch.cuda.synchronize()
-fn(A, B)
+launch_matmul(_mod._EXT, kname, A, B, block, grid, out_dtype={dtype}, smem_bytes=smem)
 torch.cuda.synchronize()
 """
     with open(path, "w") as f:
@@ -107,35 +114,44 @@ def run_ncu(script_path: str) -> str | None:
     return "\n".join(csv_lines)
 
 
-def parse_ncu_csv(csv_text: str) -> dict:
-    """Return metrics for the kernel with the highest SM throughput."""
+def parse_ncu_csv(csv_text: str, kname: str | None = None) -> dict:
+    """Return metrics for the target kernel.
+
+    When kname is given, filters rows to that kernel name and picks the
+    invocation with the highest SM throughput (avoids warmup noise).
+    Falls back to global max-SM heuristic when kname is None.
+    """
     from collections import defaultdict
     by_kernel: dict[str, dict] = defaultdict(dict)
     reader = csv.DictReader(StringIO(csv_text))
     for row in reader:
-        kid   = row.get("ID", "").strip('"')
-        name  = row.get("Metric Name", "").strip('"')
-        value = row.get("Metric Value", "").strip('"').replace(",", "")
-        if kid and name and value:
+        kid      = row.get("ID", "").strip('"')
+        kn       = row.get("Kernel Name", "").strip('"')
+        metric   = row.get("Metric Name", "").strip('"')
+        value    = row.get("Metric Value", "").strip('"').replace(",", "")
+        if kname and kn != kname:
+            continue
+        if kid and metric and value:
+            by_kernel[kid]["__kernel_name__"] = kn
             try:
-                by_kernel[kid][name] = float(value)
+                by_kernel[kid][metric] = float(value)
             except ValueError:
-                by_kernel[kid][name] = value
+                by_kernel[kid][metric] = value
     if not by_kernel:
         return {}
     best = max(by_kernel.values(), key=lambda m: float(m.get(_SM_THROUGHPUT, 0) or 0))
     return best
 
 
-def profile_one(dotpath: str, size: int, dtype: str) -> dict | None:
+def profile_one(module_path: str, kname: str, size: int, dtype: str) -> dict | None:
     with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as f:
         tmp = f.name
     try:
-        make_target_script(dotpath, size, tmp, dtype=dtype)
+        make_target_script(module_path, kname, size, tmp, dtype)
         csv_text = run_ncu(tmp)
         if csv_text is None:
             return None
-        raw = parse_ncu_csv(csv_text)
+        raw = parse_ncu_csv(csv_text, kname=kname)
         if not raw:
             print("    warning: no metrics parsed", file=sys.stderr)
             return None
@@ -159,7 +175,7 @@ def _bottleneck(m: dict) -> str:
 
 def print_table(rows: list[tuple[str, dict]]) -> None:
     hdr = (
-        f"{'Kernel':<46} "
+        f"{'Kernel':<52} "
         f"{'threads':>7} "
         f"{'regs/thr':>8} "
         f"{'smem(KB)':>8} "
@@ -179,7 +195,7 @@ def print_table(rows: list[tuple[str, dict]]) -> None:
         smem_kb = (static + dynamic) / 1024
 
         print(
-            f"  {name:<44} "
+            f"  {name:<50} "
             f"{v('threads_per_block', '.0f'):>7} "
             f"{v('registers_per_thread', '.0f'):>8} "
             f"{smem_kb:8.1f} "
@@ -206,8 +222,8 @@ def save_csv(rows: list[tuple[str, dict]], path: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("impls", nargs="*",
-                        help="Impl names or CUDA kernel names (e.g. tc1, matmul_cuda_tc1_bm256_bn64_bk32_nw4)")
+    parser.add_argument("kernels", nargs="*",
+                        help="CUDA kernel names (e.g. matmul_cuda_tc3_padB_bm128_bn128_bk16_nw4)")
     parser.add_argument("--size", type=int, default=4096, metavar="N")
     parser.add_argument("--out", default=None, metavar="FILE")
     args = parser.parse_args()
@@ -217,28 +233,26 @@ def main() -> None:
     from bench_gpu import _all_impls
     all_i = _all_impls()
 
-    if not args.impls:
-        print("No impls specified. Available tensor-core impls:")
-        for k in sorted(all_i):
-            if k.startswith("tc"):
-                print(f"  {k}")
+    if not args.kernels:
+        print("No kernel names specified.  Example:")
+        print("  sudo python profile_ncu_occupancy.py matmul_cuda_tc3_padB_bm128_bn128_bk16_nw4 --size 4096")
         return
 
     rows = []
-    for name in args.impls:
-        inferred = infer_impl(name, all_i)
-        if inferred is None:
-            print(f"  [{name}] not found in _all_impls() — skipping")
+    for kname in args.kernels:
+        found = find_impl_module(kname, all_i)
+        if found is None:
+            print(f"  [{kname}] impl not found — skipping")
             continue
-        impl_name, dotpath, dtype_str = inferred
-        print(f"  [{name}] impl={impl_name}  dtype={dtype_str}  size={args.size}³ ...",
+        impl_name, module_path, dtype_str = found
+        print(f"  [{kname}]  impl={impl_name}  dtype={dtype_str}  size={args.size}³ ...",
               end=" ", flush=True)
-        result = profile_one(dotpath, args.size, dtype_str)
+        result = profile_one(module_path, kname, args.size, dtype_str)
         if result is None:
             print("FAILED")
         else:
             print("done")
-            rows.append((name, result))
+            rows.append((kname, result))
 
     if rows:
         print_table(rows)
