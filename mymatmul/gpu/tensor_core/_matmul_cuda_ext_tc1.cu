@@ -12,9 +12,9 @@ using namespace nvcuda;
  * loop (and per-thread register tile) is replaced by warp-level WMMA:
  *   - Each warp holds WM_TILES × WN_TILES = (WARP_TILE_M/16) × (WARP_TILE_N/16)
  *     float32 accumulator fragments.
- *   - COMPUTE_TILE iterates over BK/16 k-steps; each step loads one A fragment
- *     per M-tile (reused across all N-tiles) and one B fragment per N-tile,
- *     then calls mma_sync.
+ *   - COMPUTE_TILE uses outer-product order: kk outer, load all A frags, load
+ *     all B frags, then the mma double loop — each B fragment loaded once per
+ *     k-step instead of WM_TILES times.
  *   - Intra-warp thread layout (4×8 in s6) disappears: WMMA handles thread
  *     participation internally.
  *
@@ -96,25 +96,27 @@ __device__ __forceinline__ void matmul_tc1_impl(
     } while (0)
 
 // ── WMMA compute over BK/16 k-steps using smem[buf_] ────────────────────────
-// Loop order: mt → kk → nt so each A fragment is loaded once per (mt, kk)
-// and reused across all WN_TILES B-fragment loads + mma_sync calls.
+// Outer-product order: kk outer, load all fa[], load all fb[], then mma loop.
+// Each B fragment is loaded once per k-step (not WM_TILES times).
 #define COMPUTE_TILE(buf_)                                                          \
     do {                                                                            \
-        wmma::fragment<wmma::matrix_a, 16,16,16, __nv_bfloat16, wmma::row_major> _fa; \
-        wmma::fragment<wmma::matrix_b, 16,16,16, __nv_bfloat16, wmma::row_major> _fb; \
+        wmma::fragment<wmma::matrix_a, 16,16,16, __nv_bfloat16, wmma::row_major> _fa[WM_TILES]; \
+        wmma::fragment<wmma::matrix_b, 16,16,16, __nv_bfloat16, wmma::row_major> _fb[WN_TILES]; \
         _Pragma("unroll")                                                           \
-        for (int _mt = 0; _mt < WM_TILES; _mt++) {                                 \
+        for (int _kk = 0; _kk < BK / 16; _kk++) {                                 \
             _Pragma("unroll")                                                       \
-            for (int _kk = 0; _kk < BK / 16; _kk++) {                             \
-                wmma::load_matrix_sync(_fa,                                         \
+            for (int _mt = 0; _mt < WM_TILES; _mt++)                               \
+                wmma::load_matrix_sync(_fa[_mt],                                    \
                     &A_shared[(buf_)][warp_row * WARP_TILE_M + _mt * 16][_kk * 16], BK); \
+            _Pragma("unroll")                                                       \
+            for (int _nt = 0; _nt < WN_TILES; _nt++)                               \
+                wmma::load_matrix_sync(_fb[_nt],                                    \
+                    &B_shared[(buf_)][_kk * 16][warp_col * WARP_TILE_N + _nt * 16], BN); \
+            _Pragma("unroll")                                                       \
+            for (int _mt = 0; _mt < WM_TILES; _mt++)                               \
                 _Pragma("unroll")                                                   \
-                for (int _nt = 0; _nt < WN_TILES; _nt++) {                         \
-                    wmma::load_matrix_sync(_fb,                                     \
-                        &B_shared[(buf_)][_kk * 16][warp_col * WARP_TILE_N + _nt * 16], BN); \
-                    wmma::mma_sync(acc_frag[_mt][_nt], _fa, _fb, acc_frag[_mt][_nt]); \
-                }                                                                   \
-            }                                                                       \
+                for (int _nt = 0; _nt < WN_TILES; _nt++)                           \
+                    wmma::mma_sync(acc_frag[_mt][_nt], _fa[_mt], _fb[_nt], acc_frag[_mt][_nt]); \
         }                                                                           \
     } while (0)
 
