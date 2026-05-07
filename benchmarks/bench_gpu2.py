@@ -8,7 +8,7 @@ from datetime import datetime
 import torch
 import triton.testing
 
-from bench_gpu import IMPLEMENTATIONS, SIZES, RESULTS_FILE, FIELDNAMES, load_fn, validate_fn
+from bench_gpu import IMPLEMENTATIONS, SIZES, RESULTS_FILE, FIELDNAMES, load_fn, validate_fn, get_impl_dtype, _all_impls
 
 WARMUP_MS = 100   # warmup budget in ms
 REP_MS    = 500   # timed budget in ms  (more reps → tighter distribution)
@@ -18,13 +18,17 @@ def gflops(M, N, K, ms):
     return 2 * M * N * K / (ms / 1e3) / 1e9
 
 
-def run(impls, sizes):
+def run(impl_names, sizes):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rows = []
+    all_i = _all_impls()
 
-    for name, (dotpath, max_size) in impls.items():
-        print(f"\n[{name}] {dotpath}")
-        fn = load_fn(dotpath)
+    for name in impl_names:
+        entry    = all_i.get(name, (None, None))
+        max_size = entry[1]
+        dtype    = get_impl_dtype(name)
+        fn       = load_fn(name)
+        print(f"\n[{name}]")
 
         for sz in sizes:
             M = N = K = sz
@@ -33,8 +37,8 @@ def run(impls, sizes):
                 print(f"  {M}x{N}x{K}: skipped (max_size={max_size})")
                 continue
 
-            A_gpu = torch.randn(M, K, dtype=torch.float32, device='cuda')
-            B_gpu = torch.randn(K, N, dtype=torch.float32, device='cuda')
+            A_gpu = torch.randn(M, K, dtype=dtype, device='cuda')
+            B_gpu = torch.randn(K, N, dtype=dtype, device='cuda')
 
             try:
                 validate_fn(fn, A_gpu, B_gpu)
@@ -80,12 +84,11 @@ def run(impls, sizes):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--impls", nargs="+", default=list(IMPLEMENTATIONS.keys()))
+    parser.add_argument("--impls", nargs="+", default=list(_all_impls().keys()))
     parser.add_argument("--sizes", nargs="+", type=int, default=SIZES)
     args = parser.parse_args()
 
-    impls = {k: IMPLEMENTATIONS[k] for k in args.impls}
-    run(impls, args.sizes)
+    run(args.impls, args.sizes)
 
 
 if __name__ == "__main__":

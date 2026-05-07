@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-NCU warp-stall profiling for fp32 CUDA matmul kernels.
+NCU warp-stall profiling for CUDA matmul kernels.
 
-Captures the full warp-stall breakdown to identify what prevents warps from
-issuing instructions each cycle: barrier sync, long/short scoreboard, math
-pipe throttle, memory barrier (cp.async wait), etc.
+Pass one or more CUDA kernel names directly.  The impl dotpath and dtype are
+inferred from the kernel name via _all_impls().
 
 Usage
 -----
     sudo -E env PATH="$PATH" PYTHONPATH="$PYTHONPATH" python3 profile_ncu_stalls.py \\
-        s5_bm256_bn128_bk32_u16 s5_w4_bm256_bn128_bk16_u16
+        matmul_cuda_tc1_bm256_bn64_bk32_nw4 --size 2048
 
-    # Custom size
-    sudo ... python3 profile_ncu_stalls.py --size 8192 <impls>
+    sudo ... python3 profile_ncu_stalls.py \\
+        matmul_cuda_tc1_bm256_bn64_bk32_nw4 matmul_cuda_s6_bm256_bn64_bk32_nw4 --size 4096
 """
 
 import argparse
@@ -37,27 +36,32 @@ METRICS = {
 }
 
 
-def cuda_kernel_name(impl_name: str) -> str | None:
-    if impl_name.startswith("s3w_"):
-        return "matmul_cuda_s3_warp_" + impl_name[4:]
-    if impl_name.startswith(("s3_", "s4_", "s4b_", "s4sw_", "s4st_", "s4st2_", "s4st4_", "s4stp_",
-                              "s5_bm", "s5_w4_bm", "s5_w4b_bm", "s5_w4r_bm", "s5_w4r2_bm", "s5_w4r2s_bm", "s5_w4p_bm", "s5_swz_bm", "s5_ptx_bm",
-                              "s6_bm", "s7_bm")):
-        return "matmul_cuda_" + impl_name
-    if impl_name.startswith("triton_"):
-        return "_matmul_kernel"
+def infer_impl(cuda_kernel_name: str, all_i: dict) -> tuple[str, str, str] | None:
+    """Return (impl_name, dotpath, dtype_str) by matching cuda_kernel_name against _all_impls()."""
+    import torch
+    # strip mandatory prefix
+    prefix = "matmul_cuda_"
+    stem = cuda_kernel_name[len(prefix):] if cuda_kernel_name.startswith(prefix) else cuda_kernel_name
+    # progressively strip trailing _<token> until we find a match
+    parts = stem.split("_")
+    for n in range(len(parts), 0, -1):
+        candidate = "_".join(parts[:n])
+        if candidate in all_i:
+            dotpath, _, dtype = all_i[candidate]
+            dtype_str = "torch.bfloat16" if dtype == torch.bfloat16 else "torch.float32"
+            return candidate, dotpath, dtype_str
     return None
 
 
-def make_target_script(dotpath: str, size: int, path: str) -> None:
+def make_target_script(dotpath: str, size: int, path: str, dtype: str = "torch.float32") -> None:
     module_path, fn_name = dotpath.rsplit(".", 1)
     script = f"""\
 import sys
 sys.path.insert(0, {repr(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))})
 import torch, importlib
 fn = getattr(importlib.import_module({repr(module_path)}), {repr(fn_name)})
-A = torch.randn({size}, {size}, dtype=torch.float32, device='cuda')
-B = torch.randn({size}, {size}, dtype=torch.float32, device='cuda')
+A = torch.randn({size}, {size}, dtype={dtype}, device='cuda')
+B = torch.randn({size}, {size}, dtype={dtype}, device='cuda')
 for _ in range(3):
     fn(A, B)
 torch.cuda.synchronize()
@@ -87,14 +91,19 @@ def run_ncu(script_path: str, cuda_name: str) -> str | None:
     if result.returncode != 0:
         print(f"    ncu error:\n{result.stderr.strip()}", file=sys.stderr)
         return None
-    csv_lines = [l for l in result.stdout.splitlines() if not l.startswith("==")]
+    # keep only CSV lines (start with '"'); sudo merges all output into stdout
+    csv_lines = [l for l in result.stdout.splitlines() if l.startswith('"')]
     return "\n".join(csv_lines)
 
 
 def parse_ncu_csv(csv_text: str) -> dict:
     from collections import defaultdict
     by_id: dict[str, dict] = defaultdict(dict)
-    reader = csv.DictReader(StringIO(csv_text))
+    reader = csv.DictReader(StringIO(csv_text),
+                            fieldnames=["ID","Process ID","Process Name","Host Name",
+                                        "Kernel Name","Context","Stream","Block Size",
+                                        "Grid Size","Device","CC","Section Name",
+                                        "Metric Name","Metric Unit","Metric Value"])
     for row in reader:
         kid   = row.get("ID", "").strip('"')
         name  = row.get("Metric Name", "").strip('"')
@@ -113,15 +122,11 @@ def parse_ncu_csv(csv_text: str) -> dict:
     return {k: sum(vs) / len(vs) for k, vs in all_vals.items()}
 
 
-def profile_one(name: str, dotpath: str, size: int) -> dict | None:
-    cuda_name = cuda_kernel_name(name)
-    if cuda_name is None:
-        print(f"    (no stable CUDA name for {name!r}; skipping)", file=sys.stderr)
-        return None
+def profile_one(dotpath: str, cuda_name: str, size: int, dtype: str) -> dict | None:
     with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as f:
         tmp = f.name
     try:
-        make_target_script(dotpath, size, tmp)
+        make_target_script(dotpath, size, tmp, dtype=dtype)
         csv_text = run_ncu(tmp, cuda_name)
         if csv_text is None:
             return None
@@ -135,7 +140,7 @@ def profile_one(name: str, dotpath: str, size: int) -> dict | None:
 
 
 def print_table(rows: list[tuple[str, dict]]) -> None:
-    hdr = (f"{'Kernel':<40} {'barrier':>8} {'membar':>7} {'long_sb':>8} "
+    hdr = (f"{'Kernel':<44} {'barrier':>8} {'membar':>7} {'long_sb':>8} "
            f"{'short_sb':>9} {'math_th':>8} {'mio_th':>7} "
            f"{'not_sel':>8} {'no_inst':>8} {'wait':>6} {'misc':>6}")
     print("\n" + hdr)
@@ -145,7 +150,7 @@ def print_table(rows: list[tuple[str, dict]]) -> None:
             x = m.get(k)
             return x if x is not None else float("nan")
         print(
-            f"  {name:<38} "
+            f"  {name:<42} "
             f"{v('barrier'):8.1f} "
             f"{v('membar'):7.1f} "
             f"{v('long_sb'):8.1f} "
@@ -162,31 +167,31 @@ def print_table(rows: list[tuple[str, dict]]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("impls", nargs="+", help="Kernel names from bench_gpu.IMPLEMENTATIONS")
+    parser.add_argument("cuda_kernels", nargs="+",
+                        help="CUDA kernel name(s) to profile (e.g. matmul_cuda_tc1_bm256_bn64_bk32_nw4)")
     parser.add_argument("--size", type=int, default=4096, metavar="N")
     args = parser.parse_args()
 
     bench_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, bench_dir)
-    from bench_gpu import IMPLEMENTATIONS
+    from bench_gpu import _all_impls
+    all_i = _all_impls()
 
     rows = []
-    for name in args.impls:
-        if name not in IMPLEMENTATIONS:
-            print(f"  [{name}] not in IMPLEMENTATIONS — skipping")
+    for cuda_name in args.cuda_kernels:
+        inferred = infer_impl(cuda_name, all_i)
+        if inferred is None:
+            print(f"  [{cuda_name}] could not infer impl from _all_impls() — skipping")
             continue
-        dotpath, _ = IMPLEMENTATIONS[name]
-        cuda_name = cuda_kernel_name(name)
-        if cuda_name is None:
-            print(f"  [{name}] no stable CUDA kernel name — skipping")
-            continue
-        print(f"  [{name}] cuda_fn={cuda_name}  size={args.size}³ ...", end=" ", flush=True)
-        result = profile_one(name, dotpath, args.size)
+        impl_name, dotpath, dtype_str = inferred
+        print(f"  [{cuda_name}] impl={impl_name}  dtype={dtype_str}  size={args.size}³ ...",
+              end=" ", flush=True)
+        result = profile_one(dotpath, cuda_name, args.size, dtype_str)
         if result is None:
             print("FAILED")
         else:
             print("done")
-            rows.append((name, result))
+            rows.append((cuda_name, result))
 
     if rows:
         print_table(rows)

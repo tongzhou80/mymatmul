@@ -1,8 +1,8 @@
-"""TC1: BF16 WMMA matmul, adapted from s6.
+"""TC2: BF16 WMMA matmul, triple-buffered cp.async (adapted from TC1).
 
-Same autotuned tile structure as s6 (BM, BN, BK, NUM_WARPS) but replaces
-scalar FMA with warp-level WMMA.  UNROLL is dropped — no scalar loop to tune.
-Inputs: bfloat16.  Output: bfloat16 (float32 accumulators, converted on write).
+Same tile structure as TC1 but 3 smem buffers — prolog issues 2 tiles so
+there are always 2 in-flight cp.async commits, hiding more memory latency.
+Smem: 3*(BM*BK + BK*BN)*2 bytes (50% more than TC1).
 """
 
 import time
@@ -11,7 +11,7 @@ from .._pycuda_loader import launch_matmul, get_module
 
 DTYPE = torch.bfloat16
 
-_EXT = "_matmul_cuda_ext_tc1"
+_EXT = "_matmul_cuda_ext_tc2"
 
 _BMS = [64, 128, 256]
 _BNS = [64, 128, 256]
@@ -22,7 +22,7 @@ _MAX_SMEM = 100352
 
 
 def _smem(bm, bn, bk):
-    return (2 * bm * bk + 2 * bk * bn) * 2  # bf16 = 2 bytes
+    return 3 * (bm * bk + bk * bn) * 2  # 3 buffers, bf16 = 2 bytes
 
 
 _CONFIGS = [
@@ -34,7 +34,7 @@ _CONFIGS = [
 
 
 def _kname(bm, bn, bk, nw):
-    return f"matmul_cuda_tc1_bm{bm}_bn{bn}_bk{bk}_nw{nw}"
+    return f"matmul_cuda_tc2_bm{bm}_bn{bn}_bk{bk}_nw{nw}"
 
 
 def _block(nw):
@@ -90,16 +90,16 @@ def _tune(M, N, K):
     return best_cfg
 
 
-def matmul_tc1(A, B):
+def matmul_tc2(A, B):
     M, K = A.shape
     _, N = B.shape
     key  = (M, N, K)
     if key not in _best:
         cfgs = [c for c in _CONFIGS if M % c[0] == 0 and N % c[1] == 0 and K % c[2] == 0]
-        print(f"[tc1] autotuning {M}x{K}x{N} over {len(cfgs)} configs ...")
+        print(f"[tc2] autotuning {M}x{K}x{N} over {len(cfgs)} configs ...")
         _best[key] = _tune(M, N, K)
         bm, bn, bk, nw = _best[key]
-        print(f"[tc1] best: BM={bm} BN={bn} BK={bk} NW={nw}")
+        print(f"[tc2] best: BM={bm} BN={bn} BK={bk} NW={nw}")
 
     bm, bn, bk, nw = _best[key]
     return launch_matmul(

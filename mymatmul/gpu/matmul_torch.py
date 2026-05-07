@@ -10,6 +10,11 @@ def matmul_torch(A_gpu, B_gpu):
     return torch.mm(A_gpu, B_gpu)
 
 
+def matmul_torch_bf16(A, B):
+    """cuBLAS BF16 matmul (tensor cores). Inputs and output are bfloat16."""
+    return torch.mm(A, B)
+
+
 def matmul_torch_fp32_notf32(A_gpu, B_gpu):
     """cuBLAS FP32 matmul with TF32 disabled: pure FP32 SIMT, comparable to our s4 kernels.
 

@@ -138,6 +138,8 @@ IMPLEMENTATIONS = {
     # Stage 5 PTX: s5 with raw PTX cp.async.cg.shared.global.L2::128B
     "s5_ptx_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_ptx.matmul_s5_ptx", None),
     "s5_ptx_bm256_bn128_bk32_u16": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_ptx.matmul_s5_ptx_bm256_bn128_bk32_u16", None),
+    # cuBLAS BF16 reference (tensor cores, bfloat16 inputs/output)
+    "cublas_bf16": ("mymatmul.gpu.matmul_torch.matmul_torch_bf16", None, torch.bfloat16),
     # Blog series article 1: 128-thread, 64×256 tile, BK=16, no pipelining
     "blog1": ("mymatmul.gpu.cuda_core.matmul_cuda_blog1.matmul_blog1", None),
     # Blog series article 3: 128-thread, 128×128 tile, cp.async + register pipelining (N=4096 only)
@@ -163,6 +165,53 @@ IMPLEMENTATIONS = {
 }
 
 SIZES = [128, 256, 512, 1024, 2048, 4096, 8192]
+
+# ---------------------------------------------------------------------------
+# Auto-discovery: any mymatmul/gpu/{cuda_core,tensor_core}/matmul_cuda_{X}.py
+# that exposes matmul_{X}() is auto-registered as impl "X".
+# Optional module constants: DTYPE (default float32), MAX_SIZE (default None).
+# ---------------------------------------------------------------------------
+
+_GPU_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "mymatmul", "gpu")
+_DISCOVERED: dict | None = None
+
+
+def _auto_discover_impls() -> dict:
+    import glob, importlib
+    result = {}
+    for subdir, pkg in [("cuda_core",   "mymatmul.gpu.cuda_core"),
+                        ("tensor_core", "mymatmul.gpu.tensor_core")]:
+        for path in sorted(glob.glob(os.path.join(_GPU_DIR, subdir, "matmul_cuda_*.py"))):
+            base = os.path.basename(path)[len("matmul_cuda_"):-3]
+            dotpath = f"{pkg}.matmul_cuda_{base}.matmul_{base}"
+            try:
+                mod = importlib.import_module(f"{pkg}.matmul_cuda_{base}")
+                if not hasattr(mod, f"matmul_{base}"):
+                    continue
+                dtype    = getattr(mod, "DTYPE",    torch.float32)
+                max_size = getattr(mod, "MAX_SIZE", None)
+            except Exception:
+                continue
+            result[base] = (dotpath, max_size, dtype)
+    return result
+
+
+def _all_impls() -> dict:
+    """Merge auto-discovered + explicit IMPLEMENTATIONS (explicit takes precedence)."""
+    global _DISCOVERED
+    if _DISCOVERED is None:
+        _DISCOVERED = _auto_discover_impls()
+    merged = dict(_DISCOVERED)
+    for k, v in IMPLEMENTATIONS.items():
+        # normalise to 3-tuple (dotpath, max_size, dtype)
+        merged[k] = (*v, torch.float32) if len(v) == 2 else v
+    return merged
+
+
+def get_impl_dtype(name: str) -> torch.dtype:
+    entry = _all_impls().get(name)
+    return entry[2] if entry and len(entry) > 2 else torch.float32
 WARMUP_RUNS = 3
 TIMED_RUNS = 10
 
@@ -214,16 +263,35 @@ def benchmark_fn(fn, A_gpu, B_gpu):
     return times
 
 
-def load_fn(dotpath: str):
-    module_path, fn_name = dotpath.rsplit(".", 1)
+def load_fn(name_or_dotpath: str):
+    """Load a matmul function by impl name or explicit dotpath."""
     import importlib
+    if '.' in name_or_dotpath:
+        dotpath = name_or_dotpath  # explicit dotpath (backward compat)
+    else:
+        entry = _all_impls().get(name_or_dotpath)
+        if entry is None:
+            raise KeyError(f"Unknown impl: '{name_or_dotpath}'")
+        dotpath = entry[0]
+    module_path, fn_name = dotpath.rsplit(".", 1)
     mod = importlib.import_module(module_path)
     return getattr(mod, fn_name)
 
 
-def validate_fn(fn, A_gpu, B_gpu, rtol=1e-2, atol=1e-1):
+def validate_fn(fn, A_gpu, B_gpu, rtol=None, atol=None):
+    if A_gpu.dtype == torch.bfloat16:
+        # Use float32 reference — cuBLAS BF16 switches to BF16 accumulators at large K,
+        # making it an unreliable reference for kernels that keep float32 accumulators.
+        # BF16 input quantization errors accumulate as ~sqrt(K)*u (u=2^-8=1/256, unit roundoff)
+        # with expected max over N^2 outputs ~= sqrt(K)/32. Scale atol with sqrt(K).
+        expected = torch.mm(A_gpu.float(), B_gpu.float())
+        if rtol is None: rtol = 1e-2
+        if atol is None: atol = max(1.0, A_gpu.shape[1] ** 0.5 / 32)
+    else:
+        expected = torch.matmul(A_gpu.float(), B_gpu.float())
+        if rtol is None: rtol = 1e-2
+        if atol is None: atol = 1e-1
     result = fn(A_gpu, B_gpu).float()
-    expected = torch.matmul(A_gpu.float(), B_gpu.float())
 
     diff = (result - expected).abs()
     rel = diff / expected.abs().clamp_min(1e-3)
@@ -246,13 +314,17 @@ def validate_fn(fn, A_gpu, B_gpu, rtol=1e-2, atol=1e-1):
     return True
 
 
-def run(impls, sizes):
+def run(impl_names, sizes):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rows = []
+    all_i = _all_impls()
 
-    for name, (dotpath, max_size) in impls.items():
-        print(f"\n[{name}] {dotpath}")
-        fn = load_fn(dotpath)
+    for name in impl_names:
+        entry    = all_i.get(name, (None, None, torch.float32))
+        max_size = entry[1]
+        dtype    = entry[2] if len(entry) > 2 else torch.float32
+        fn       = load_fn(name)
+        print(f"\n[{name}]")
 
         for sz in sizes:
             M = N = K = sz
@@ -261,9 +333,8 @@ def run(impls, sizes):
                 print(f"  {M}x{N}x{K}: skipped (max_size={max_size})")
                 continue
 
-            # Create tensors directly on GPU
-            A_gpu = torch.randn(M, K, dtype=torch.float32, device='cuda')
-            B_gpu = torch.randn(K, N, dtype=torch.float32, device='cuda')
+            A_gpu = torch.randn(M, K, dtype=dtype, device='cuda')
+            B_gpu = torch.randn(K, N, dtype=dtype, device='cuda')
 
             # Validate result before benchmarking
             try:
@@ -309,14 +380,13 @@ def run(impls, sizes):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--impls", nargs="+", default=list(IMPLEMENTATIONS.keys()),
+    parser.add_argument("--impls", nargs="+", default=list(_all_impls().keys()),
                         help="Which implementations to benchmark (default: all)")
     parser.add_argument("--sizes", nargs="+", type=int, default=SIZES,
                         help="Matrix sizes to benchmark (square MxMxM)")
     args = parser.parse_args()
 
-    impls = {k: IMPLEMENTATIONS[k] for k in args.impls}
-    run(impls, args.sizes)
+    run(args.impls, args.sizes)
 
 
 if __name__ == "__main__":

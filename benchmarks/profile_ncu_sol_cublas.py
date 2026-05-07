@@ -69,7 +69,7 @@ METRICS = {
 # Target script generation
 # ---------------------------------------------------------------------------
 
-def make_target_script(dotpath: str, size: int, path: str) -> None:
+def make_target_script(dotpath: str, size: int, path: str, dtype: str = "torch.float32") -> None:
     """Write a warmup-then-measure script for the given impl dotpath."""
     module_path, fn_name = dotpath.rsplit(".", 1)
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -78,8 +78,8 @@ import sys
 sys.path.insert(0, {repr(repo_root)})
 import torch, importlib
 fn = getattr(importlib.import_module({repr(module_path)}), {repr(fn_name)})
-A = torch.randn({size}, {size}, dtype=torch.float32, device='cuda')
-B = torch.randn({size}, {size}, dtype=torch.float32, device='cuda')
+A = torch.randn({size}, {size}, dtype={dtype}, device='cuda')
+B = torch.randn({size}, {size}, dtype={dtype}, device='cuda')
 # 3 warmup launches
 for _ in range(3):
     fn(A, B)
@@ -157,11 +157,11 @@ def parse_ncu_csv_max_sm(csv_text: str) -> dict:
 # Per-impl profiling
 # ---------------------------------------------------------------------------
 
-def profile_one(dotpath: str, size: int) -> dict | None:
+def profile_one(dotpath: str, size: int, dtype: str = "torch.float32") -> dict | None:
     with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as f:
         tmp = f.name
     try:
-        make_target_script(dotpath, size, tmp)
+        make_target_script(dotpath, size, tmp, dtype=dtype)
         csv_text = run_ncu(tmp)
         if csv_text is None:
             return None
@@ -258,17 +258,21 @@ def main() -> None:
 
     bench_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, bench_dir)
-    from bench_gpu import IMPLEMENTATIONS
+    from bench_gpu import _all_impls
+    import torch
+    all_i = _all_impls()
 
     rows: list[tuple[str, dict]] = []
     for name in args.impls:
-        if name not in IMPLEMENTATIONS:
-            print(f"  [{name}] not in IMPLEMENTATIONS — skipping")
+        entry = all_i.get(name)
+        if entry is None:
+            print(f"  [{name}] not found — skipping")
             continue
-        dotpath, _ = IMPLEMENTATIONS[name]
-        print(f"  [{name}]  size={args.size}³  (max-SM heuristic) ...",
+        dotpath, _, dtype = entry
+        dtype_str = "torch.bfloat16" if dtype == torch.bfloat16 else "torch.float32"
+        print(f"  [{name}]  dtype={dtype_str}  size={args.size}³  (max-SM heuristic) ...",
               end=" ", flush=True)
-        result = profile_one(dotpath, args.size)
+        result = profile_one(dotpath, args.size, dtype=dtype_str)
         if result is None:
             print("FAILED")
         else:

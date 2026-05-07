@@ -1,8 +1,10 @@
-"""TC1: BF16 WMMA matmul, adapted from s6.
+"""TC3: BF16 WMMA matmul — TC1 with A-tile smem padding (PAD_A=8).
 
-Same autotuned tile structure as s6 (BM, BN, BK, NUM_WARPS) but replaces
-scalar FMA with warp-level WMMA.  UNROLL is dropped — no scalar loop to tune.
-Inputs: bfloat16.  Output: bfloat16 (float32 accumulators, converted on write).
+Same double-buffered cp.async and WMMA compute as TC1, but A_shared row
+stride is padded from BK to BK+8 (bf16 elements) to eliminate bank conflicts.
+The WMMA load_matrix_sync leading dimension is updated to BK+8 accordingly.
+
+Smem: (2*BM*(BK+8) + 2*BK*BN)*2 bytes.
 """
 
 import time
@@ -11,7 +13,7 @@ from .._pycuda_loader import launch_matmul, get_module
 
 DTYPE = torch.bfloat16
 
-_EXT = "_matmul_cuda_ext_tc1"
+_EXT = "_matmul_cuda_ext_tc3_padA"
 
 _BMS = [64, 128, 256]
 _BNS = [64, 128, 256]
@@ -19,10 +21,11 @@ _BKS = [16, 32]
 _NWS = [4, 8]
 
 _MAX_SMEM = 100352
+_PAD_A = 8
 
 
 def _smem(bm, bn, bk):
-    return (2 * bm * bk + 2 * bk * bn) * 2  # bf16 = 2 bytes
+    return (2 * bm * (bk + _PAD_A) + 2 * bk * bn) * 2  # bf16 = 2 bytes
 
 
 _CONFIGS = [
@@ -34,7 +37,7 @@ _CONFIGS = [
 
 
 def _kname(bm, bn, bk, nw):
-    return f"matmul_cuda_tc1_bm{bm}_bn{bn}_bk{bk}_nw{nw}"
+    return f"matmul_cuda_tc3_padA_bm{bm}_bn{bn}_bk{bk}_nw{nw}"
 
 
 def _block(nw):
@@ -90,16 +93,16 @@ def _tune(M, N, K):
     return best_cfg
 
 
-def matmul_tc1(A, B):
+def matmul_tc3_padA(A, B):
     M, K = A.shape
     _, N = B.shape
     key  = (M, N, K)
     if key not in _best:
         cfgs = [c for c in _CONFIGS if M % c[0] == 0 and N % c[1] == 0 and K % c[2] == 0]
-        print(f"[tc1] autotuning {M}x{K}x{N} over {len(cfgs)} configs ...")
+        print(f"[tc3_padA] autotuning {M}x{K}x{N} over {len(cfgs)} configs ...")
         _best[key] = _tune(M, N, K)
         bm, bn, bk, nw = _best[key]
-        print(f"[tc1] best: BM={bm} BN={bn} BK={bk} NW={nw}")
+        print(f"[tc3_padA] best: BM={bm} BN={bn} BK={bk} NW={nw}")
 
     bm, bn, bk, nw = _best[key]
     return launch_matmul(

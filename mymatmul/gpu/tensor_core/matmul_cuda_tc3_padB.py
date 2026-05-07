@@ -1,8 +1,14 @@
-"""TC1: BF16 WMMA matmul, adapted from s6.
+"""TC4: BF16 WMMA matmul — TC1 with B-tile smem padding (PAD_B=8).
 
-Same autotuned tile structure as s6 (BM, BN, BK, NUM_WARPS) but replaces
-scalar FMA with warp-level WMMA.  UNROLL is dropped — no scalar loop to tune.
-Inputs: bfloat16.  Output: bfloat16 (float32 accumulators, converted on write).
+Same double-buffered cp.async and WMMA compute as TC1, but B_shared row
+stride is padded from BN to BN+8 (bf16 elements) to reduce bank conflicts.
+
+Without padding: BN=64 → stride=128 bytes → (64/2)%32=0 → all rows alias
+to bank 0 (maximum 16-way conflict for a 16×16 WMMA B fragment).
+With PAD_B=8: stride=144 bytes → (72/2)%32=4 → period-8 cycling, 8 distinct
+banks → reduces to 2-way conflict.
+
+A_shared is unchanged.  Smem: (2*BM*BK + 2*BK*(BN+8))*2 bytes.
 """
 
 import time
@@ -11,7 +17,7 @@ from .._pycuda_loader import launch_matmul, get_module
 
 DTYPE = torch.bfloat16
 
-_EXT = "_matmul_cuda_ext_tc1"
+_EXT = "_matmul_cuda_ext_tc3_padB"
 
 _BMS = [64, 128, 256]
 _BNS = [64, 128, 256]
@@ -19,10 +25,11 @@ _BKS = [16, 32]
 _NWS = [4, 8]
 
 _MAX_SMEM = 100352
+_PAD_B = 8
 
 
 def _smem(bm, bn, bk):
-    return (2 * bm * bk + 2 * bk * bn) * 2  # bf16 = 2 bytes
+    return (2 * bm * bk + 2 * bk * (bn + _PAD_B)) * 2  # bf16 = 2 bytes
 
 
 _CONFIGS = [
@@ -34,7 +41,7 @@ _CONFIGS = [
 
 
 def _kname(bm, bn, bk, nw):
-    return f"matmul_cuda_tc1_bm{bm}_bn{bn}_bk{bk}_nw{nw}"
+    return f"matmul_cuda_tc3_padB_bm{bm}_bn{bn}_bk{bk}_nw{nw}"
 
 
 def _block(nw):
@@ -68,12 +75,12 @@ def _tune(M, N, K):
         try:
             for _ in range(2):
                 launch_matmul(_EXT, kn, A, B, block, grid,
-                              out_dtype=torch.float32, smem_bytes=sb)
+                              out_dtype=torch.bfloat16, smem_bytes=sb)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             for _ in range(3):
                 launch_matmul(_EXT, kn, A, B, block, grid,
-                              out_dtype=torch.float32, smem_bytes=sb)
+                              out_dtype=torch.bfloat16, smem_bytes=sb)
             torch.cuda.synchronize()
             t = (time.perf_counter() - t0) / 3
         except Exception as e:
@@ -90,16 +97,16 @@ def _tune(M, N, K):
     return best_cfg
 
 
-def matmul_tc1(A, B):
+def matmul_tc3_padB(A, B):
     M, K = A.shape
     _, N = B.shape
     key  = (M, N, K)
     if key not in _best:
         cfgs = [c for c in _CONFIGS if M % c[0] == 0 and N % c[1] == 0 and K % c[2] == 0]
-        print(f"[tc1] autotuning {M}x{K}x{N} over {len(cfgs)} configs ...")
+        print(f"[tc3_padB] autotuning {M}x{K}x{N} over {len(cfgs)} configs ...")
         _best[key] = _tune(M, N, K)
         bm, bn, bk, nw = _best[key]
-        print(f"[tc1] best: BM={bm} BN={bn} BK={bk} NW={nw}")
+        print(f"[tc3_padB] best: BM={bm} BN={bn} BK={bk} NW={nw}")
 
     bm, bn, bk, nw = _best[key]
     return launch_matmul(
