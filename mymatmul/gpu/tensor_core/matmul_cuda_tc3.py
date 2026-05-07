@@ -1,14 +1,16 @@
-"""TC3: BF16 WMMA matmul with tunable A-tile and B-tile smem padding.
+"""TC3: TC2b + register prefetch on the inner kk loop.
 
-Extends TC1 by making PAD_A and PAD_B template parameters, each from {0, 8}.
-When PAD_A=PAD_B=0 the kernel is identical to TC1.
+COMPUTE_TILE double-buffers A and B fragments in registers so that ldmatrix
+loads for kk+1 are issued before the mma.sync for kk complete, hiding
+smem-to-register latency behind tensor-core compute.
 
-PAD=8 pads the tile's column stride by 8 BF16 elements, shifting consecutive
-rows by 4 banks → period-8 cycling → 2-way conflict (vs 16-way unpadded).
-PAD=4 (not included) would give zero conflict but forces 8-byte cp.async,
-which proved slower in practice.
+At BK=16 (NUM_KK=1) there is nothing to pipeline; TC3 degenerates to TC2b.
+The benefit grows with BK: BK=32 overlaps 1 ldmatrix cluster with 1 mma
+cluster; BK=64 overlaps 3.  The register cost is 2× the fragment temps
+(fa[2] instead of fa[1], fb[2] instead of fb[1]).
 
-Smem: (2*BM*(BK+PAD_A) + 2*BK*(BN+PAD_B)) * 2 bytes  (double-buffered).
+Everything else — ISSUE_TILE, smem layout, XOR swizzle, write-back — is
+identical to TC2b.
 """
 
 import time
@@ -19,31 +21,28 @@ DTYPE = torch.bfloat16
 
 _EXT = "_matmul_cuda_ext_tc3"
 
-_BMS    = [64, 128, 256]
-_BNS    = [64, 128, 256]
-_BKS    = [16, 32]
-_NWS    = [4, 8]
-_PAD_AS = [0, 8]
-_PAD_BS = [0, 8]
+_BMS = [64, 128, 256]
+_BNS = [64, 128, 256]
+_BKS = [16, 32, 64]
+_NWS = [4, 8]
 
 _MAX_SMEM = 100352
 
 
-def _smem(bm, bn, bk, pa, pb):
-    return (2 * bm * (bk + pa) + 2 * bk * (bn + pb)) * 2
+def _smem(bm, bn, bk):
+    return (2 * bm * bk + 2 * bk * bn) * 2
 
 
 _CONFIGS = [
-    (bm, bn, bk, nw, pa, pb)
+    (bm, bn, bk, nw)
     for bm in _BMS for bn in _BNS for bk in _BKS for nw in _NWS
-    for pa in _PAD_AS for pb in _PAD_BS
-    if _smem(bm, bn, bk, pa, pb) <= _MAX_SMEM
+    if _smem(bm, bn, bk) <= _MAX_SMEM
     and bm * bn <= 4096 * nw
 ]
 
 
-def _kname(bm, bn, bk, nw, pa, pb):
-    return f"matmul_cuda_tc3_bm{bm}_bn{bn}_bk{bk}_nw{nw}_pa{pa}_pb{pb}"
+def _kname(bm, bn, bk, nw):
+    return f"matmul_cuda_tc3_bm{bm}_bn{bn}_bk{bk}_nw{nw}"
 
 
 def _block(nw):
@@ -69,28 +68,28 @@ def _tune(M, N, K):
     n = len(cfgs)
 
     for idx, cfg in enumerate(cfgs):
-        bm, bn, bk, nw, pa, pb = cfg
+        bm, bn, bk, nw = cfg
         kn    = _kname(*cfg)
         block = _block(nw)
         grid  = _grid(M, N, bm, bn)
-        sb    = _smem(bm, bn, bk, pa, pb)
+        sb    = _smem(bm, bn, bk)
         try:
             for _ in range(2):
                 launch_matmul(_EXT, kn, A, B, block, grid,
-                              out_dtype=torch.bfloat16, smem_bytes=sb)
+                              out_dtype=torch.float32, smem_bytes=sb)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             for _ in range(3):
                 launch_matmul(_EXT, kn, A, B, block, grid,
-                              out_dtype=torch.bfloat16, smem_bytes=sb)
+                              out_dtype=torch.float32, smem_bytes=sb)
             torch.cuda.synchronize()
             t = (time.perf_counter() - t0) / 3
         except Exception as e:
-            print(f"  [{idx+1}/{n}] BM={bm} BN={bn} BK={bk} NW={nw} PA={pa} PB={pb}  FAILED: {e}")
+            print(f"  [{idx+1}/{n}] BM={bm} BN={bn} BK={bk} NW={nw}  FAILED: {e}")
             continue
 
         gflops = 2 * M * N * K / t / 1e12
-        print(f"  [{idx+1:3d}/{n}] BM={bm:3d} BN={bn:3d} BK={bk:2d} NW={nw} PA={pa} PB={pb}   {gflops:6.1f} TFLOPS")
+        print(f"  [{idx+1:3d}/{n}] BM={bm:3d} BN={bn:3d} BK={bk:2d} NW={nw}   {gflops:6.1f} TFLOPS")
 
         if t < best_t:
             best_t   = t
@@ -107,12 +106,12 @@ def matmul_tc3(A, B):
         cfgs = [c for c in _CONFIGS if M % c[0] == 0 and N % c[1] == 0 and K % c[2] == 0]
         print(f"[tc3] autotuning {M}x{K}x{N} over {len(cfgs)} configs ...")
         _best[key] = _tune(M, N, K)
-        bm, bn, bk, nw, pa, pb = _best[key]
-        print(f"[tc3] best: BM={bm} BN={bn} BK={bk} NW={nw} PA={pa} PB={pb}")
+        bm, bn, bk, nw = _best[key]
+        print(f"[tc3] best: BM={bm} BN={bn} BK={bk} NW={nw}")
 
-    bm, bn, bk, nw, pa, pb = _best[key]
+    bm, bn, bk, nw = _best[key]
     return launch_matmul(
-        _EXT, _kname(bm, bn, bk, nw, pa, pb), A, B,
+        _EXT, _kname(bm, bn, bk, nw), A, B,
         _block(nw), _grid(M, N, bm, bn),
-        smem_bytes=_smem(bm, bn, bk, pa, pb),
+        smem_bytes=_smem(bm, bn, bk),
     )

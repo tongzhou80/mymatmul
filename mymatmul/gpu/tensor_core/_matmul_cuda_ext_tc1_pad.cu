@@ -6,26 +6,36 @@
 using namespace nvcuda;
 
 /*
- * TC3: BF16 WMMA matmul — TC1 with A-tile smem padding to remove bank conflicts.
+ * TC1_pad: BF16 WMMA matmul with tunable A-tile and B-tile smem padding.
  *
- * A_shared row stride padded from BK to BK+8 (bf16 elements).
- * For BK=16: stride=24 (48 bytes, 12 banks); for BK=32: stride=40 (80 bytes, 20 banks).
- * In both cases the 8-row group touched by each warp hits 8 distinct banks
- * (stride=12 banks: {0,12,24,4,16,28,8,20}; stride=20 banks: {0,20,8,28,16,4,24,12}).
+ * Template parameters PAD_A and PAD_B pad the A-tile column stride (BKP=BK+PAD_A)
+ * and B-tile column stride (BNP=BN+PAD_B).  When both are 0 the code is identical
+ * to TC1.  Only PAD ∈ {0, 8} is used — PAD=8 keeps BKP/BNP multiples of 8,
+ * preserving 16-byte cp.async alignment.  PAD=4 (not instantiated here) would
+ * require 8-byte copies which proved slower despite giving zero conflict.
  *
- * Smem: (2*BM*(BK+8) + 2*BK*BN)*2 bytes.
- * load_matrix_sync receives leading dimension BK+8 (padded stride).
+ * Bank-conflict analysis (32 banks, 4 bytes each, BF16 = 2 bytes):
+ *   shift per row = (ldm / 2) % 32
+ *   cycle length  = 32 / gcd(shift, 32)   ← distinct banks before wrap
+ *
+ *   PAD=0 → shift=0  (power-of-2 BK/BN) → cycle=1  → 16-way conflict
+ *   PAD=8 → shift=4  (BK∈{16,32})        → cycle=8  →  2-way conflict
+ *
+ * Both PAD_A and PAD_B can be tuned independently; the autotuner finds
+ * the best combination for each (M,N,K).
+ *
+ * Smem: (2*BM*BKP + 2*BK*BNP) * 2 bytes  (double-buffered, BF16).
  */
 
-template <int BM, int BN, int BK, int NUM_WARPS>
-__device__ __forceinline__ void matmul_tc3_padA_impl(
+template <int BM, int BN, int BK, int NUM_WARPS, int PAD_A, int PAD_B>
+__device__ __forceinline__ void matmul_tc3_impl(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
     __nv_bfloat16* __restrict__ C,
     int M, int K, int N
 ) {
-    constexpr int PAD_A = 8;
-    constexpr int BKP   = BK + PAD_A;  // padded A-tile column stride
+    constexpr int BKP = BK + PAD_A;
+    constexpr int BNP = BN + PAD_B;
 
     constexpr int WARP_N = 2;
     constexpr int WARP_M = NUM_WARPS / WARP_N;
@@ -38,15 +48,15 @@ __device__ __forceinline__ void matmul_tc3_padA_impl(
 
     constexpr int THREADS = NUM_WARPS * 32;
 
+    // BKP and BNP are multiples of 8 for PAD∈{0,8}, so 16-byte cp.async is valid.
     constexpr int A_ELEM   = (BM * BK / THREADS >= 8) ? 8 : 4;
     constexpr int A_GROUPS = BM * BK / A_ELEM / THREADS;
     constexpr int B_ELEM   = (BK * BN / THREADS >= 8) ? 8 : 4;
     constexpr int B_GROUPS = BK * BN / B_ELEM / THREADS;
 
     extern __shared__ __nv_bfloat16 smem[];
-    // A_shared uses padded row stride BKP to avoid bank conflicts
     auto A_shared = reinterpret_cast<__nv_bfloat16 (*)[BM][BKP]>(smem);
-    auto B_shared = reinterpret_cast<__nv_bfloat16 (*)[BK][BN]>(smem + 2 * BM * BKP);
+    auto B_shared = reinterpret_cast<__nv_bfloat16 (*)[BK][BNP]>(smem + 2 * BM * BKP);
 
     const int tid      = threadIdx.y * blockDim.x + threadIdx.x;
     const int warp_id  = tid / 32;
@@ -64,8 +74,8 @@ __device__ __forceinline__ void matmul_tc3_padA_impl(
         for (int nt = 0; nt < WN_TILES; nt++)
             wmma::fill_fragment(acc_frag[mt][nt], 0.0f);
 
-// ── Async load one BM×BK A-tile and BK×BN B-tile into smem[buf_] ────────────
-// A index uses logical BK width; A_shared[buf_][r][c] handles padded stride.
+// Issue one BM×BK A-tile and BK×BN B-tile into smem[buf_] via cp.async.
+// Index arithmetic uses logical BK/BN widths; padded array types handle stride.
 #define ISSUE_TILE(k0_, buf_)                                                       \
     do {                                                                            \
         _Pragma("unroll")                                                           \
@@ -87,24 +97,26 @@ __device__ __forceinline__ void matmul_tc3_padA_impl(
         __pipeline_commit();                                                         \
     } while (0)
 
-// ── WMMA compute — leading dimension for A is BKP (padded stride) ────────────
+// WMMA compute over BK/16 k-steps; ldm for A is BKP, for B is BNP.
 #define COMPUTE_TILE(buf_)                                                          \
     do {                                                                            \
-        wmma::fragment<wmma::matrix_a, 16,16,16, __nv_bfloat16, wmma::row_major> _fa; \
-        wmma::fragment<wmma::matrix_b, 16,16,16, __nv_bfloat16, wmma::row_major> _fb; \
+        wmma::fragment<wmma::matrix_a, 16,16,16, __nv_bfloat16, wmma::row_major> _fa[WM_TILES]; \
+        wmma::fragment<wmma::matrix_b, 16,16,16, __nv_bfloat16, wmma::row_major> _fb[WN_TILES]; \
         _Pragma("unroll")                                                           \
-        for (int _mt = 0; _mt < WM_TILES; _mt++) {                                 \
+        for (int _kk = 0; _kk < BK / 16; _kk++) {                                 \
             _Pragma("unroll")                                                       \
-            for (int _kk = 0; _kk < BK / 16; _kk++) {                             \
-                wmma::load_matrix_sync(_fa,                                         \
+            for (int _mt = 0; _mt < WM_TILES; _mt++)                               \
+                wmma::load_matrix_sync(_fa[_mt],                                    \
                     &A_shared[(buf_)][warp_row * WARP_TILE_M + _mt * 16][_kk * 16], BKP); \
+            _Pragma("unroll")                                                       \
+            for (int _nt = 0; _nt < WN_TILES; _nt++)                               \
+                wmma::load_matrix_sync(_fb[_nt],                                    \
+                    &B_shared[(buf_)][_kk * 16][warp_col * WARP_TILE_N + _nt * 16], BNP); \
+            _Pragma("unroll")                                                       \
+            for (int _mt = 0; _mt < WM_TILES; _mt++)                               \
                 _Pragma("unroll")                                                   \
-                for (int _nt = 0; _nt < WN_TILES; _nt++) {                         \
-                    wmma::load_matrix_sync(_fb,                                     \
-                        &B_shared[(buf_)][_kk * 16][warp_col * WARP_TILE_N + _nt * 16], BN); \
-                    wmma::mma_sync(acc_frag[_mt][_nt], _fa, _fb, acc_frag[_mt][_nt]); \
-                }                                                                   \
-            }                                                                       \
+                for (int _nt = 0; _nt < WN_TILES; _nt++)                           \
+                    wmma::mma_sync(acc_frag[_mt][_nt], _fa[_mt], _fb[_nt], acc_frag[_mt][_nt]); \
         }                                                                           \
     } while (0)
 
@@ -151,30 +163,38 @@ __device__ __forceinline__ void matmul_tc3_padA_impl(
     }
 }
 
-#define MAKE_LAUNCHER(BM_, BN_, BK_, NW_)                                           \
-extern "C" __global__ __launch_bounds__(NW_ * 32)                                   \
-void matmul_cuda_tc3_padA_bm##BM_##_bn##BN_##_bk##BK_##_nw##NW_(                        \
-    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,       \
-    __nv_bfloat16* __restrict__ C, int M, int K, int N) {                           \
-    matmul_tc3_padA_impl<BM_, BN_, BK_, NW_>(A, B, C, M, K, N);                         \
+#define MAKE_LAUNCHER(BM_, BN_, BK_, NW_, PA_, PB_)                                 \
+extern "C" __global__ __launch_bounds__(NW_ * 32)                                    \
+void matmul_cuda_tc1_pad_bm##BM_##_bn##BN_##_bk##BK_##_nw##NW_##_pa##PA_##_pb##PB_(    \
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,        \
+    __nv_bfloat16* __restrict__ C, int M, int K, int N) {                            \
+    matmul_tc3_impl<BM_, BN_, BK_, NW_, PA_, PB_>(A, B, C, M, K, N);               \
 }
 
-// ── NW=4 ─────────────────────────────────────────────────────────────────────
-MAKE_LAUNCHER( 64,  64, 16, 4) MAKE_LAUNCHER( 64,  64, 32, 4)
-MAKE_LAUNCHER( 64, 128, 16, 4) MAKE_LAUNCHER( 64, 128, 32, 4)
-MAKE_LAUNCHER( 64, 256, 16, 4) MAKE_LAUNCHER( 64, 256, 32, 4)
-MAKE_LAUNCHER(128,  64, 16, 4) MAKE_LAUNCHER(128,  64, 32, 4)
-MAKE_LAUNCHER(128, 128, 16, 4) MAKE_LAUNCHER(128, 128, 32, 4)
-MAKE_LAUNCHER(256,  64, 16, 4) MAKE_LAUNCHER(256,  64, 32, 4)
+// Expand all 4 (PAD_A, PAD_B) ∈ {0,8}² combos for a given (BM, BN, BK, NW).
+#define MAKE_PADS(BM_, BN_, BK_, NW_)          \
+    MAKE_LAUNCHER(BM_, BN_, BK_, NW_, 0, 0)    \
+    MAKE_LAUNCHER(BM_, BN_, BK_, NW_, 0, 8)    \
+    MAKE_LAUNCHER(BM_, BN_, BK_, NW_, 8, 0)    \
+    MAKE_LAUNCHER(BM_, BN_, BK_, NW_, 8, 8)
 
-// ── NW=8 ─────────────────────────────────────────────────────────────────────
-MAKE_LAUNCHER( 64,  64, 16, 8) MAKE_LAUNCHER( 64,  64, 32, 8)
-MAKE_LAUNCHER( 64, 128, 16, 8) MAKE_LAUNCHER( 64, 128, 32, 8)
-MAKE_LAUNCHER( 64, 256, 16, 8) MAKE_LAUNCHER( 64, 256, 32, 8)
-MAKE_LAUNCHER(128,  64, 16, 8) MAKE_LAUNCHER(128,  64, 32, 8)
-MAKE_LAUNCHER(128, 128, 16, 8) MAKE_LAUNCHER(128, 128, 32, 8)
-MAKE_LAUNCHER(128, 256, 16, 8) MAKE_LAUNCHER(128, 256, 32, 8)
-MAKE_LAUNCHER(256,  64, 16, 8) MAKE_LAUNCHER(256,  64, 32, 8)
-MAKE_LAUNCHER(256, 128, 16, 8) MAKE_LAUNCHER(256, 128, 32, 8)
+// ── NW=4 (128 threads) ───────────────────────────────────────────────────────
+MAKE_PADS( 64,  64, 16, 4) MAKE_PADS( 64,  64, 32, 4)
+MAKE_PADS( 64, 128, 16, 4) MAKE_PADS( 64, 128, 32, 4)
+MAKE_PADS( 64, 256, 16, 4) MAKE_PADS( 64, 256, 32, 4)
+MAKE_PADS(128,  64, 16, 4) MAKE_PADS(128,  64, 32, 4)
+MAKE_PADS(128, 128, 16, 4) MAKE_PADS(128, 128, 32, 4)
+MAKE_PADS(256,  64, 16, 4) MAKE_PADS(256,  64, 32, 4)
 
+// ── NW=8 (256 threads) ───────────────────────────────────────────────────────
+MAKE_PADS( 64,  64, 16, 8) MAKE_PADS( 64,  64, 32, 8)
+MAKE_PADS( 64, 128, 16, 8) MAKE_PADS( 64, 128, 32, 8)
+MAKE_PADS( 64, 256, 16, 8) MAKE_PADS( 64, 256, 32, 8)
+MAKE_PADS(128,  64, 16, 8) MAKE_PADS(128,  64, 32, 8)
+MAKE_PADS(128, 128, 16, 8) MAKE_PADS(128, 128, 32, 8)
+MAKE_PADS(128, 256, 16, 8) MAKE_PADS(128, 256, 32, 8)
+MAKE_PADS(256,  64, 16, 8) MAKE_PADS(256,  64, 32, 8)
+MAKE_PADS(256, 128, 16, 8) MAKE_PADS(256, 128, 32, 8)
+
+#undef MAKE_PADS
 #undef MAKE_LAUNCHER

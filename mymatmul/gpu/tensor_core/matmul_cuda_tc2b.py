@@ -14,7 +14,7 @@ _EXT = "_matmul_cuda_ext_tc2b"
 
 _BMS = [64, 128, 256]
 _BNS = [64, 128, 256]
-_BKS = [16, 32]
+_BKS = [16, 32, 64]
 _NWS = [4, 8]
 
 _MAX_SMEM = 100352

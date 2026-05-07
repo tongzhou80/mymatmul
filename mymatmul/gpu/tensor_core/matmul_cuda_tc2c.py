@@ -1,10 +1,9 @@
-"""TC3: BF16 WMMA matmul — TC1 with A-tile smem padding (PAD_A=8).
+"""TC2c: BF16 raw-PTX mma.sync, BK=64, symmetric A+B XOR swizzle.
 
-Same double-buffered cp.async and WMMA compute as TC1, but A_shared row
-stride is padded from BK to BK+8 (bf16 elements) to eliminate bank conflicts.
-The WMMA load_matrix_sync leading dimension is updated to BK+8 accordingly.
-
-Smem: (2*BM*(BK+8) + 2*BK*BN)*2 bytes.
+At BK=64 every A-tile row aliases to bank 0 (row stride = 128 bytes = 32 banks),
+identical to the B-tile pattern. Both tiles use the same per-row swizzle:
+  physical_chunk = logical_chunk ^ (row % SWZ)
+where SWZ = BK/8 = 8 for A and SWZ = BN/8 for B.
 """
 
 import time
@@ -13,31 +12,31 @@ from .._pycuda_loader import launch_matmul, get_module
 
 DTYPE = torch.bfloat16
 
-_EXT = "_matmul_cuda_ext_tc3_padA"
+_EXT = "_matmul_cuda_ext_tc2c"
+
+_BK = 64
 
 _BMS = [64, 128, 256]
 _BNS = [64, 128, 256]
-_BKS = [16, 32]
 _NWS = [4, 8]
 
 _MAX_SMEM = 100352
-_PAD_A = 8
 
 
-def _smem(bm, bn, bk):
-    return (2 * bm * (bk + _PAD_A) + 2 * bk * bn) * 2  # bf16 = 2 bytes
+def _smem(bm, bn):
+    return (2 * bm * _BK + 2 * _BK * bn) * 2  # = 256*(bm+bn)
 
 
 _CONFIGS = [
-    (bm, bn, bk, nw)
-    for bm in _BMS for bn in _BNS for bk in _BKS for nw in _NWS
-    if _smem(bm, bn, bk) <= _MAX_SMEM
+    (bm, bn, nw)
+    for bm in _BMS for bn in _BNS for nw in _NWS
+    if _smem(bm, bn) <= _MAX_SMEM
     and bm * bn <= 4096 * nw
 ]
 
 
-def _kname(bm, bn, bk, nw):
-    return f"matmul_cuda_tc3_padA_bm{bm}_bn{bn}_bk{bk}_nw{nw}"
+def _kname(bm, bn, nw):
+    return f"matmul_cuda_tc2c_bm{bm}_bn{bn}_bk64_nw{nw}"
 
 
 def _block(nw):
@@ -57,17 +56,17 @@ def _tune(M, N, K):
 
     get_module(_EXT)
 
-    cfgs = [c for c in _CONFIGS if M % c[0] == 0 and N % c[1] == 0 and K % c[2] == 0]
+    cfgs = [c for c in _CONFIGS if M % c[0] == 0 and N % c[1] == 0 and K % _BK == 0]
     best_t = float("inf")
     best_cfg = cfgs[0]
     n = len(cfgs)
 
     for idx, cfg in enumerate(cfgs):
-        bm, bn, bk, nw = cfg
+        bm, bn, nw = cfg
         kn    = _kname(*cfg)
         block = _block(nw)
         grid  = _grid(M, N, bm, bn)
-        sb    = _smem(bm, bn, bk)
+        sb    = _smem(bm, bn)
         try:
             for _ in range(2):
                 launch_matmul(_EXT, kn, A, B, block, grid,
@@ -80,11 +79,11 @@ def _tune(M, N, K):
             torch.cuda.synchronize()
             t = (time.perf_counter() - t0) / 3
         except Exception as e:
-            print(f"  [{idx+1}/{n}] BM={bm} BN={bn} BK={bk} NW={nw}  FAILED: {e}")
+            print(f"  [{idx+1}/{n}] BM={bm} BN={bn} NW={nw}  FAILED: {e}")
             continue
 
         gflops = 2 * M * N * K / t / 1e12
-        print(f"  [{idx+1:3d}/{n}] BM={bm:3d} BN={bn:3d} BK={bk:2d} NW={nw}   {gflops:6.1f} TFLOPS")
+        print(f"  [{idx+1:2d}/{n}] BM={bm:3d} BN={bn:3d} NW={nw}   {gflops:6.1f} TFLOPS")
 
         if t < best_t:
             best_t   = t
@@ -93,20 +92,20 @@ def _tune(M, N, K):
     return best_cfg
 
 
-def matmul_tc3_padA(A, B):
+def matmul_tc2c(A, B):
     M, K = A.shape
     _, N = B.shape
     key  = (M, N, K)
     if key not in _best:
-        cfgs = [c for c in _CONFIGS if M % c[0] == 0 and N % c[1] == 0 and K % c[2] == 0]
-        print(f"[tc3_padA] autotuning {M}x{K}x{N} over {len(cfgs)} configs ...")
+        cfgs = [c for c in _CONFIGS if M % c[0] == 0 and N % c[1] == 0 and K % _BK == 0]
+        print(f"[tc2c] autotuning {M}x{K}x{N} over {len(cfgs)} configs ...")
         _best[key] = _tune(M, N, K)
-        bm, bn, bk, nw = _best[key]
-        print(f"[tc3_padA] best: BM={bm} BN={bn} BK={bk} NW={nw}")
+        bm, bn, nw = _best[key]
+        print(f"[tc2c] best: BM={bm} BN={bn} BK={_BK} NW={nw}")
 
-    bm, bn, bk, nw = _best[key]
+    bm, bn, nw = _best[key]
     return launch_matmul(
-        _EXT, _kname(bm, bn, bk, nw), A, B,
+        _EXT, _kname(bm, bn, nw), A, B,
         _block(nw), _grid(M, N, bm, bn),
-        smem_bytes=_smem(bm, bn, bk),
+        smem_bytes=_smem(bm, bn),
     )

@@ -6,30 +6,28 @@
 using namespace nvcuda;
 
 /*
- * TC3-padB4: same as tc3_padB but PAD_B=4 instead of 8.
+ * TC1_padB2: BF16 WMMA matmul — TC1 with B-tile smem padding to reduce bank conflicts.
  *
- * PAD_B=4 → BNP=BN+4.  Bank-shift per row: (BNP/2)%32 = ((BN+4)/2)%32.
- * For BN=64:  BNP=68,  shift=(68/2)%32=34%32=2  → cycle=16 → zero conflict
- * For BN=128: BNP=132, shift=(132/2)%32=66%32=2 → cycle=16 → zero conflict
- * Compare with PAD_B=8 (tc3_padB): shift=4 → cycle=8 → 2-way conflict.
+ * B_shared row stride padded from BN to BN+8 (bf16 elements).
+ * Without padding: stride=BN=64 → (64/2)%32=0 → ALL rows alias to bank 0 (worst case).
+ * With PAD_B=8: stride=72 → (72/2)%32=36%32=4 → period-8 cycling, 8 distinct banks.
+ * This reduces the B-tile 16-row conflict from 16-way down to 2-way.
  *
- * Alignment note: BNP is a multiple of 4 but NOT 8, so 16-byte cp.async would
- * be misaligned on odd rows.  We use B_ELEM=4 (8-byte copies) throughout.
- * Row stride BNP*2 bytes: 68*2=136, 132*2=264, 260*2=520 — all multiples of 8 ✓.
- * Column offsets _c are multiples of B_ELEM=4 ✓.
- *
- * A_shared is unchanged (no padding).  Smem: (2*BM*BK + 2*BK*(BN+4))*2 bytes.
+ * A_shared is unchanged (no padding).  Smem: (2*BM*BK + 2*BK*(BN+8))*2 bytes.
+ * load_matrix_sync for B receives leading dimension BN+8 (padded stride).
+ * cp.async for B is 16-byte aligned: row stride=72*2=144 bytes (144/16=9 ✓),
+ * column offsets are multiples of 8 BF16 = 16 bytes ✓.
  */
 
 template <int BM, int BN, int BK, int NUM_WARPS>
-__device__ __forceinline__ void matmul_tc3_padB4_impl(
+__device__ __forceinline__ void matmul_tc3_padB2_impl(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
     __nv_bfloat16* __restrict__ C,
     int M, int K, int N
 ) {
-    constexpr int PAD_B = 4;
-    constexpr int BNP   = BN + PAD_B;
+    constexpr int PAD_B = 8;
+    constexpr int BNP   = BN + PAD_B;  // padded B-tile column stride
 
     constexpr int WARP_N = 2;
     constexpr int WARP_M = NUM_WARPS / WARP_N;
@@ -44,12 +42,12 @@ __device__ __forceinline__ void matmul_tc3_padB4_impl(
 
     constexpr int A_ELEM   = (BM * BK / THREADS >= 8) ? 8 : 4;
     constexpr int A_GROUPS = BM * BK / A_ELEM / THREADS;
-    // B_ELEM fixed at 4 (8-byte copies): BNP%8 != 0 so 16-byte copies would misalign.
-    constexpr int B_ELEM   = 4;
+    constexpr int B_ELEM   = (BK * BN / THREADS >= 8) ? 8 : 4;
     constexpr int B_GROUPS = BK * BN / B_ELEM / THREADS;
 
     extern __shared__ __nv_bfloat16 smem[];
     auto A_shared = reinterpret_cast<__nv_bfloat16 (*)[BM][BK]>(smem);
+    // B_shared uses padded row stride BNP to reduce bank conflicts
     auto B_shared = reinterpret_cast<__nv_bfloat16 (*)[BK][BNP]>(smem + 2 * BM * BK);
 
     const int tid      = threadIdx.y * blockDim.x + threadIdx.x;
@@ -68,6 +66,8 @@ __device__ __forceinline__ void matmul_tc3_padB4_impl(
         for (int nt = 0; nt < WN_TILES; nt++)
             wmma::fill_fragment(acc_frag[mt][nt], 0.0f);
 
+// ── Async load A (unpadded) and B (padded stride BNP) ────────────────────────
+// B index uses logical BN width; B_shared[buf_][r][c] handles padded stride.
 #define ISSUE_TILE(k0_, buf_)                                                       \
     do {                                                                            \
         _Pragma("unroll")                                                           \
@@ -89,23 +89,27 @@ __device__ __forceinline__ void matmul_tc3_padB4_impl(
         __pipeline_commit();                                                         \
     } while (0)
 
+// ── WMMA compute — outer-product order: load all A frags, load all B frags, mma ─
+// Fixes redundant B loads: original loaded each B tile WM_TILES times; now once.
 #define COMPUTE_TILE(buf_)                                                          \
     do {                                                                            \
-        wmma::fragment<wmma::matrix_a, 16,16,16, __nv_bfloat16, wmma::row_major> _fa; \
-        wmma::fragment<wmma::matrix_b, 16,16,16, __nv_bfloat16, wmma::row_major> _fb; \
+        wmma::fragment<wmma::matrix_a, 16,16,16, __nv_bfloat16, wmma::row_major> _fa[WM_TILES]; \
+        wmma::fragment<wmma::matrix_b, 16,16,16, __nv_bfloat16, wmma::row_major> _fb[WN_TILES]; \
         _Pragma("unroll")                                                           \
-        for (int _mt = 0; _mt < WM_TILES; _mt++) {                                 \
+        for (int _kk = 0; _kk < BK / 16; _kk++) {                                 \
             _Pragma("unroll")                                                       \
-            for (int _kk = 0; _kk < BK / 16; _kk++) {                             \
-                wmma::load_matrix_sync(_fa,                                         \
+            for (int _mt = 0; _mt < WM_TILES; _mt++)                               \
+                wmma::load_matrix_sync(_fa[_mt],                                    \
                     &A_shared[(buf_)][warp_row * WARP_TILE_M + _mt * 16][_kk * 16], BK); \
+            _Pragma("unroll")                                                       \
+            for (int _nt = 0; _nt < WN_TILES; _nt++)                               \
+                wmma::load_matrix_sync(_fb[_nt],                                    \
+                    &B_shared[(buf_)][_kk * 16][warp_col * WARP_TILE_N + _nt * 16], BNP); \
+            _Pragma("unroll")                                                       \
+            for (int _mt = 0; _mt < WM_TILES; _mt++)                               \
                 _Pragma("unroll")                                                   \
-                for (int _nt = 0; _nt < WN_TILES; _nt++) {                         \
-                    wmma::load_matrix_sync(_fb,                                     \
-                        &B_shared[(buf_)][_kk * 16][warp_col * WARP_TILE_N + _nt * 16], BNP); \
-                    wmma::mma_sync(acc_frag[_mt][_nt], _fa, _fb, acc_frag[_mt][_nt]); \
-                }                                                                   \
-            }                                                                       \
+                for (int _nt = 0; _nt < WN_TILES; _nt++)                           \
+                    wmma::mma_sync(acc_frag[_mt][_nt], _fa[_mt], _fb[_nt], acc_frag[_mt][_nt]); \
         }                                                                           \
     } while (0)
 
@@ -154,10 +158,10 @@ __device__ __forceinline__ void matmul_tc3_padB4_impl(
 
 #define MAKE_LAUNCHER(BM_, BN_, BK_, NW_)                                           \
 extern "C" __global__ __launch_bounds__(NW_ * 32)                                   \
-void matmul_cuda_tc3_padB4_bm##BM_##_bn##BN_##_bk##BK_##_nw##NW_(                  \
+void matmul_cuda_tc1_padB2_bm##BM_##_bn##BN_##_bk##BK_##_nw##NW_(                        \
     const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,       \
     __nv_bfloat16* __restrict__ C, int M, int K, int N) {                           \
-    matmul_tc3_padB4_impl<BM_, BN_, BK_, NW_>(A, B, C, M, K, N);                   \
+    matmul_tc3_padB2_impl<BM_, BN_, BK_, NW_>(A, B, C, M, K, N);                         \
 }
 
 // ── NW=4 ─────────────────────────────────────────────────────────────────────
