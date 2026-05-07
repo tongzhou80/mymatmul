@@ -90,7 +90,7 @@ __device__ __forceinline__ void matmul_tc2_impl(
     constexpr int WARP_TILE_N = BN / WARP_N;
 
     constexpr int WM_TILES = WARP_TILE_M / 16;
-    constexpr int WN_TILES = WARP_TILE_N / 16;
+    constexpr int WN_TILES = WARP_TILE_N / 8;   // native mma width: one mma per nt
 
     constexpr int THREADS = NUM_WARPS * 32;
 
@@ -117,10 +117,9 @@ __device__ __forceinline__ void matmul_tc2_impl(
     const int block_row = blockIdx.y * BM;
     const int block_col = blockIdx.x * BN;
 
-    // acc[mt][nt][8]: same element layout as TC1's wmma float32 accumulator.
-    //   [0..3] = output of 1st mma call (N-cols 0..7 within the 16-wide tile)
-    //   [4..7] = output of 2nd mma call (N-cols 8..15)
-    float acc[WM_TILES][WN_TILES][8] = {};
+    // acc[mt][nt][4]: 4 f32 per 16x8 mma output tile.
+    //   nt indexes 8-wide N chunks directly — one mma.sync per (mt, nt, kk).
+    float acc[WM_TILES][WN_TILES][4] = {};
 
 // ── Async load: A flat, B XOR-swizzled ───────────────────────────────────────
 // Swizzle formula (8-bf16 granularity):
@@ -154,6 +153,7 @@ __device__ __forceinline__ void matmul_tc2_impl(
 //                  threads 16..31 address right half (col kk*16+8).
 // B: ldmatrix.x2.trans — threads 0..15 address rows kk*16..kk*16+15 with
 //    swizzled column; threads 16..31 mirror 0..15 (unused by hardware).
+// _nt indexes 8-wide N chunks directly: _nc = warp_col*WARP_TILE_N + _nt*8.
 #define COMPUTE_TILE(buf_)                                                          \
     do {                                                                            \
         _Pragma("unroll")                                                           \
@@ -166,17 +166,14 @@ __device__ __forceinline__ void matmul_tc2_impl(
                 ldmatrix_x4(_fa[_mt][0], _fa[_mt][1], _fa[_mt][2], _fa[_mt][3],   \
                     __cvta_generic_to_shared(&A_shared[(buf_)][_ar][_ac]));         \
             }                                                                       \
-            uint32_t _fb[WN_TILES][2][2];                                           \
+            uint32_t _fb[WN_TILES][2];                                              \
             _Pragma("unroll")                                                       \
             for (int _nt = 0; _nt < WN_TILES; _nt++) {                             \
-                _Pragma("unroll")                                                   \
-                for (int _hn = 0; _hn < 2; _hn++) {                                \
-                    const int _br = _kk * 16 + (lane % 16);                        \
-                    const int _nc = warp_col * WARP_TILE_N + _nt * 16 + _hn * 8;  \
-                    const int _sc = ((_nc / 8) ^ (_br % B_SWZ)) * 8;              \
-                    ldmatrix_x2_trans(_fb[_nt][_hn][0], _fb[_nt][_hn][1],          \
-                        __cvta_generic_to_shared(&B_shared[(buf_)][_br][_sc]));     \
-                }                                                                   \
+                const int _br = _kk * 16 + (lane % 16);                            \
+                const int _nc = warp_col * WARP_TILE_N + _nt * 8;                  \
+                const int _sc = ((_nc / 8) ^ (_br % B_SWZ)) * 8;                  \
+                ldmatrix_x2_trans(_fb[_nt][0], _fb[_nt][1],                        \
+                    __cvta_generic_to_shared(&B_shared[(buf_)][_br][_sc]));         \
             }                                                                       \
             _Pragma("unroll")                                                       \
             for (int _mt = 0; _mt < WM_TILES; _mt++) {                             \
@@ -186,12 +183,7 @@ __device__ __forceinline__ void matmul_tc2_impl(
                                  acc[_mt][_nt][2], acc[_mt][_nt][3],               \
                                  _fa[_mt][0], _fa[_mt][1],                         \
                                  _fa[_mt][2], _fa[_mt][3],                         \
-                                 _fb[_nt][0][0], _fb[_nt][0][1]);                  \
-                    mma_m16n8k16(acc[_mt][_nt][4], acc[_mt][_nt][5],               \
-                                 acc[_mt][_nt][6], acc[_mt][_nt][7],               \
-                                 _fa[_mt][0], _fa[_mt][1],                         \
-                                 _fa[_mt][2], _fa[_mt][3],                         \
-                                 _fb[_nt][1][0], _fb[_nt][1][1]);                  \
+                                 _fb[_nt][0], _fb[_nt][1]);                        \
                 }                                                                   \
             }                                                                       \
         }                                                                           \
@@ -218,12 +210,12 @@ __device__ __forceinline__ void matmul_tc2_impl(
 #undef ISSUE_TILE
 #undef COMPUTE_TILE
 
-    // Write-back: identical element mapping to TC1's wmma accumulator layout.
+    // Write-back: mma.sync m16n8 output layout.
     //   Thread t: base_row = t/4, base_col = 2*(t%4)
     //   e=0: row+0,col+0  e=1: row+0,col+1  e=2: row+8,col+0  e=3: row+8,col+1
-    //   e=4: row+0,col+8  e=5: row+0,col+9  e=6: row+8,col+8  e=7: row+8,col+9
-    constexpr int row_off[8] = {0, 0, 8, 8, 0, 0, 8, 8};
-    constexpr int col_off[8] = {0, 1, 0, 1, 8, 9, 8, 9};
+    //   nt indexes 8-wide N chunks: gc base = warp_col*WARP_TILE_N + nt*8
+    constexpr int row_off[4] = {0, 0, 8, 8};
+    constexpr int col_off[4] = {0, 1, 0, 1};
     const int base_row = lane / 4;
     const int base_col = (lane % 4) * 2;
 
@@ -232,10 +224,10 @@ __device__ __forceinline__ void matmul_tc2_impl(
         #pragma unroll
         for (int nt = 0; nt < WN_TILES; nt++) {
             #pragma unroll
-            for (int e = 0; e < 8; e++) {
+            for (int e = 0; e < 4; e++) {
                 const int gr = block_row + warp_row * WARP_TILE_M + mt * 16
                                + base_row + row_off[e];
-                const int gc = block_col + warp_col * WARP_TILE_N + nt * 16
+                const int gc = block_col + warp_col * WARP_TILE_N + nt * 8
                                + base_col + col_off[e];
                 if (gr < M && gc < N)
                     C[gr * N + gc] = __float2bfloat16(acc[mt][nt][e]);
