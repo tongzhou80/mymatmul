@@ -1,16 +1,11 @@
-"""TC3: TC2b + register prefetch on the inner kk loop.
+"""TC2b_l2: TC2b with inline PTX cp.async.cg.L2::128B hint for B-tile loads.
 
-COMPUTE_TILE double-buffers A and B fragments in registers so that ldmatrix
-loads for kk+1 are issued before the mma.sync for kk complete, hiding
-smem-to-register latency behind tensor-core compute.
+B rows are 16-byte aligned (bf16, BN≥64), so each cp.async fetches a full
+128-byte L2 cache line.  A rows that are 8 elements wide use the standard
+cp.async.ca (cache-all) path.
 
-At BK=16 (NUM_KK=1) there is nothing to pipeline; TC3 degenerates to TC2b.
-The benefit grows with BK: BK=32 overlaps 1 ldmatrix cluster with 1 mma
-cluster; BK=64 overlaps 3.  The register cost is 2× the fragment temps
-(fa[2] instead of fa[1], fb[2] instead of fb[1]).
-
-Everything else — ISSUE_TILE, smem layout, XOR swizzle, write-back — is
-identical to TC2b.
+L2::128B hint tells the GPU to fetch the full cache line into L2 even if the
+warp only touches part of it — useful when consecutive CTAs share B-tile strips.
 """
 
 import time
@@ -19,7 +14,7 @@ from .._pycuda_loader import launch_matmul, get_module
 
 DTYPE = torch.bfloat16
 
-_EXT = "_matmul_cuda_ext_tc3"
+_EXT = "_matmul_cuda_ext_tc2b_l2"
 
 _BMS = [64, 128, 256]
 _BNS = [64, 128, 256]
@@ -42,7 +37,7 @@ _CONFIGS = [
 
 
 def _kname(bm, bn, bk, nw):
-    return f"matmul_cuda_tc3_bm{bm}_bn{bn}_bk{bk}_nw{nw}"
+    return f"matmul_cuda_tc2b_l2_bm{bm}_bn{bn}_bk{bk}_nw{nw}"
 
 
 def _block(nw):
@@ -98,16 +93,16 @@ def _tune(M, N, K):
     return best_cfg
 
 
-def matmul_tc3(A, B):
+def matmul_tc2b_l2(A, B):
     M, K = A.shape
     _, N = B.shape
     key  = (M, N, K)
     if key not in _best:
         cfgs = [c for c in _CONFIGS if M % c[0] == 0 and N % c[1] == 0 and K % c[2] == 0]
-        print(f"[tc3] autotuning {M}x{K}x{N} over {len(cfgs)} configs ...")
+        print(f"[tc2b_l2] autotuning {M}x{K}x{N} over {len(cfgs)} configs ...")
         _best[key] = _tune(M, N, K)
         bm, bn, bk, nw = _best[key]
-        print(f"[tc3] best: BM={bm} BN={bn} BK={bk} NW={nw}")
+        print(f"[tc2b_l2] best: BM={bm} BN={bn} BK={bk} NW={nw}")
 
     bm, bn, bk, nw = _best[key]
     return launch_matmul(

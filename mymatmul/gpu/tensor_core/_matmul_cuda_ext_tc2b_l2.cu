@@ -3,21 +3,22 @@
 #include <cuda_bf16.h>
 
 /*
- * TC3: TC2b + register prefetch on the inner kk loop.
+ * TC2b_l2: TC2b with cp.async.cg.L2::128B prefetch hint.
  *
- * COMPUTE_TILE double-buffers the A and B fragments in registers:
- * while mma.sync executes for kk, the ldmatrix loads for kk+1 are issued
- * ahead of time so the GPU can hide smem-to-register latency behind the
- * tensor-core compute.
+ * Replaces __pipeline_memcpy_async (which uses cp.async.ca / default eviction)
+ * with inline PTX cp.async.cg + L2::128B eviction hint.  This tells the L2
+ * to load the full 128-byte cache line even when only 16 bytes are consumed,
+ * so adjacent CTAs (or the same CTA's later iterations) that touch the same
+ * line find it already warm in L2.
  *
- *   fa[2][WM_TILES][4]  (double-buffered A fragments)
- *   fb[2][WN_TILES][2]  (double-buffered B fragments)
+ *   .cg   = cache at global (L2) level, bypass L1
+ *   .L2::128B = eviction hint: prefetch/retain full 128-byte line in L2
  *
- * For BK=16 (NUM_KK=1) there is nothing to pipeline, so TC3 degenerates to
- * TC2b (prologue load → epilogue compute).  The benefit grows with BK:
- * BK=32 overlaps 1 ldmatrix cluster with 1 mma cluster; BK=64 overlaps 3.
+ * cp.async pipeline management switches from __pipeline_* to the PTX
+ * cp.async.commit_group / cp.async.wait_group builtins, which are the
+ * underlying mechanism __pipeline_* wraps.
  *
- * Everything else (ISSUE_TILE, smem layout, XOR swizzle, write-back) is
+ * Everything else (smem layout, XOR swizzle, COMPUTE_TILE, write-back) is
  * identical to TC2b.
  */
 
@@ -58,10 +59,40 @@ __device__ __forceinline__ void mma_m16n8k16(
     );
 }
 
+// 16-byte async copy with L2::128B hint (bypass L1, prefetch full cache line).
+__device__ __forceinline__ void cp_async_cg_l2(void* dst, const void* src) {
+    uint32_t smem_ptr = __cvta_generic_to_shared(dst);
+    asm volatile(
+        "cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
+        :: "r"(smem_ptr), "l"((uint64_t)src)
+    );
+}
+
+// 8-byte async copy (L2::128B requires 16-byte copies; fall back to .ca for 8-byte).
+__device__ __forceinline__ void cp_async_ca_8(void* dst, const void* src) {
+    uint32_t smem_ptr = __cvta_generic_to_shared(dst);
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 8;\n"
+        :: "r"(smem_ptr), "l"((uint64_t)src)
+    );
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" :::);
+}
+
+__device__ __forceinline__ void cp_async_wait1() {
+    asm volatile("cp.async.wait_group 1;\n" :::);
+}
+
+__device__ __forceinline__ void cp_async_wait_all() {
+    asm volatile("cp.async.wait_all;\n" :::);
+}
+
 // ── Kernel implementation ─────────────────────────────────────────────────────
 
 template <int BM, int BN, int BK, int NUM_WARPS>
-__device__ __forceinline__ void matmul_tc3_impl(
+__device__ __forceinline__ void matmul_tc2b_l2_impl(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
     __nv_bfloat16* __restrict__ C,
@@ -78,6 +109,9 @@ __device__ __forceinline__ void matmul_tc3_impl(
 
     constexpr int THREADS = NUM_WARPS * 32;
 
+    // L2::128B requires 16-byte (8-element bf16) copies.
+    // A_ELEM / B_ELEM: prefer 16 bytes (8 bf16); fall back to 8 bytes only
+    // when tile/thread count forces smaller granularity.
     constexpr int A_ELEM   = (BM * BK / THREADS >= 8) ? 8 : 4;
     constexpr int A_GROUPS = BM * BK / A_ELEM / THREADS;
     constexpr int B_ELEM   = (BK * BN / THREADS >= 8) ? 8 : 4;
@@ -86,8 +120,6 @@ __device__ __forceinline__ void matmul_tc3_impl(
     constexpr int A_SWZ   = BK / 8;
     constexpr int A_SHIFT = 64 / BK;
     constexpr int B_SWZ   = BN / 8;
-
-    constexpr int NUM_KK = BK / 16;   // kk steps per smem tile
 
     extern __shared__ __nv_bfloat16 smem[];
     auto A_shared = reinterpret_cast<__nv_bfloat16 (*)[BM][BK]>(smem);
@@ -104,7 +136,7 @@ __device__ __forceinline__ void matmul_tc3_impl(
 
     float acc[WM_TILES][WN_TILES][4] = {};
 
-// ── Async load: same XOR swizzle as TC2b ─────────────────────────────────────
+// ── Async load with L2::128B hint ────────────────────────────────────────────
 #define ISSUE_TILE(k0_, buf_)                                                       \
     do {                                                                            \
         _Pragma("unroll")                                                           \
@@ -113,9 +145,13 @@ __device__ __forceinline__ void matmul_tc3_impl(
             const int _r  = (_g * A_ELEM) / BK;                                   \
             const int _c  = (_g * A_ELEM) % BK;                                   \
             const int _sc = ((_c / 8) ^ ((_r / A_SHIFT) % A_SWZ)) * 8 + (_c % 8); \
-            __pipeline_memcpy_async(&A_shared[(buf_)][_r][_sc],                     \
-                                    &A[(block_row + _r) * K + (k0_) + _c],        \
-                                    A_ELEM * (int)sizeof(__nv_bfloat16));           \
+            if constexpr (A_ELEM == 8) {                                            \
+                cp_async_cg_l2(&A_shared[(buf_)][_r][_sc],                          \
+                               &A[(block_row + _r) * K + (k0_) + _c]);             \
+            } else {                                                                \
+                cp_async_ca_8(&A_shared[(buf_)][_r][_sc],                           \
+                              &A[(block_row + _r) * K + (k0_) + _c]);              \
+            }                                                                       \
         }                                                                           \
         _Pragma("unroll")                                                           \
         for (int _i = 0; _i < B_GROUPS; _i++) {                                    \
@@ -123,71 +159,52 @@ __device__ __forceinline__ void matmul_tc3_impl(
             const int _r  = (_g * B_ELEM) / BN;                                   \
             const int _c  = (_g * B_ELEM) % BN;                                   \
             const int _sc = ((_c / 8) ^ (_r % B_SWZ)) * 8 + (_c % 8);            \
-            __pipeline_memcpy_async(&B_shared[(buf_)][_r][_sc],                    \
-                                    &B[((k0_) + _r) * N + block_col + _c],        \
-                                    B_ELEM * (int)sizeof(__nv_bfloat16));           \
+            if constexpr (B_ELEM == 8) {                                            \
+                cp_async_cg_l2(&B_shared[(buf_)][_r][_sc],                          \
+                               &B[((k0_) + _r) * N + block_col + _c]);             \
+            } else {                                                                \
+                cp_async_ca_8(&B_shared[(buf_)][_r][_sc],                           \
+                              &B[((k0_) + _r) * N + block_col + _c]);              \
+            }                                                                       \
         }                                                                           \
-        __pipeline_commit();                                                         \
+        cp_async_commit();                                                           \
     } while (0)
 
-// ── Helpers: load one kk slice into a register buffer slot ───────────────────
-// buf__ passed explicitly because these macros are expanded inside COMPUTE_TILE
-// and cannot inherit COMPUTE_TILE's buf_ parameter via the preprocessor.
-#define LOAD_A(slot_, kk_, buf__)                                                   \
-    _Pragma("unroll")                                                               \
-    for (int _mt = 0; _mt < WM_TILES; _mt++) {                                     \
-        const int _ar   = warp_row * WARP_TILE_M + _mt * 16 + (lane % 16);        \
-        const int _lg   = (kk_) * 2 + (lane / 16);                                 \
-        const int _phys = _lg ^ ((_ar / A_SHIFT) % A_SWZ);                        \
-        ldmatrix_x4(fa[(slot_)][_mt][0], fa[(slot_)][_mt][1],                      \
-                    fa[(slot_)][_mt][2], fa[(slot_)][_mt][3],                      \
-            __cvta_generic_to_shared(&A_shared[(buf__)][_ar][_phys * 8]));         \
-    }
-
-#define LOAD_B(slot_, kk_, buf__)                                                   \
-    _Pragma("unroll")                                                               \
-    for (int _nt = 0; _nt < WN_TILES; _nt++) {                                     \
-        const int _br = (kk_) * 16 + (lane % 16);                                  \
-        const int _nc = warp_col * WARP_TILE_N + _nt * 8;                          \
-        const int _sc = ((_nc / 8) ^ (_br % B_SWZ)) * 8;                          \
-        ldmatrix_x2_trans(fb[(slot_)][_nt][0], fb[(slot_)][_nt][1],                \
-            __cvta_generic_to_shared(&B_shared[(buf__)][_br][_sc]));               \
-    }
-
-#define COMPUTE(slot_)                                                              \
-    _Pragma("unroll")                                                               \
-    for (int _mt = 0; _mt < WM_TILES; _mt++) {                                     \
-        _Pragma("unroll")                                                           \
-        for (int _nt = 0; _nt < WN_TILES; _nt++) {                                 \
-            mma_m16n8k16(acc[_mt][_nt][0], acc[_mt][_nt][1],                       \
-                         acc[_mt][_nt][2], acc[_mt][_nt][3],                       \
-                         fa[(slot_)][_mt][0], fa[(slot_)][_mt][1],                 \
-                         fa[(slot_)][_mt][2], fa[(slot_)][_mt][3],                 \
-                         fb[(slot_)][_nt][0], fb[(slot_)][_nt][1]);                \
-        }                                                                           \
-    }
-
-// ── Compute: register-prefetch double-buffered inner kk loop ─────────────────
-// buf_ is the smem double-buffer slot (0 or 1) for this outer k tile.
-// fa[2][WM_TILES][4] and fb[2][WN_TILES][2] ping-pong between kk steps.
+// ── Compute: identical to TC2b ────────────────────────────────────────────────
 #define COMPUTE_TILE(buf_)                                                          \
     do {                                                                            \
-        uint32_t fa[2][WM_TILES][4];                                                \
-        uint32_t fb[2][WN_TILES][2];                                                \
-        /* Prologue: issue loads for kk=0 */                                        \
-        LOAD_A(0, 0, buf_)                                                          \
-        LOAD_B(0, 0, buf_)                                                          \
-        /* Main loop: load kk+1 while computing kk */                               \
         _Pragma("unroll")                                                           \
-        for (int _kk = 0; _kk < NUM_KK - 1; _kk++) {                              \
-            const int _cur = _kk & 1;                                               \
-            const int _nxt = 1 - _cur;                                              \
-            LOAD_A(_nxt, _kk + 1, buf_)                                             \
-            LOAD_B(_nxt, _kk + 1, buf_)                                             \
-            COMPUTE(_cur)                                                            \
+        for (int _kk = 0; _kk < BK / 16; _kk++) {                                 \
+            uint32_t _fa[WM_TILES][4];                                              \
+            _Pragma("unroll")                                                       \
+            for (int _mt = 0; _mt < WM_TILES; _mt++) {                             \
+                const int _ar  = warp_row * WARP_TILE_M + _mt * 16 + (lane % 16); \
+                const int _lg  = _kk * 2 + (lane / 16);                            \
+                const int _phys = _lg ^ ((_ar / A_SHIFT) % A_SWZ);                \
+                ldmatrix_x4(_fa[_mt][0], _fa[_mt][1], _fa[_mt][2], _fa[_mt][3],   \
+                    __cvta_generic_to_shared(&A_shared[(buf_)][_ar][_phys * 8]));  \
+            }                                                                       \
+            uint32_t _fb[WN_TILES][2];                                              \
+            _Pragma("unroll")                                                       \
+            for (int _nt = 0; _nt < WN_TILES; _nt++) {                             \
+                const int _br = _kk * 16 + (lane % 16);                            \
+                const int _nc = warp_col * WARP_TILE_N + _nt * 8;                  \
+                const int _sc = ((_nc / 8) ^ (_br % B_SWZ)) * 8;                  \
+                ldmatrix_x2_trans(_fb[_nt][0], _fb[_nt][1],                        \
+                    __cvta_generic_to_shared(&B_shared[(buf_)][_br][_sc]));         \
+            }                                                                       \
+            _Pragma("unroll")                                                       \
+            for (int _mt = 0; _mt < WM_TILES; _mt++) {                             \
+                _Pragma("unroll")                                                   \
+                for (int _nt = 0; _nt < WN_TILES; _nt++) {                         \
+                    mma_m16n8k16(acc[_mt][_nt][0], acc[_mt][_nt][1],               \
+                                 acc[_mt][_nt][2], acc[_mt][_nt][3],               \
+                                 _fa[_mt][0], _fa[_mt][1],                         \
+                                 _fa[_mt][2], _fa[_mt][3],                         \
+                                 _fb[_nt][0], _fb[_nt][1]);                        \
+                }                                                                   \
+            }                                                                       \
         }                                                                           \
-        /* Epilogue: compute last kk (no more loads to issue) */                    \
-        COMPUTE((NUM_KK - 1) & 1)                                                   \
     } while (0)
 
     const int num_tiles = K / BK;
@@ -198,20 +215,17 @@ __device__ __forceinline__ void matmul_tc3_impl(
         const int cur = k_iter & 1;
         const int nxt = 1 - cur;
         ISSUE_TILE((k_iter + 1) * BK, nxt);
-        __pipeline_wait_prior(1);
+        cp_async_wait1();
         __syncthreads();
         COMPUTE_TILE(cur);
         __syncthreads();
     }
 
-    __pipeline_wait_prior(0);
+    cp_async_wait_all();
     __syncthreads();
     COMPUTE_TILE((num_tiles - 1) & 1);
 
 #undef ISSUE_TILE
-#undef LOAD_A
-#undef LOAD_B
-#undef COMPUTE
 #undef COMPUTE_TILE
 
     constexpr int row_off[4] = {0, 0, 8, 8};
@@ -238,10 +252,10 @@ __device__ __forceinline__ void matmul_tc3_impl(
 
 #define MAKE_LAUNCHER(BM_, BN_, BK_, NW_)                                           \
 extern "C" __global__ __launch_bounds__(NW_ * 32)                                   \
-void matmul_cuda_tc3_bm##BM_##_bn##BN_##_bk##BK_##_nw##NW_(                        \
+void matmul_cuda_tc2b_l2_bm##BM_##_bn##BN_##_bk##BK_##_nw##NW_(                    \
     const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,       \
     __nv_bfloat16* __restrict__ C, int M, int K, int N) {                           \
-    matmul_tc3_impl<BM_, BN_, BK_, NW_>(A, B, C, M, K, N);                         \
+    matmul_tc2b_l2_impl<BM_, BN_, BK_, NW_>(A, B, C, M, K, N);                     \
 }
 
 // ── NW=4 ─────────────────────────────────────────────────────────────────────
