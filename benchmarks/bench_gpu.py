@@ -138,8 +138,14 @@ IMPLEMENTATIONS = {
     # Stage 5 PTX: s5 with raw PTX cp.async.cg.shared.global.L2::128B
     "s5_ptx_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_ptx.matmul_s5_ptx", None),
     "s5_ptx_bm256_bn128_bk32_u16": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_ptx.matmul_s5_ptx_bm256_bn128_bk32_u16", None),
+    # Triton BF16 tensor-core (autotuned, same config space as tc2b)
+    "triton_bf16_autotuned": ("mymatmul.gpu.matmul_triton.triton_bf16_autotuned", None, torch.bfloat16),
     # cuBLAS BF16 reference (tensor cores, bfloat16 inputs/output)
     "cublas_bf16": ("mymatmul.gpu.matmul_torch.matmul_torch_bf16", None, torch.bfloat16),
+    # TC3: TC2b + tunable NUM_STAGES smem pipeline (NS=2 == TC2b)
+    "tc3": ("mymatmul.gpu.tensor_core.matmul_cuda_tc3.matmul_tc3", None, torch.bfloat16),
+    # TC4: TC2b with ldmatrix.x4.trans for B (pairs two N-tiles, halves B ldmatrix count)
+    "tc4": ("mymatmul.gpu.tensor_core.matmul_cuda_tc4.matmul_tc4", None, torch.bfloat16),
     # Blog series article 1: 128-thread, 64×256 tile, BK=16, no pipelining
     "blog1": ("mymatmul.gpu.cuda_core.matmul_cuda_blog1.matmul_blog1", None),
     # Blog series article 3: 128-thread, 128×128 tile, cp.async + register pipelining (N=4096 only)
@@ -210,8 +216,19 @@ def _all_impls() -> dict:
 
 
 def get_impl_dtype(name: str) -> torch.dtype:
-    entry = _all_impls().get(name)
+    entry = _all_impls().get(name) or _find_prefix_entry(name)
     return entry[2] if entry and len(entry) > 2 else torch.float32
+
+
+def _find_prefix_entry(name: str):
+    """Return the _all_impls() entry for the longest prefix of name that is a known impl."""
+    all_i = _all_impls()
+    parts = name.split("_")
+    for n in range(len(parts) - 1, 0, -1):
+        entry = all_i.get("_".join(parts[:n]))
+        if entry is not None:
+            return entry
+    return None
 WARMUP_RUNS = 3
 TIMED_RUNS = 10
 
@@ -264,18 +281,47 @@ def benchmark_fn(fn, A_gpu, B_gpu):
 
 
 def load_fn(name_or_dotpath: str):
-    """Load a matmul function by impl name or explicit dotpath."""
-    import importlib
+    """Load a matmul function by impl name or dotpath.
+
+    Also accepts specific kernel config names like 'tc4_bm128_bn64_bk64_nw4':
+    strips the known impl prefix to find the module, then builds a direct
+    launch_matmul call for that kernel without autotuning.
+    """
+    import importlib, inspect
     if '.' in name_or_dotpath:
-        dotpath = name_or_dotpath  # explicit dotpath (backward compat)
-    else:
-        entry = _all_impls().get(name_or_dotpath)
-        if entry is None:
-            raise KeyError(f"Unknown impl: '{name_or_dotpath}'")
-        dotpath = entry[0]
-    module_path, fn_name = dotpath.rsplit(".", 1)
+        module_path, fn_name = name_or_dotpath.rsplit(".", 1)
+        return getattr(importlib.import_module(module_path), fn_name)
+
+    entry = _all_impls().get(name_or_dotpath)
+    if entry is not None:
+        module_path, fn_name = entry[0].rsplit(".", 1)
+        return getattr(importlib.import_module(module_path), fn_name)
+
+    # Specific kernel config: find impl prefix, load module, build direct launcher.
+    prefix_entry = _find_prefix_entry(name_or_dotpath)
+    if prefix_entry is None:
+        raise KeyError(f"Unknown impl: '{name_or_dotpath}'")
+
+    module_path = prefix_entry[0].rsplit(".", 1)[0]
     mod = importlib.import_module(module_path)
-    return getattr(mod, fn_name)
+    kname = f"matmul_cuda_{name_or_dotpath}"
+    cfg = next((c for c in mod._CONFIGS if mod._kname(*c) == kname), None)
+    if cfg is None:
+        raise KeyError(f"Kernel '{kname}' not found in {module_path}._CONFIGS")
+
+    block = mod._block(cfg[3]) if len(inspect.signature(mod._block).parameters) > 0 else mod._block()
+    smem_nparams = len(inspect.signature(mod._smem).parameters)
+    smem = mod._smem(*(cfg[:3] + cfg[4:])[:smem_nparams])
+    bm, bn = cfg[0], cfg[1]
+
+    def _direct(A, B):
+        from mymatmul.gpu._pycuda_loader import launch_matmul, get_module
+        get_module(mod._EXT)
+        return launch_matmul(mod._EXT, kname, A, B, block,
+                             mod._grid(A.shape[0], B.shape[1], bm, bn),
+                             smem_bytes=smem)
+    _direct.__name__ = kname
+    return _direct
 
 
 def validate_fn(fn, A_gpu, B_gpu, rtol=None, atol=None):
