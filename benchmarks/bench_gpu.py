@@ -221,14 +221,8 @@ def get_impl_dtype(name: str) -> torch.dtype:
 
 
 def _find_prefix_entry(name: str):
-    """Return the _all_impls() entry for the longest prefix of name that is a known impl."""
-    all_i = _all_impls()
-    parts = name.split("_")
-    for n in range(len(parts) - 1, 0, -1):
-        entry = all_i.get("_".join(parts[:n]))
-        if entry is not None:
-            return entry
-    return None
+    """Return the _all_impls() entry for the module prefix (first word before '_')."""
+    return _all_impls().get(name.split("_")[0])
 WARMUP_RUNS = 3
 TIMED_RUNS = 10
 
