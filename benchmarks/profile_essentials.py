@@ -41,23 +41,32 @@ METRICS = {
     # Bank conflicts
     "smem_ld_conflicts":    "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum",
     "smem_st_conflicts":    "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum",
+    # Warp stalls (% of warp-active cycles)
+    "stall_math_throt":     "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct",
+    "stall_long_sb":        "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct",
+    "stall_not_sel":        "smsp__warp_issue_stalled_not_selected_per_warp_active.pct",
+    "stall_membar":         "smsp__warp_issue_stalled_membar_per_warp_active.pct",
+    "stall_barrier":        "smsp__warp_issue_stalled_barrier_per_warp_active.pct",
+    "stall_short_sb":       "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct",
+    "stall_mio_throt":      "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct",
+    "stall_wait":           "smsp__warp_issue_stalled_wait_per_warp_active.pct",
+    "stall_no_inst":        "smsp__warp_issue_stalled_no_instruction_per_warp_active.pct",
+    "stall_misc":           "smsp__warp_issue_stalled_misc_per_warp_active.pct",
 }
 
 
 def find_impl(kname: str, all_i: dict):
-    """Return (impl_name, module_path, dtype_str) for a CUDA kernel name."""
+    """Return (impl_name, module_path, dtype_str) for a kernel name or CUDA kernel name."""
     import torch
-    prefix = "matmul_cuda_"
-    stem = kname[len(prefix):] if kname.startswith(prefix) else kname
-    parts = stem.split("_")
-    for n in range(len(parts), 0, -1):
-        candidate = "_".join(parts[:n])
-        if candidate in all_i:
-            dotpath, _, dtype = all_i[candidate]
-            module_path = dotpath.rsplit(".", 1)[0]
-            dtype_str = "torch.bfloat16" if dtype == torch.bfloat16 else "torch.float32"
-            return candidate, module_path, dtype_str
-    return None
+    stem = kname[len("matmul_cuda_"):] if kname.startswith("matmul_cuda_") else kname
+    prefix = stem.split("_")[0]
+    entry = all_i.get(prefix)
+    if entry is None:
+        return None
+    dotpath, _, dtype = entry
+    module_path = dotpath.rsplit(".", 1)[0]
+    dtype_str = "torch.bfloat16" if dtype == torch.bfloat16 else "torch.float32"
+    return prefix, module_path, dtype_str
 
 
 def make_target_script(module_path: str, kname: str, size: int, path: str, dtype: str) -> None:
@@ -133,14 +142,16 @@ def parse_ncu_csv(csv_text: str, kname: str) -> dict:
 
 
 def profile_one(module_path: str, kname: str, size: int, dtype: str) -> dict | None:
+    # NCU and _CONFIGS both use the full "matmul_cuda_" prefixed name.
+    full_kname = kname if kname.startswith("matmul_cuda_") else f"matmul_cuda_{kname}"
     with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as f:
         tmp = f.name
     try:
-        make_target_script(module_path, kname, size, tmp, dtype)
+        make_target_script(module_path, full_kname, size, tmp, dtype)
         csv_text = run_ncu(tmp)
         if csv_text is None:
             return None
-        raw = parse_ncu_csv(csv_text, kname)
+        raw = parse_ncu_csv(csv_text, full_kname)
         if not raw:
             print("    warning: no metrics parsed", file=sys.stderr)
             return None
@@ -200,6 +211,16 @@ def print_results(rows: list[tuple[str, dict]], max_warps_per_sm: int) -> None:
               f"  limiter={limit_str}"
               f"  LD-cf={_fv(m,'smem_ld_conflicts','.0f')}"
               f"  ST-cf={_fv(m,'smem_st_conflicts','.0f')}")
+        print(f"  Stall: math={_fv(m,'stall_math_throt')}%"
+              f"  long_sb={_fv(m,'stall_long_sb')}%"
+              f"  not_sel={_fv(m,'stall_not_sel')}%"
+              f"  membar={_fv(m,'stall_membar')}%"
+              f"  barrier={_fv(m,'stall_barrier')}%"
+              f"  short_sb={_fv(m,'stall_short_sb')}%"
+              f"  mio={_fv(m,'stall_mio_throt')}%"
+              f"  wait={_fv(m,'stall_wait')}%"
+              f"  no_inst={_fv(m,'stall_no_inst')}%"
+              f"  misc={_fv(m,'stall_misc')}%")
 
 
 def save_csv(rows: list[tuple[str, dict]], max_warps_per_sm: int, path: str) -> None:
