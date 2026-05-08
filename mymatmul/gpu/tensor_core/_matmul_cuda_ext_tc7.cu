@@ -3,17 +3,26 @@
 #include <cuda_bf16.h>
 
 /*
- * TC6: TC5 with the inner kk loop split into three separate passes.
+ * TC7: TC6 with A-tile and B-tile async copies committed separately.
  *
- * TC5 interleaves per-kk-slice: ldmatrix-A → ldmatrix-B → mma.
- * TC6 separates them into three fully-unrolled passes over kk:
- *   Pass 1: ldmatrix all A fragments  (_fa[kk][mt][4])
- *   Pass 2: ldmatrix all B fragments  (_fb[kk][nt][2])
- *   Pass 3: mma across all kk slices
+ * TC6 issues A+B together under one __pipeline_commit() and waits for
+ * both before any ldmatrix begins.
  *
- * Semantically equivalent to TC5 — the compiler sees the same instructions
- * after full unroll.  This restructuring is a stepping stone toward
- * overlapping async A-tile copy with B ldmatrix (future TC7).
+ * TC7 commits them independently:
+ *   ISSUE_A_TILE → __pipeline_commit()   (group 2k)
+ *   ISSUE_B_TILE → __pipeline_commit()   (group 2k+1)
+ *
+ * Then the compute sequence per tile is:
+ *   wait_prior(3) + sync  → A[cur] in smem, ldmatrix all A frags
+ *   wait_prior(2) + sync  → B[cur] in smem, ldmatrix all B frags
+ *   sync                  → smem[cur] released, MMA from registers
+ *
+ * wait_prior(3/2) are constant every iteration because we always issue
+ * exactly two new commits before waiting (so the oldest pending group
+ * is always 3/2 back from the most recent).
+ *
+ * Fragment arrays are lifted to function scope so LOAD_A / LOAD_B /
+ * RUN_MMA macros can all reference them without stacking do-while blocks.
  */
 
 // ── PTX helpers ──────────────────────────────────────────────────────────────
@@ -56,7 +65,7 @@ __device__ __forceinline__ void mma_m16n8k16(
 // ── Kernel implementation ─────────────────────────────────────────────────────
 
 template <int BM, int BN, int BK, int NUM_WARPS>
-__device__ __forceinline__ void matmul_tc6_impl(
+__device__ __forceinline__ void matmul_tc7_impl(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
     __nv_bfloat16* __restrict__ C,
@@ -98,7 +107,13 @@ __device__ __forceinline__ void matmul_tc6_impl(
 
     float acc[WM_TILES][WN_TILES][4] = {};
 
-#define ISSUE_TILE(k0_, buf_)                                                       \
+    // Fragment arrays at function scope: written by LOAD_A/LOAD_B, read by RUN_MMA.
+    uint32_t fa[BK / 16][WM_TILES][4];
+    uint32_t fb[BK / 16][WN_TILES][2];
+
+// ── Async issue macros (one commit each) ─────────────────────────────────────
+
+#define ISSUE_A_TILE(k0_, buf_)                                                     \
     do {                                                                            \
         _Pragma("unroll")                                                           \
         for (int _i = 0; _i < A_GROUPS; _i++) {                                    \
@@ -110,6 +125,11 @@ __device__ __forceinline__ void matmul_tc6_impl(
                                     &A[(block_row + _r) * K + (k0_) + _c],        \
                                     A_ELEM * (int)sizeof(__nv_bfloat16));           \
         }                                                                           \
+        __pipeline_commit();                                                         \
+    } while (0)
+
+#define ISSUE_B_TILE(k0_, buf_)                                                     \
+    do {                                                                            \
         _Pragma("unroll")                                                           \
         for (int _i = 0; _i < B_GROUPS; _i++) {                                    \
             const int _g  = tid + _i * THREADS;                                    \
@@ -123,13 +143,10 @@ __device__ __forceinline__ void matmul_tc6_impl(
         __pipeline_commit();                                                         \
     } while (0)
 
-// Three-pass COMPUTE_TILE: separate ldmatrix-A, ldmatrix-B, and mma loops.
-// Fragment arrays are sized for all kk slices so all loads precede all MMAs.
-#define COMPUTE_TILE(buf_)                                                          \
+// ── Three compute passes (share fa/fb from function scope) ───────────────────
+
+#define LOAD_A_FRAGS(buf_)                                                          \
     do {                                                                            \
-        uint32_t _fa[BK / 16][WM_TILES][4];                                        \
-        uint32_t _fb[BK / 16][WN_TILES][2];                                        \
-        /* Pass 1: ldmatrix A for all kk slices */                                  \
         _Pragma("unroll")                                                           \
         for (int _kk = 0; _kk < BK / 16; _kk++) {                                 \
             _Pragma("unroll")                                                       \
@@ -137,12 +154,15 @@ __device__ __forceinline__ void matmul_tc6_impl(
                 const int _ar   = warp_row * WARP_TILE_M + _mt * 16 + (lane % 16);\
                 const int _lg   = _kk * 2 + (lane / 16);                           \
                 const int _phys = _lg ^ ((_ar / A_SHIFT) % A_SWZ);                \
-                ldmatrix_x4(_fa[_kk][_mt][0], _fa[_kk][_mt][1],                   \
-                            _fa[_kk][_mt][2], _fa[_kk][_mt][3],                   \
+                ldmatrix_x4(fa[_kk][_mt][0], fa[_kk][_mt][1],                     \
+                            fa[_kk][_mt][2], fa[_kk][_mt][3],                     \
                     __cvta_generic_to_shared(&A_shared[(buf_)][_ar][_phys * 8]));  \
             }                                                                       \
         }                                                                           \
-        /* Pass 2: ldmatrix B for all kk slices */                                  \
+    } while (0)
+
+#define LOAD_B_FRAGS(buf_)                                                          \
+    do {                                                                            \
         _Pragma("unroll")                                                           \
         for (int _kk = 0; _kk < BK / 16; _kk++) {                                 \
             _Pragma("unroll")                                                       \
@@ -150,11 +170,14 @@ __device__ __forceinline__ void matmul_tc6_impl(
                 const int _br = _kk * 16 + (lane % 16);                            \
                 const int _nc = warp_col * WARP_TILE_N + _nt * 8;                  \
                 const int _sc = ((_nc / 8) ^ (_br % B_SWZ)) * 8;                  \
-                ldmatrix_x2_trans(_fb[_kk][_nt][0], _fb[_kk][_nt][1],             \
+                ldmatrix_x2_trans(fb[_kk][_nt][0], fb[_kk][_nt][1],               \
                     __cvta_generic_to_shared(&B_shared[(buf_)][_br][_sc]));         \
             }                                                                       \
         }                                                                           \
-        /* Pass 3: MMA across all kk slices */                                      \
+    } while (0)
+
+#define RUN_MMA()                                                                   \
+    do {                                                                            \
         _Pragma("unroll")                                                           \
         for (int _kk = 0; _kk < BK / 16; _kk++) {                                 \
             _Pragma("unroll")                                                       \
@@ -163,34 +186,59 @@ __device__ __forceinline__ void matmul_tc6_impl(
                 for (int _nt = 0; _nt < WN_TILES; _nt++) {                         \
                     mma_m16n8k16(acc[_mt][_nt][0], acc[_mt][_nt][1],               \
                                  acc[_mt][_nt][2], acc[_mt][_nt][3],               \
-                                 _fa[_kk][_mt][0], _fa[_kk][_mt][1],              \
-                                 _fa[_kk][_mt][2], _fa[_kk][_mt][3],              \
-                                 _fb[_kk][_nt][0], _fb[_kk][_nt][1]);             \
+                                 fa[_kk][_mt][0], fa[_kk][_mt][1],                \
+                                 fa[_kk][_mt][2], fa[_kk][_mt][3],                \
+                                 fb[_kk][_nt][0], fb[_kk][_nt][1]);               \
                 }                                                                   \
             }                                                                       \
         }                                                                           \
     } while (0)
 
+// ── Main pipeline loop ────────────────────────────────────────────────────────
+
     const int num_tiles = K / BK;
 
-    ISSUE_TILE(0, 0);
+    ISSUE_A_TILE(0, 0);          // group 0: A[0]
+    ISSUE_B_TILE(0, 0);          // group 1: B[0]
 
     for (int k_iter = 0; k_iter < num_tiles - 1; k_iter++) {
         const int cur = k_iter & 1;
         const int nxt = 1 - cur;
-        ISSUE_TILE((k_iter + 1) * BK, nxt);
-        __pipeline_wait_prior(1);
+
+        ISSUE_A_TILE((k_iter + 1) * BK, nxt);   // group 2*(k+1)  : A[k+1]
+        ISSUE_B_TILE((k_iter + 1) * BK, nxt);   // group 2*(k+1)+1: B[k+1]
+
+        // A[cur] is 3 back from the most-recent commit → wait_prior(3)
+        __pipeline_wait_prior(3);
         __syncthreads();
-        COMPUTE_TILE(cur);
+        LOAD_A_FRAGS(cur);
+
+        // B[cur] is 2 back from the most-recent commit → wait_prior(2)
+        __pipeline_wait_prior(2);
         __syncthreads();
+        LOAD_B_FRAGS(cur);
+
+        __syncthreads();    // smem[cur] released; next iter may overwrite it
+        RUN_MMA();
     }
+
+    // Final tile: only A[last] and B[last] remain pending (1 and 0 back)
+    __pipeline_wait_prior(1);
+    __syncthreads();
+    LOAD_A_FRAGS((num_tiles - 1) & 1);
 
     __pipeline_wait_prior(0);
     __syncthreads();
-    COMPUTE_TILE((num_tiles - 1) & 1);
+    LOAD_B_FRAGS((num_tiles - 1) & 1);
+    RUN_MMA();
 
-#undef ISSUE_TILE
-#undef COMPUTE_TILE
+#undef ISSUE_A_TILE
+#undef ISSUE_B_TILE
+#undef LOAD_A_FRAGS
+#undef LOAD_B_FRAGS
+#undef RUN_MMA
+
+// ── Vectorized write-back ─────────────────────────────────────────────────────
 
     const int base_row = lane / 4;
     const int base_col = (lane % 4) * 2;
@@ -214,10 +262,10 @@ __device__ __forceinline__ void matmul_tc6_impl(
 
 #define MAKE_LAUNCHER(BM_, BN_, BK_, NW_)                                           \
 extern "C" __global__ __launch_bounds__(NW_ * 32)                                   \
-void matmul_cuda_tc6_bm##BM_##_bn##BN_##_bk##BK_##_nw##NW_(                        \
+void matmul_cuda_tc7_bm##BM_##_bn##BN_##_bk##BK_##_nw##NW_(                        \
     const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,       \
     __nv_bfloat16* __restrict__ C, int M, int K, int N) {                           \
-    matmul_tc6_impl<BM_, BN_, BK_, NW_>(A, B, C, M, K, N);                         \
+    matmul_tc7_impl<BM_, BN_, BK_, NW_>(A, B, C, M, K, N);                         \
 }
 
 // ── NW=4 ─────────────────────────────────────────────────────────────────────

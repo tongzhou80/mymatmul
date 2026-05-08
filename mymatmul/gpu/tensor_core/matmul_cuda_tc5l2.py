@@ -1,13 +1,14 @@
-"""TC6: TC5 with inner kk loop split into three separate passes.
+"""TC5l2: TC5 with cp.async.cg.L2::128B prefetch hint on tile loads.
 
-Restructures COMPUTE_TILE from one interleaved loop (ldmatrix-A, ldmatrix-B,
-mma per kk slice) into three fully-unrolled passes:
-  Pass 1: ldmatrix A for all kk slices → _fa[kk][mt][4]
-  Pass 2: ldmatrix B for all kk slices → _fb[kk][nt][2]
-  Pass 3: MMA across all kk slices
+Uses cp.async.cg + L2::128B eviction hint instead of __pipeline_memcpy_async.
+The hint tells the L2 to prefetch/retain the full 128-byte cache line, so
+adjacent CTAs that touch the same line find it warm in L2.
 
-Semantically equivalent to TC5 after unroll.  Stepping stone toward TC7
-which will interleave async B-tile copy with Pass 1 (ldmatrix A).
+L2::128B requires 16-byte (8-element bf16) copies; configs where A_ELEM or
+B_ELEM is 4 (8 bytes) fall back to cp.async.ca without the hint.
+
+Everything else (smem layout, XOR swizzle, COMPUTE_TILE, vectorized
+bfloat162 write-back) is identical to TC5.
 """
 
 import time
@@ -16,7 +17,7 @@ from .._pycuda_loader import launch_matmul, get_module
 
 DTYPE = torch.bfloat16
 
-_EXT = "_matmul_cuda_ext_tc6"
+_EXT = "_matmul_cuda_ext_tc5l2"
 
 _BMS = [64, 128, 256]
 _BNS = [64, 128, 256]
@@ -39,7 +40,7 @@ _CONFIGS = [
 
 
 def _kname(bm, bn, bk, nw):
-    return f"matmul_cuda_tc6_bm{bm}_bn{bn}_bk{bk}_nw{nw}"
+    return f"matmul_cuda_tc5l2_bm{bm}_bn{bn}_bk{bk}_nw{nw}"
 
 
 def _block(nw):
@@ -60,7 +61,7 @@ def _tune(M, N, K):
     get_module(_EXT)
 
     cfgs = [c for c in _CONFIGS if M % c[0] == 0 and N % c[1] == 0 and K % c[2] == 0]
-    best_t = float("inf")
+    best_t  = float("inf")
     best_cfg = cfgs[0]
     n = len(cfgs)
 
@@ -72,13 +73,11 @@ def _tune(M, N, K):
         sb    = _smem(bm, bn, bk)
         try:
             for _ in range(2):
-                launch_matmul(_EXT, kn, A, B, block, grid,
-                              out_dtype=torch.float32, smem_bytes=sb)
+                launch_matmul(_EXT, kn, A, B, block, grid, smem_bytes=sb)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             for _ in range(3):
-                launch_matmul(_EXT, kn, A, B, block, grid,
-                              out_dtype=torch.float32, smem_bytes=sb)
+                launch_matmul(_EXT, kn, A, B, block, grid, smem_bytes=sb)
             torch.cuda.synchronize()
             t = (time.perf_counter() - t0) / 3
         except Exception as e:
@@ -95,16 +94,16 @@ def _tune(M, N, K):
     return best_cfg
 
 
-def matmul_tc6(A, B):
+def matmul_tc5l2(A, B):
     M, K = A.shape
     _, N = B.shape
     key  = (M, N, K)
     if key not in _best:
         cfgs = [c for c in _CONFIGS if M % c[0] == 0 and N % c[1] == 0 and K % c[2] == 0]
-        print(f"[tc6] autotuning {M}x{K}x{N} over {len(cfgs)} configs ...")
+        print(f"[tc5l2] autotuning {M}x{K}x{N} over {len(cfgs)} configs ...")
         _best[key] = _tune(M, N, K)
         bm, bn, bk, nw = _best[key]
-        print(f"[tc6] best: BM={bm} BN={bn} BK={bk} NW={nw}")
+        print(f"[tc5l2] best: BM={bm} BN={bn} BK={bk} NW={nw}")
 
     bm, bn, bk, nw = _best[key]
     return launch_matmul(

@@ -3,17 +3,18 @@
 #include <cuda_bf16.h>
 
 /*
- * TC6: TC5 with the inner kk loop split into three separate passes.
+ * TC5rp: TC5 + register prefetch on the inner kk loop.
  *
- * TC5 interleaves per-kk-slice: ldmatrix-A → ldmatrix-B → mma.
- * TC6 separates them into three fully-unrolled passes over kk:
- *   Pass 1: ldmatrix all A fragments  (_fa[kk][mt][4])
- *   Pass 2: ldmatrix all B fragments  (_fb[kk][nt][2])
- *   Pass 3: mma across all kk slices
+ * TC5 = TC2b + vectorized __nv_bfloat162 write-back.
+ * TC5rp adds double-buffered fragment registers so that while mma.sync
+ * executes for kk, the ldmatrix loads for kk+1 are issued ahead:
  *
- * Semantically equivalent to TC5 — the compiler sees the same instructions
- * after full unroll.  This restructuring is a stepping stone toward
- * overlapping async A-tile copy with B ldmatrix (future TC7).
+ *   fa[2][WM_TILES][4]  (double-buffered A fragments, ping-pong per kk)
+ *   fb[2][WN_TILES][2]  (double-buffered B fragments, ping-pong per kk)
+ *
+ * For BK=16 (NUM_KK=1) there is nothing to pipeline — degenerates to TC5.
+ * For BK=32 (NUM_KK=2): 1 ldmatrix cluster overlaps 1 mma cluster.
+ * For BK=64 (NUM_KK=4): 3 ldmatrix clusters overlap 3 mma clusters.
  */
 
 // ── PTX helpers ──────────────────────────────────────────────────────────────
@@ -56,7 +57,7 @@ __device__ __forceinline__ void mma_m16n8k16(
 // ── Kernel implementation ─────────────────────────────────────────────────────
 
 template <int BM, int BN, int BK, int NUM_WARPS>
-__device__ __forceinline__ void matmul_tc6_impl(
+__device__ __forceinline__ void matmul_tc5rp_impl(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
     __nv_bfloat16* __restrict__ C,
@@ -80,8 +81,9 @@ __device__ __forceinline__ void matmul_tc6_impl(
 
     constexpr int A_SWZ   = BK / 8;
     constexpr int A_SHIFT = 64 / BK;
+    constexpr int B_SWZ   = BN / 8;
 
-    constexpr int B_SWZ = BN / 8;
+    constexpr int NUM_KK = BK / 16;
 
     extern __shared__ __nv_bfloat16 smem[];
     auto A_shared = reinterpret_cast<__nv_bfloat16 (*)[BM][BK]>(smem);
@@ -123,52 +125,63 @@ __device__ __forceinline__ void matmul_tc6_impl(
         __pipeline_commit();                                                         \
     } while (0)
 
-// Three-pass COMPUTE_TILE: separate ldmatrix-A, ldmatrix-B, and mma loops.
-// Fragment arrays are sized for all kk slices so all loads precede all MMAs.
+// Load one kk-slice of A fragments into register slot slot_.
+// fa must be declared in the enclosing scope as fa[2][WM_TILES][4].
+#define LOAD_A(slot_, kk_, buf__)                                                   \
+    _Pragma("unroll")                                                               \
+    for (int _mt = 0; _mt < WM_TILES; _mt++) {                                     \
+        const int _ar   = warp_row * WARP_TILE_M + _mt * 16 + (lane % 16);        \
+        const int _lg   = (kk_) * 2 + (lane / 16);                                 \
+        const int _phys = _lg ^ ((_ar / A_SHIFT) % A_SWZ);                        \
+        ldmatrix_x4(fa[(slot_)][_mt][0], fa[(slot_)][_mt][1],                      \
+                    fa[(slot_)][_mt][2], fa[(slot_)][_mt][3],                      \
+            __cvta_generic_to_shared(&A_shared[(buf__)][_ar][_phys * 8]));         \
+    }
+
+// Load one kk-slice of B fragments into register slot slot_.
+// fb must be declared in the enclosing scope as fb[2][WN_TILES][2].
+#define LOAD_B(slot_, kk_, buf__)                                                   \
+    _Pragma("unroll")                                                               \
+    for (int _nt = 0; _nt < WN_TILES; _nt++) {                                     \
+        const int _br = (kk_) * 16 + (lane % 16);                                  \
+        const int _nc = warp_col * WARP_TILE_N + _nt * 8;                          \
+        const int _sc = ((_nc / 8) ^ (_br % B_SWZ)) * 8;                          \
+        ldmatrix_x2_trans(fb[(slot_)][_nt][0], fb[(slot_)][_nt][1],                \
+            __cvta_generic_to_shared(&B_shared[(buf__)][_br][_sc]));               \
+    }
+
+#define COMPUTE(slot_)                                                              \
+    _Pragma("unroll")                                                               \
+    for (int _mt = 0; _mt < WM_TILES; _mt++) {                                     \
+        _Pragma("unroll")                                                           \
+        for (int _nt = 0; _nt < WN_TILES; _nt++) {                                 \
+            mma_m16n8k16(acc[_mt][_nt][0], acc[_mt][_nt][1],                       \
+                         acc[_mt][_nt][2], acc[_mt][_nt][3],                       \
+                         fa[(slot_)][_mt][0], fa[(slot_)][_mt][1],                 \
+                         fa[(slot_)][_mt][2], fa[(slot_)][_mt][3],                 \
+                         fb[(slot_)][_nt][0], fb[(slot_)][_nt][1]);                \
+        }                                                                           \
+    }
+
+// Double-buffered kk loop: load kk+1 while computing kk.
 #define COMPUTE_TILE(buf_)                                                          \
     do {                                                                            \
-        uint32_t _fa[BK / 16][WM_TILES][4];                                        \
-        uint32_t _fb[BK / 16][WN_TILES][2];                                        \
-        /* Pass 1: ldmatrix A for all kk slices */                                  \
+        uint32_t fa[2][WM_TILES][4];                                                \
+        uint32_t fb[2][WN_TILES][2];                                                \
+        /* Prologue: prefetch kk=0 into slot 0 */                                   \
+        LOAD_A(0, 0, buf_)                                                          \
+        LOAD_B(0, 0, buf_)                                                          \
+        /* Main: load kk+1 into nxt while computing kk from cur */                  \
         _Pragma("unroll")                                                           \
-        for (int _kk = 0; _kk < BK / 16; _kk++) {                                 \
-            _Pragma("unroll")                                                       \
-            for (int _mt = 0; _mt < WM_TILES; _mt++) {                             \
-                const int _ar   = warp_row * WARP_TILE_M + _mt * 16 + (lane % 16);\
-                const int _lg   = _kk * 2 + (lane / 16);                           \
-                const int _phys = _lg ^ ((_ar / A_SHIFT) % A_SWZ);                \
-                ldmatrix_x4(_fa[_kk][_mt][0], _fa[_kk][_mt][1],                   \
-                            _fa[_kk][_mt][2], _fa[_kk][_mt][3],                   \
-                    __cvta_generic_to_shared(&A_shared[(buf_)][_ar][_phys * 8]));  \
-            }                                                                       \
+        for (int _kk = 0; _kk < NUM_KK - 1; _kk++) {                              \
+            const int _cur = _kk & 1;                                               \
+            const int _nxt = 1 - _cur;                                              \
+            LOAD_A(_nxt, _kk + 1, buf_)                                             \
+            LOAD_B(_nxt, _kk + 1, buf_)                                             \
+            COMPUTE(_cur)                                                            \
         }                                                                           \
-        /* Pass 2: ldmatrix B for all kk slices */                                  \
-        _Pragma("unroll")                                                           \
-        for (int _kk = 0; _kk < BK / 16; _kk++) {                                 \
-            _Pragma("unroll")                                                       \
-            for (int _nt = 0; _nt < WN_TILES; _nt++) {                            \
-                const int _br = _kk * 16 + (lane % 16);                            \
-                const int _nc = warp_col * WARP_TILE_N + _nt * 8;                  \
-                const int _sc = ((_nc / 8) ^ (_br % B_SWZ)) * 8;                  \
-                ldmatrix_x2_trans(_fb[_kk][_nt][0], _fb[_kk][_nt][1],             \
-                    __cvta_generic_to_shared(&B_shared[(buf_)][_br][_sc]));         \
-            }                                                                       \
-        }                                                                           \
-        /* Pass 3: MMA across all kk slices */                                      \
-        _Pragma("unroll")                                                           \
-        for (int _kk = 0; _kk < BK / 16; _kk++) {                                 \
-            _Pragma("unroll")                                                       \
-            for (int _mt = 0; _mt < WM_TILES; _mt++) {                             \
-                _Pragma("unroll")                                                   \
-                for (int _nt = 0; _nt < WN_TILES; _nt++) {                         \
-                    mma_m16n8k16(acc[_mt][_nt][0], acc[_mt][_nt][1],               \
-                                 acc[_mt][_nt][2], acc[_mt][_nt][3],               \
-                                 _fa[_kk][_mt][0], _fa[_kk][_mt][1],              \
-                                 _fa[_kk][_mt][2], _fa[_kk][_mt][3],              \
-                                 _fb[_kk][_nt][0], _fb[_kk][_nt][1]);             \
-                }                                                                   \
-            }                                                                       \
-        }                                                                           \
+        /* Epilogue: compute last kk (no more loads) */                             \
+        COMPUTE((NUM_KK - 1) & 1)                                                   \
     } while (0)
 
     const int num_tiles = K / BK;
@@ -190,8 +203,13 @@ __device__ __forceinline__ void matmul_tc6_impl(
     COMPUTE_TILE((num_tiles - 1) & 1);
 
 #undef ISSUE_TILE
+#undef LOAD_A
+#undef LOAD_B
+#undef COMPUTE
 #undef COMPUTE_TILE
 
+    // Vectorized write-back from TC5: pack two consecutive acc values into
+    // one __nv_bfloat162 store (32-bit) instead of two scalar 16-bit stores.
     const int base_row = lane / 4;
     const int base_col = (lane % 4) * 2;
 
@@ -214,10 +232,10 @@ __device__ __forceinline__ void matmul_tc6_impl(
 
 #define MAKE_LAUNCHER(BM_, BN_, BK_, NW_)                                           \
 extern "C" __global__ __launch_bounds__(NW_ * 32)                                   \
-void matmul_cuda_tc6_bm##BM_##_bn##BN_##_bk##BK_##_nw##NW_(                        \
+void matmul_cuda_tc5rp_bm##BM_##_bn##BN_##_bk##BK_##_nw##NW_(                      \
     const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,       \
     __nv_bfloat16* __restrict__ C, int M, int K, int N) {                           \
-    matmul_tc6_impl<BM_, BN_, BK_, NW_>(A, B, C, M, K, N);                         \
+    matmul_tc5rp_impl<BM_, BN_, BK_, NW_>(A, B, C, M, K, N);                       \
 }
 
 // ── NW=4 ─────────────────────────────────────────────────────────────────────

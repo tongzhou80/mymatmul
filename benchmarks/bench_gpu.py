@@ -146,6 +146,20 @@ IMPLEMENTATIONS = {
     "tc3": ("mymatmul.gpu.tensor_core.matmul_cuda_tc3.matmul_tc3", None, torch.bfloat16),
     # TC4: TC2b with ldmatrix.x4.trans for B (pairs two N-tiles, halves B ldmatrix count)
     "tc4": ("mymatmul.gpu.tensor_core.matmul_cuda_tc4.matmul_tc4", None, torch.bfloat16),
+    # TC5: TC2b with vectorized __nv_bfloat162 write-back (halves epilogue store count)
+    "tc5": ("mymatmul.gpu.tensor_core.matmul_cuda_tc5.matmul_tc5", None, torch.bfloat16),
+    # TC5rp: TC5 + register prefetch (double-buffered inner kk loop)
+    "tc5rp": ("mymatmul.gpu.tensor_core.matmul_cuda_tc5rp.matmul_tc5rp", None, torch.bfloat16),
+    # TC5jit: TC5 with M/K/N baked in as JIT compile-time constants
+    "tc5jit": ("mymatmul.gpu.tensor_core.matmul_cuda_tc5jit.matmul_tc5jit", None, torch.bfloat16),
+    # TC5swz: TC5 + GROUP_M CTA swizzle (SW=1..8) for L2 B-tile reuse
+    "tc5swz": ("mymatmul.gpu.tensor_core.matmul_cuda_tc5swz.matmul_tc5swz", None, torch.bfloat16),
+    # TC5l2: TC5 with cp.async.cg.L2::128B prefetch hint on tile loads
+    "tc5l2": ("mymatmul.gpu.tensor_core.matmul_cuda_tc5l2.matmul_tc5l2", None, torch.bfloat16),
+    # TC6: TC5 with kk loop split into 3 passes (ldmatrix-A, ldmatrix-B, MMA)
+    "tc6": ("mymatmul.gpu.tensor_core.matmul_cuda_tc6.matmul_tc6", None, torch.bfloat16),
+    # TC7: TC6 with A-tile and B-tile async copies committed separately
+    "tc7": ("mymatmul.gpu.tensor_core.matmul_cuda_tc7.matmul_tc7", None, torch.bfloat16),
     # Blog series article 1: 128-thread, 64×256 tile, BK=16, no pipelining
     "blog1": ("mymatmul.gpu.cuda_core.matmul_cuda_blog1.matmul_blog1", None),
     # Blog series article 3: 128-thread, 128×128 tile, cp.async + register pipelining (N=4096 only)

@@ -1,13 +1,14 @@
-"""TC6: TC5 with inner kk loop split into three separate passes.
+"""TC5rp: TC5 + register prefetch on the inner kk loop.
 
-Restructures COMPUTE_TILE from one interleaved loop (ldmatrix-A, ldmatrix-B,
-mma per kk slice) into three fully-unrolled passes:
-  Pass 1: ldmatrix A for all kk slices → _fa[kk][mt][4]
-  Pass 2: ldmatrix B for all kk slices → _fb[kk][nt][2]
-  Pass 3: MMA across all kk slices
+COMPUTE_TILE double-buffers A and B fragment registers (fa[2], fb[2]) so
+that ldmatrix for kk+1 is issued while mma.sync executes for kk, hiding
+smem-to-register latency behind tensor-core compute.
 
-Semantically equivalent to TC5 after unroll.  Stepping stone toward TC7
-which will interleave async B-tile copy with Pass 1 (ldmatrix A).
+For BK=16 (1 kk step) this degenerates to TC5 — nothing to pipeline.
+For BK=32 (2 steps): 1 ldmatrix cluster overlaps 1 MMA cluster.
+For BK=64 (4 steps): 3 ldmatrix clusters overlap 3 MMA clusters.
+
+Write-back is TC5's vectorized __nv_bfloat162 stores.
 """
 
 import time
@@ -16,7 +17,7 @@ from .._pycuda_loader import launch_matmul, get_module
 
 DTYPE = torch.bfloat16
 
-_EXT = "_matmul_cuda_ext_tc6"
+_EXT = "_matmul_cuda_ext_tc5rp"
 
 _BMS = [64, 128, 256]
 _BNS = [64, 128, 256]
@@ -39,7 +40,7 @@ _CONFIGS = [
 
 
 def _kname(bm, bn, bk, nw):
-    return f"matmul_cuda_tc6_bm{bm}_bn{bn}_bk{bk}_nw{nw}"
+    return f"matmul_cuda_tc5rp_bm{bm}_bn{bn}_bk{bk}_nw{nw}"
 
 
 def _block(nw):
@@ -95,16 +96,16 @@ def _tune(M, N, K):
     return best_cfg
 
 
-def matmul_tc6(A, B):
+def matmul_tc5rp(A, B):
     M, K = A.shape
     _, N = B.shape
     key  = (M, N, K)
     if key not in _best:
         cfgs = [c for c in _CONFIGS if M % c[0] == 0 and N % c[1] == 0 and K % c[2] == 0]
-        print(f"[tc6] autotuning {M}x{K}x{N} over {len(cfgs)} configs ...")
+        print(f"[tc5rp] autotuning {M}x{K}x{N} over {len(cfgs)} configs ...")
         _best[key] = _tune(M, N, K)
         bm, bn, bk, nw = _best[key]
-        print(f"[tc6] best: BM={bm} BN={bn} BK={bk} NW={nw}")
+        print(f"[tc5rp] best: BM={bm} BN={bn} BK={bk} NW={nw}")
 
     bm, bn, bk, nw = _best[key]
     return launch_matmul(
