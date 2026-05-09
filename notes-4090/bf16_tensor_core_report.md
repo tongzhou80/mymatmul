@@ -327,8 +327,7 @@ TC5→TC5_regpruned: two-arg `__launch_bounds__` forces tighter register budget.
 | 9216  | BM=128, BN=128, BK=32, NW=4, LB=1 |
 | 10240 | BM=128, BN=128, BK=32, NW=4, LB=1 |
 
-LB=1 (tightest register budget) dominates from 3072 onwards where occupancy is
-sufficient to hide latency. LB=2 wins at 2048 and LB=3 at 1024, where the
+LB=1 dominates from 3072 onwards. LB=2 wins at 2048 and LB=3 at 1024, where the
 smaller grids benefit from higher occupancy at the cost of fewer registers per
 thread. BK=64 is preferred at 1024–2048 (higher arithmetic intensity per CTA
 compensates for fewer CTAs); BK=32 with larger tiles takes over from 3072+.

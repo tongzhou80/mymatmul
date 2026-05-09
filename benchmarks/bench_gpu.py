@@ -116,7 +116,8 @@ IMPLEMENTATIONS = {
     "s5_w4r2_bm128_bn128_bk16_u8": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4r2.matmul_s5_w4r2_bm128_bn128_bk16_u8", None),
     "s5_w4r2_bm128_bn128_bk16_u16": ("mymatmul.gpu.cuda_core.matmul_cuda_s5_w4r2.matmul_s5_w4r2_bm128_bn128_bk16_u16", None),
     # Stage 6: unified NUM_WARPS template (4 or 8); extends search to BM/BN=32
-    "s6_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s6.matmul_s6", None),
+    "s6_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s6.matmul_s6",       None),
+    "s6_lb":        ("mymatmul.gpu.cuda_core.matmul_cuda_s6_lb.matmul_s6_lb", None),
     # Stage 7: s6 with M/N/K baked as compile-time constants (JIT per shape)
     "s7_autotuned": ("mymatmul.gpu.cuda_core.matmul_cuda_s7.matmul_s7", None),
     # Stage 7 swz: s7 + CTA swizzle-by-2 (1D grid, A-tile L2 reuse)
