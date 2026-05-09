@@ -1,24 +1,28 @@
-#ifndef LB_MIN_BLOCKS
-#define LB_MIN_BLOCKS 2
-#endif
-
 #include <cuda_runtime.h>
 #include <cuda_pipeline_primitives.h>
 #include <cuda_bf16.h>
 
 /*
- * TC6: TC5 with the inner kk loop split into three separate passes.
+ * TC6_lb: TC5_lb with ldmatrix_x4_trans for the B tile.
  *
- * TC5 interleaves per-kk-slice: ldmatrix-A → ldmatrix-B → mma.
- * TC6 separates them into three fully-unrolled passes over kk:
- *   Pass 1: ldmatrix all A fragments  (_fa[kk][mt][4])
- *   Pass 2: ldmatrix all B fragments  (_fb[kk][nt][2])
- *   Pass 3: mma across all kk slices
+ * TC5 issues one ldmatrix_x2_trans per (kk, nt) — WN_TILES calls per k-step.
+ * TC6 issues one ldmatrix_x4_trans per (kk, nt_pair) — WN_TILES/2 calls,
+ * halving the number of ldmatrix instructions for B.
  *
- * Semantically equivalent to TC5 — the compiler sees the same instructions
- * after full unroll.  This restructuring is a stepping stone toward
- * overlapping async A-tile copy with B ldmatrix (future TC7).
+ * For x4_trans, the 32 warp lanes split into two groups:
+ *   lanes  0-15 → provide address for n-tile nt   (nc0 = warp_col*WARP_TILE_N + nt*8)
+ *   lanes 16-31 → provide address for n-tile nt+1 (nc1 = nc0 + 8)
+ * Each group uses lane%16 to select the k-row (same as tc5's x2_trans scheme).
+ *
+ * WN_TILES = BN/16 ∈ {4,8,16} for all instantiated configs — always even.
+ *
+ * Kernel names are tc6 variants of tc5's naming convention.
+ * Compiled with -DLB_MIN_BLOCKS=N (N = 1..4) for register-budget control.
  */
+
+#ifndef LB_MIN_BLOCKS
+#define LB_MIN_BLOCKS 2
+#endif
 
 // ── PTX helpers ──────────────────────────────────────────────────────────────
 
@@ -33,13 +37,13 @@ __device__ __forceinline__ void ldmatrix_x4(
     );
 }
 
-__device__ __forceinline__ void ldmatrix_x2_trans(
-    uint32_t& r0, uint32_t& r1,
+__device__ __forceinline__ void ldmatrix_x4_trans(
+    uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3,
     uint32_t smem_ptr
 ) {
     asm volatile(
-        "ldmatrix.sync.aligned.x2.m8n8.trans.shared.b16 {%0,%1}, [%2];\n"
-        : "=r"(r0), "=r"(r1)
+        "ldmatrix.sync.aligned.x4.m8n8.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
         : "r"(smem_ptr)
     );
 }
@@ -127,49 +131,42 @@ __device__ __forceinline__ void matmul_tc6_impl(
         __pipeline_commit();                                                         \
     } while (0)
 
-// Three-pass COMPUTE_TILE: separate ldmatrix-A, ldmatrix-B, and mma loops.
-// Fragment arrays are sized for all kk slices so all loads precede all MMAs.
+// B is loaded with ldmatrix_x4_trans: one instruction covers two consecutive
+// n-tiles at a time.  Lanes 0-15 address nc0, lanes 16-31 address nc0+8;
+// within each group, lane%16 selects the k-row (identical to tc5's x2 scheme).
 #define COMPUTE_TILE(buf_)                                                          \
     do {                                                                            \
-        uint32_t _fa[BK / 16][WM_TILES][4];                                        \
-        uint32_t _fb[BK / 16][WN_TILES][2];                                        \
-        /* Pass 1: ldmatrix A for all kk slices */                                  \
         _Pragma("unroll")                                                           \
         for (int _kk = 0; _kk < BK / 16; _kk++) {                                 \
+            uint32_t _fa[WM_TILES][4];                                              \
             _Pragma("unroll")                                                       \
             for (int _mt = 0; _mt < WM_TILES; _mt++) {                             \
-                const int _ar   = warp_row * WARP_TILE_M + _mt * 16 + (lane % 16);\
-                const int _lg   = _kk * 2 + (lane / 16);                           \
+                const int _ar  = warp_row * WARP_TILE_M + _mt * 16 + (lane % 16); \
+                const int _lg  = _kk * 2 + (lane / 16);                            \
                 const int _phys = _lg ^ ((_ar / A_SHIFT) % A_SWZ);                \
-                ldmatrix_x4(_fa[_kk][_mt][0], _fa[_kk][_mt][1],                   \
-                            _fa[_kk][_mt][2], _fa[_kk][_mt][3],                   \
+                ldmatrix_x4(_fa[_mt][0], _fa[_mt][1], _fa[_mt][2], _fa[_mt][3],   \
                     __cvta_generic_to_shared(&A_shared[(buf_)][_ar][_phys * 8]));  \
             }                                                                       \
-        }                                                                           \
-        /* Pass 2: ldmatrix B for all kk slices */                                  \
-        _Pragma("unroll")                                                           \
-        for (int _kk = 0; _kk < BK / 16; _kk++) {                                 \
+            uint32_t _fb[WN_TILES][2];                                              \
             _Pragma("unroll")                                                       \
-            for (int _nt = 0; _nt < WN_TILES; _nt++) {                            \
-                const int _br = _kk * 16 + (lane % 16);                            \
-                const int _nc = warp_col * WARP_TILE_N + _nt * 8;                  \
-                const int _sc = ((_nc / 8) ^ (_br % B_SWZ)) * 8;                  \
-                ldmatrix_x2_trans(_fb[_kk][_nt][0], _fb[_kk][_nt][1],             \
-                    __cvta_generic_to_shared(&B_shared[(buf_)][_br][_sc]));         \
+            for (int _nt = 0; _nt < WN_TILES; _nt += 2) {                         \
+                const int _nc0    = warp_col * WARP_TILE_N + _nt * 8;             \
+                const int _nc_sel = (lane < 16) ? _nc0 : (_nc0 + 8);              \
+                const int _br     = _kk * 16 + (lane % 16);                       \
+                const int _sc     = ((_nc_sel / 8) ^ (_br % B_SWZ)) * 8;          \
+                ldmatrix_x4_trans(_fb[_nt][0], _fb[_nt][1],                        \
+                                  _fb[_nt+1][0], _fb[_nt+1][1],                   \
+                    __cvta_generic_to_shared(&B_shared[(buf_)][_br][_sc]));        \
             }                                                                       \
-        }                                                                           \
-        /* Pass 3: MMA across all kk slices */                                      \
-        _Pragma("unroll")                                                           \
-        for (int _kk = 0; _kk < BK / 16; _kk++) {                                 \
             _Pragma("unroll")                                                       \
             for (int _mt = 0; _mt < WM_TILES; _mt++) {                             \
                 _Pragma("unroll")                                                   \
                 for (int _nt = 0; _nt < WN_TILES; _nt++) {                         \
                     mma_m16n8k16(acc[_mt][_nt][0], acc[_mt][_nt][1],               \
                                  acc[_mt][_nt][2], acc[_mt][_nt][3],               \
-                                 _fa[_kk][_mt][0], _fa[_kk][_mt][1],              \
-                                 _fa[_kk][_mt][2], _fa[_kk][_mt][3],              \
-                                 _fb[_kk][_nt][0], _fb[_kk][_nt][1]);             \
+                                 _fa[_mt][0], _fa[_mt][1],                         \
+                                 _fa[_mt][2], _fa[_mt][3],                         \
+                                 _fb[_nt][0], _fb[_nt][1]);                        \
                 }                                                                   \
             }                                                                       \
         }                                                                           \
@@ -217,7 +214,7 @@ __device__ __forceinline__ void matmul_tc6_impl(
 }
 
 #define MAKE_LAUNCHER(BM_, BN_, BK_, NW_)                                           \
-extern "C" __global__ __launch_bounds__(NW_ * 32, LB_MIN_BLOCKS)                                   \
+extern "C" __global__ __launch_bounds__(NW_ * 32, LB_MIN_BLOCKS)                   \
 void matmul_cuda_tc6_bm##BM_##_bn##BN_##_bk##BK_##_nw##NW_(                        \
     const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,       \
     __nv_bfloat16* __restrict__ C, int M, int K, int N) {                           \

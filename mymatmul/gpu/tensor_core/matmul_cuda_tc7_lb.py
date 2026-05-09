@@ -1,9 +1,9 @@
-"""TC6_lb: TC6 (split-passes) with tunable __launch_bounds__ min-blocks-per-SM.
+"""TC7_lb: TC7 (split A/B pipeline commits) with tunable __launch_bounds__.
 
-TC6 separates the inner kk loop into three passes (ldmatrix-A, ldmatrix-B, MMA)
-versus TC5's interleaved approach. This variant adds LB_MIN_BLOCKS tuning on top,
-compiled to four cubins (LB=1..4) with register-estimate pruning to skip configs
-where acc+frag registers exceed the LB budget.
+TC7 commits A-tile and B-tile async copies independently, enabling fine-grained
+overlap: ldmatrix-A can begin as soon as A arrives without waiting for B.
+This variant adds LB_MIN_BLOCKS tuning compiled to four cubins (LB=1..4)
+with register-estimate pruning.
 """
 
 import os
@@ -17,7 +17,7 @@ from .._pycuda_loader import get_module_jit
 DTYPE = torch.bfloat16
 
 _GPU_DIR   = os.path.dirname(os.path.abspath(__file__))
-_CU_SRC    = os.path.join(_GPU_DIR, "_matmul_cuda_ext_tc6_lb.cu")
+_CU_SRC    = os.path.join(_GPU_DIR, "_matmul_cuda_ext_tc7_lb.cu")
 _SM_ARCH   = "sm_89"
 
 _LB_BLOCKS = [1, 2, 3, 4]
@@ -51,7 +51,7 @@ _CONFIGS = [
 
 
 def _cubin_path(lb):
-    return os.path.join(_GPU_DIR, f"_matmul_cuda_ext_tc6_lb{lb}_{_SM_ARCH}.cubin")
+    return os.path.join(_GPU_DIR, f"_matmul_cuda_ext_tc7_lb{lb}_{_SM_ARCH}.cubin")
 
 
 def _get_mod(lb):
@@ -59,7 +59,7 @@ def _get_mod(lb):
 
 
 def _kname(bm, bn, bk, nw):
-    return f"matmul_cuda_tc6_bm{bm}_bn{bn}_bk{bk}_nw{nw}"
+    return f"matmul_cuda_tc7_bm{bm}_bn{bn}_bk{bk}_nw{nw}"
 
 
 def _block(nw):
@@ -110,16 +110,16 @@ def _tune(M, N, K):
     return best_cfg
 
 
-def matmul_tc6_lb(A, B):
+def matmul_tc7_lb(A, B):
     M, K = A.shape
     _, N = B.shape
     key  = (M, N, K)
     if key not in _best:
         cfgs = [c for c in _CONFIGS if M % c[0] == 0 and N % c[1] == 0 and K % c[2] == 0]
-        print(f"[tc6_lb] autotuning {M}x{N}x{K} over {len(cfgs)} configs ...")
+        print(f"[tc7_lb] autotuning {M}x{N}x{K} over {len(cfgs)} configs ...")
         _best[key] = _tune(M, N, K)
         bm, bn, bk, nw, lb = _best[key]
-        print(f"[tc6_lb] best: BM={bm} BN={bn} BK={bk} NW={nw} LB={lb}")
+        print(f"[tc7_lb] best: BM={bm} BN={bn} BK={bk} NW={nw} LB={lb}")
     bm, bn, bk, nw, lb = _best[key]
     return _launch(_get_mod(lb), _kname(bm, bn, bk, nw), A, B,
                    _block(nw), _grid(M, N, bm, bn), _smem(bm, bn, bk))

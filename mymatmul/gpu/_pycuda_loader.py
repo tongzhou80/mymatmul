@@ -13,7 +13,8 @@ import threading
 import torch
 import pycuda.driver as drv
 
-NVCC = "/usr/local/cuda/bin/nvcc"
+NVCC   = "/usr/local/cuda/bin/nvcc"
+PTXAS  = "/usr/local/cuda-12.8/bin/ptxas"
 SM_ARCH = "sm_89"   # RTX 4090 (Ada Lovelace)
 
 # Per-extension extra nvcc flags (e.g. register caps).
@@ -86,6 +87,33 @@ def get_module(ext_name: str) -> drv.Module:
 
 def get_kernel(ext_name: str, kernel_name: str) -> drv.Function:
     return get_module(ext_name).get_function(kernel_name)
+
+
+def _compile_ptx(ptx_path: str, cubin: str) -> None:
+    cmd = [PTXAS, f"-arch={SM_ARCH}", ptx_path, "-o", cubin]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ptxas failed:\n{r.stderr}")
+
+
+def get_module_ptx(ptx_path: str) -> drv.Module:
+    """Compile a .ptx file to a cubin (via ptxas) and load it.
+
+    The cubin is cached next to the .ptx file as <name>_sm89.cubin.
+    """
+    ptx_path = os.path.abspath(ptx_path)
+    cubin = ptx_path[:-4] + f"_{SM_ARCH}.cubin"
+    with _lock:
+        if cubin in _modules:
+            return _modules[cubin]
+        _ensure_ctx()
+        if not os.path.exists(cubin) or os.path.getmtime(ptx_path) > os.path.getmtime(cubin):
+            print(f"[pycuda] compiling {os.path.basename(ptx_path)} ...", end=" ", flush=True)
+            _compile_ptx(ptx_path, cubin)
+            print("done")
+        mod = drv.module_from_file(cubin)
+        _modules[cubin] = mod
+        return mod
 
 
 def get_module_jit(cu_path: str, cubin_path: str, extra_flags: list[str]) -> drv.Module:
