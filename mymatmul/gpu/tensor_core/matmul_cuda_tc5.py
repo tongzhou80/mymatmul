@@ -5,8 +5,8 @@ exploiting the MMA output layout where acc[0]/acc[1] and acc[2]/acc[3] each
 occupy consecutive columns in the same row.
 """
 
-import time
 import torch
+import triton.testing
 from .._pycuda_loader import launch_matmul, get_module
 
 DTYPE = torch.bfloat16
@@ -66,25 +66,20 @@ def _tune(M, N, K):
         grid  = _grid(M, N, bm, bn)
         sb    = _smem(bm, bn, bk)
         try:
-            for _ in range(2):
-                launch_matmul(_EXT, kn, A, B, block, grid,
-                              out_dtype=torch.float32, smem_bytes=sb)
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            for _ in range(3):
-                launch_matmul(_EXT, kn, A, B, block, grid,
-                              out_dtype=torch.float32, smem_bytes=sb)
-            torch.cuda.synchronize()
-            t = (time.perf_counter() - t0) / 3
+            _, ms_min, _ = triton.testing.do_bench(
+                lambda: launch_matmul(_EXT, kn, A, B, block, grid,
+                                      out_dtype=torch.float32, smem_bytes=sb),
+                warmup=10, rep=50, quantiles=(0.5, 0.0, 1.0),
+            )
         except Exception as e:
             print(f"  [{idx+1}/{n}] BM={bm} BN={bn} BK={bk} NW={nw}  FAILED: {e}")
             continue
 
-        gflops = 2 * M * N * K / t / 1e12
+        gflops = 2 * M * N * K / (ms_min / 1e3) / 1e12
         print(f"  [{idx+1:3d}/{n}] BM={bm:3d} BN={bn:3d} BK={bk:2d} NW={nw}   {gflops:6.1f} TFLOPS")
 
-        if t < best_t:
-            best_t   = t
+        if ms_min < best_t:
+            best_t   = ms_min
             best_cfg = cfg
 
     return best_cfg
