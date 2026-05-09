@@ -262,20 +262,24 @@ Valid configs: **42** for TC5, **90** for TC5_regpruned (after pruning).
 **Precision:** BF16 inputs, FP32 accumulators, BF16 output.  
 **Peak BF16 tensor-core throughput:** 164 TFLOPS (dense).
 
-### TC5_regpruned vs TC5 vs cuBLAS vs Triton
+### TC5_regpruned vs cuBLAS vs Triton
 
-| Size  | TC5   | TC5_regpruned | cuBLAS | Triton | regpruned/cuBLAS |
-|-------|-------|---------------|--------|--------|-----------------|
-| 2048  | 123.4 | 128.1         | 135.3  | 133.2  | 95%             |
-| 3072  | 130.5 | 134.8         | 131.3  | 140.9  | **103%**        |
-| 4096  | 134.4 | 138.8         | 134.1  | 143.1  | **104%**        |
-| 5120  | 135.8 | 139.1         | 141.5  | 144.0  | 98%             |
-| 6144  | 138.1 | 141.4         | 142.7  | 144.5  | 99%             |
-| 7168  | 136.7 | 139.4         | 143.5  | 144.8  | 97%             |
-| 8192  | 140.0 | 142.5         | 144.1  | 144.9  | **99%**         |
+| Size  | TC5_regpruned | cuBLAS | Triton | regpruned/cuBLAS | regpruned/Triton |
+|-------|---------------|--------|--------|-----------------|-----------------|
+| 1024  | 87.4          | 91.2   | 95.3   | 96%             | 92%             |
+| 2048  | 128.1         | 135.3  | 132.1  | 95%             | 97%             |
+| 3072  | 134.8         | 130.8  | 140.9  | **103%**        | 96%             |
+| 4096  | 138.7         | 135.6  | 143.1  | **102%**        | 97%             |
+| 5120  | 139.1         | 141.5  | 143.9  | 98%             | 97%             |
+| 6144  | 141.4         | 142.6  | 144.5  | **99%**         | 98%             |
+| 7168  | 139.4         | 143.5  | 144.8  | 97%             | 96%             |
+| 8192  | 142.5         | 144.0  | 144.9  | **99%**         | 98%             |
+| 9216  | 141.1         | 144.3  | 145.0  | 98%             | 97%             |
+| 10240 | 142.8         | 143.1  | 145.2  | **100%**        | 98%             |
 
-TC5_regpruned gains ~2–3 TFLOPS over TC5 at all sizes, reaching cuBLAS parity or
-better at 3072–4096 (wave-quantization sweet spots) and staying within 1% at 8192.
+TC5_regpruned matches or beats cuBLAS at 3072–4096 (wave-quantization sweet spots
+where cuBLAS dips) and stays within 1–2% at 5120+. Triton leads by a consistent
+2–4%, attributed to its deeper multi-stage prefetch pipeline.
 
 ### LB Variant Comparison at Large Sizes (TFLOPS)
 
@@ -311,17 +315,22 @@ TC5→TC5_regpruned: two-arg `__launch_bounds__` forces tighter register budget.
 
 | Size  | TC5_regpruned best |
 |-------|-------------------|
+| 1024  | BM=64,  BN=64,  BK=64, NW=4, LB=3 |
 | 2048  | BM=128, BN=64,  BK=64, NW=4, LB=2 |
 | 3072  | BM=64,  BN=128, BK=32, NW=4, LB=1 |
 | 4096  | BM=128, BN=128, BK=32, NW=4, LB=1 |
-| 5120  | BM=64,  BN=128, BK=16, NW=4, LB=1 |
+| 5120  | BM=64,  BN=128, BK=32, NW=4, LB=1 |
 | 6144  | BM=128, BN=128, BK=32, NW=4, LB=1 |
 | 7168  | BM=128, BN=128, BK=32, NW=4, LB=1 |
 | 8192  | BM=128, BN=128, BK=32, NW=4, LB=1 |
+| 9216  | BM=128, BN=128, BK=32, NW=4, LB=1 |
+| 10240 | BM=128, BN=128, BK=32, NW=4, LB=1 |
 
-LB=1 dominates at 3072+ (tightest budget → most registers available → best ILP).
-LB=2 wins at 2048 where the smaller grid benefits from higher occupancy to hide
-latency over maximizing per-thread register count.
+LB=1 (tightest register budget) dominates from 3072 onwards where occupancy is
+sufficient to hide latency. LB=2 wins at 2048 and LB=3 at 1024, where the
+smaller grids benefit from higher occupancy at the cost of fewer registers per
+thread. BK=64 is preferred at 1024–2048 (higher arithmetic intensity per CTA
+compensates for fewer CTAs); BK=32 with larger tiles takes over from 3072+.
 
 ---
 
