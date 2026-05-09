@@ -157,7 +157,8 @@ IMPLEMENTATIONS = {
     # TC5l2: TC5 with cp.async.cg.L2::128B prefetch hint on tile loads
     "tc5l2":     ("mymatmul.gpu.tensor_core.matmul_cuda_tc5l2.matmul_tc5l2",         None, torch.bfloat16),
     # TC5_reg: TC5 autotuned over tile shape AND maxrregcount (128/168/255)
-    "tc5_reg":   ("mymatmul.gpu.tensor_core.matmul_cuda_tc5_reg.matmul_tc5_reg",     None, torch.bfloat16),
+    "tc5_reg":     ("mymatmul.gpu.tensor_core.matmul_cuda_tc5_reg.matmul_tc5_reg",         None, torch.bfloat16),
+    "tc5_regpruned": ("mymatmul.gpu.tensor_core.matmul_cuda_tc5_regpruned.matmul_tc5_regpruned", None, torch.bfloat16),
     "tc8_4096":     ("mymatmul.gpu.tensor_core.matmul_cuda_tc8_4096.matmul_tc8_4096",             None, torch.bfloat16),
     "tc8_4096_ptx": ("mymatmul.gpu.tensor_core.matmul_cuda_tc8_4096_ptx.matmul_tc8_4096_ptx",   None, torch.bfloat16),
     "tc8_gemini":   ("mymatmul.gpu.tensor_core.matmul_cuda_tc8_gemini.matmul_tc8_gemini",           None, torch.bfloat16),
