@@ -159,6 +159,7 @@ IMPLEMENTATIONS = {
     # TC5_reg: TC5 autotuned over tile shape AND maxrregcount (128/168/255)
     "tc5_reg":     ("mymatmul.gpu.tensor_core.matmul_cuda_tc5_reg.matmul_tc5_reg",         None, torch.bfloat16),
     "tc5_regpruned": ("mymatmul.gpu.tensor_core.matmul_cuda_tc5_regpruned.matmul_tc5_regpruned", None, torch.bfloat16),
+    "tc6_lb":        ("mymatmul.gpu.tensor_core.matmul_cuda_tc6_lb.matmul_tc6_lb",               None, torch.bfloat16),
     "tc8_4096":     ("mymatmul.gpu.tensor_core.matmul_cuda_tc8_4096.matmul_tc8_4096",             None, torch.bfloat16),
     "tc8_4096_ptx": ("mymatmul.gpu.tensor_core.matmul_cuda_tc8_4096_ptx.matmul_tc8_4096_ptx",   None, torch.bfloat16),
     "tc8_gemini":   ("mymatmul.gpu.tensor_core.matmul_cuda_tc8_gemini.matmul_tc8_gemini",           None, torch.bfloat16),
