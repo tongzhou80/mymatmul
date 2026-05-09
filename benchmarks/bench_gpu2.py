@@ -18,7 +18,7 @@ def gflops(M, N, K, ms):
     return 2 * M * N * K / (ms / 1e3) / 1e9
 
 
-def run(impl_names, sizes):
+def run(impl_names, shapes):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rows = []
     all_i = _all_impls()
@@ -30,11 +30,9 @@ def run(impl_names, sizes):
         fn       = load_fn(name)
         print(f"\n[{name}]")
 
-        for sz in sizes:
-            M = N = K = sz
-
-            if max_size is not None and sz > max_size:
-                print(f"  {M}x{N}x{K}: skipped (max_size={max_size})")
+        for M, K, N in shapes:
+            if max_size is not None and max(M, N, K) > max_size:
+                print(f"  {M}x{K}x{N}: skipped (max_size={max_size})")
                 continue
 
             A_gpu = torch.randn(M, K, dtype=dtype, device='cuda')
@@ -43,7 +41,7 @@ def run(impl_names, sizes):
             try:
                 validate_fn(fn, A_gpu, B_gpu)
             except AssertionError as e:
-                print(f"  {M}x{N}x{K}: ✗ validation FAILED: {e}")
+                print(f"  {M}x{K}x{N}: ✗ validation FAILED: {e}")
                 continue
 
             ms_median, ms_min, _ = triton.testing.do_bench(
@@ -54,7 +52,7 @@ def run(impl_names, sizes):
             )
             gf = gflops(M, N, K, ms_min)
 
-            print(f"  {M}x{N}x{K}: ✓ {gf:.2f} GFLOPS  (median {ms_median:.2f} ms, best {ms_min:.2f} ms)")
+            print(f"  {M}x{K}x{N}: ✓ {gf:.2f} GFLOPS  (median {ms_median:.2f} ms, best {ms_min:.2f} ms)")
 
             rows.append({
                 "timestamp": timestamp,
@@ -82,13 +80,34 @@ def run(impl_names, sizes):
     print(f"\nResults written to {RESULTS_FILE}")
 
 
+def _parse_shape(s):
+    """Parse MxKxN or a single integer (square) into (M, K, N)."""
+    parts = s.split("x")
+    if len(parts) == 1:
+        n = int(parts[0])
+        return (n, n, n)
+    if len(parts) == 3:
+        return (int(parts[0]), int(parts[1]), int(parts[2]))
+    raise argparse.ArgumentTypeError(f"shape must be N or MxKxN, got {s!r}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--impls", nargs="+", default=list(_all_impls().keys()))
-    parser.add_argument("--sizes", nargs="+", type=int, default=SIZES)
+    parser.add_argument("--sizes", nargs="+", type=int, default=None,
+                        help="Square sizes (shorthand for --shapes NxNxN)")
+    parser.add_argument("--shapes", nargs="+", type=_parse_shape, default=None,
+                        help="Shapes as MxKxN (e.g. 64x16384x65536) or plain N for square")
     args = parser.parse_args()
 
-    run(args.impls, args.sizes)
+    if args.shapes is not None:
+        shapes = args.shapes
+    elif args.sizes is not None:
+        shapes = [(s, s, s) for s in args.sizes]
+    else:
+        shapes = [(s, s, s) for s in SIZES]
+
+    run(args.impls, shapes)
 
 
 if __name__ == "__main__":

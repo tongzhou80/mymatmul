@@ -334,7 +334,67 @@ compensates for fewer CTAs); BK=32 with larger tiles takes over from 3072+.
 
 ---
 
-## 6. Conclusion
+## 6. Skewed (Non-Square) Shapes
+
+All square-size results above use `M = N = K`. This section evaluates small-M shapes
+representative of batch matrix-multiply workloads (e.g. token-length × model-dim ×
+vocab in LLM inference).
+
+### Performance vs cuBLAS and Triton
+
+| Shape (M×K×N) | TC5_regpruned | cuBLAS BF16 | Triton BF16 | tc5/cuBLAS | tc5/Triton |
+|---------------|:-------------:|:-----------:|:-----------:|:----------:|:----------:|
+| 64×16384×65536 | 60.9 | 58.0 | 60.9 | **105%** | 100% |
+| 128×16384×65536 | 119.7 | 109.7 | 119.9 | **109%** | 100% |
+| 256×16384×65536 | 139.9 | 142.7 | 141.9 | 98% | 99% |
+| 64×8192×65536 | 59.4 | 54.4 | 59.2 | **109%** | 100% |
+| 128×8192×65536 | 114.5 | 106.4 | 116.3 | **108%** | 98% |
+
+TC5_regpruned beats cuBLAS by 5–9% at M=64 and M=128, and is statistically tied
+with Triton across all small-M shapes. The one exception is M=256, where both fall
+~1–2% short: with BM=256 the occupancy constraint `BM×BN ≤ 4096×NW` forces BN=64
+(narrow-N tile), reducing arithmetic intensity per CTA while cuBLAS can likely
+select a wider asymmetric tile.
+
+### LB Behavior at Small M
+
+| Shape | TC5_regpruned best config |
+|-------|--------------------------|
+| 64×16384×65536 | BM=64 BN=128 BK=32 NW=4 **LB=4** |
+| 64×8192×65536 | BM=64 BN=128 BK=32 NW=4 **LB=4** |
+| 128×16384×65536 | BM=128 BN=256 BK=32 NW=8 **LB=1** |
+| 128×8192×65536 | BM=128 BN=128 BK=16 NW=4 **LB=1** |
+| 256×16384×65536 | BM=256 BN=64 BK=32 NW=4 **LB=1** |
+
+At M=64 the grid has only one row of M-tiles, so the total block count is
+`N/BN × 1`. With so few blocks per SM, occupancy matters more than ILP: LB=4 (4
+blocks/SM enforced, tighter register budget) wins over LB=1. This is the opposite
+of the large-square-matrix regime. At M=128+ the grid is large enough to saturate
+the GPU, and LB=1 resumes dominance.
+
+### Numerical Accuracy
+
+With M=64, K=16384, N=65536 and standard-normal BF16 inputs (output std ≈ 128):
+
+| Comparison | Max abs err | Mean abs err |
+|------------|------------|-------------|
+| cuBLAS BF16 vs FP32 ref | 4.0 | 0.214 |
+| TC5_regpruned vs FP32 ref | 4.0 | **0.002** |
+| TC5_regpruned vs cuBLAS BF16 | 4.0 | 0.214 |
+
+Our kernel uses WMMA `float` accumulators throughout — the BF16 inputs are only
+loaded into fragment registers; all intermediate accumulation happens in FP32. The
+result is bit-identical to a full FP32 matmul at the accumulator level, with error
+only from the final BF16 output cast (max ~4.0 at magnitude ~128, i.e. one BF16
+ULP). cuBLAS BF16 introduces ~100× more mean error — likely using a different
+internal accumulation path.
+
+The max abs err of 4.0 in all cases is expected BF16 quantization of the output:
+at values ~128, the BF16 step size is ~1.0, so rounding error up to ~4.0 is normal.
+
+---
+
+## 7. Conclusion
 
 The kernel progression from TC1 to TC5_regpruned reaches cuBLAS parity at
 4096 and 99% at 8192:
@@ -356,3 +416,10 @@ pipeline, TC5swz CTA swizzle, TC5jit/TC5jit_lb JIT constants, TC8g multi-stage)
 found no improvement over TC5_regpruned. The remaining 1–2% gap behind cuBLAS
 and 2–4% behind Triton at large sizes is not yet explained; the register and
 occupancy analysis does not point to an obvious remaining bottleneck.
+
+On small-M skewed shapes (M=64–128, K/N ∼ 8192–65536), TC5_regpruned **beats
+cuBLAS BF16 by 5–9%** and matches Triton within 1%. The autotuner shifts to
+higher LB (LB=4 at M=64) to favor occupancy over ILP when the grid has only one
+M-tile row. Numerically, the FP32 accumulator path means TC5_regpruned is
+effectively lossless vs a full FP32 reference (mean error 0.002 vs cuBLAS BF16's
+0.214 at K=16384).
