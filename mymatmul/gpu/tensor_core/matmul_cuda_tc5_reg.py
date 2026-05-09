@@ -17,13 +17,12 @@ import torch
 import triton.testing
 import pycuda.driver as drv
 
-from .._pycuda_loader import get_module_jit
+from .._pycuda_loader import get_module_jit, SM_ARCH
 
 DTYPE = torch.bfloat16
 
 _GPU_DIR   = os.path.dirname(os.path.abspath(__file__))
 _TC5_LB_CU = os.path.join(_GPU_DIR, "_matmul_cuda_ext_tc5_lb.cu")
-_SM_ARCH   = "sm_89"
 
 _LB_BLOCKS = [1, 2, 3, 4]
 
@@ -53,7 +52,7 @@ _CONFIGS = [
 
 
 def _cubin_path(lb):
-    return os.path.join(_GPU_DIR, f"_matmul_cuda_ext_tc5_lb{lb}_{_SM_ARCH}.cubin")
+    return os.path.join(_GPU_DIR, f"_matmul_cuda_ext_tc5_lb{lb}_{SM_ARCH}.cubin")
 
 
 def _get_mod(lb):

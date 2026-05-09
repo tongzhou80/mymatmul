@@ -13,9 +13,18 @@ import threading
 import torch
 import pycuda.driver as drv
 
-NVCC   = "/usr/local/cuda/bin/nvcc"
-PTXAS  = "/usr/local/cuda-12.8/bin/ptxas"
-SM_ARCH = "sm_89"   # RTX 4090 (Ada Lovelace)
+NVCC  = "/usr/local/cuda/bin/nvcc"
+PTXAS = "/usr/local/cuda-12.8/bin/ptxas"
+
+
+def _detect_sm_arch() -> str:
+    if not torch.cuda.is_available():
+        return "sm_89"
+    major, minor = torch.cuda.get_device_capability(0)
+    return f"sm_{major}{minor}"
+
+
+SM_ARCH = _detect_sm_arch()
 
 # Per-extension extra nvcc flags (e.g. register caps).
 _EXTRA_FLAGS: dict[str, list[str]] = {}
