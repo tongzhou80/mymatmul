@@ -3,14 +3,15 @@
 ## Abstract
 
 We implement a series of BF16 GEMM kernels using CUDA tensor cores, reaching
-**~100% of cuBLAS BF16** at N=4096 and **~99% at N=8192** with `tc5_regpruned`.
+**102–103% of cuBLAS BF16** at N=3072–4096 (wave-quantization sweet spots where
+cuBLAS underperforms) and **99–100% at N=8192–10240** with `tc5_regpruned`.
 The progression has five main stages: TC1 (WMMA API), TC2 (raw PTX + B-tile
 XOR swizzle), TC2b (A-tile XOR swizzle), TC5 (vectorized write-back + BK=64),
 and TC5_reg/TC5_regpruned (two-arg `__launch_bounds__` LB tuning + register-estimate
 pruning). A second round of optimization explored pipeline restructuring (TC6,
 TC7), CTA swizzle (TC5swz), JIT constants (TC5jit/TC5jit_lb), and multi-stage
-prefetch (TC8g); none improved over TC5_regpruned. The primary remaining gap
-vs cuBLAS (1–2%) and Triton (2–4%) at large sizes is not yet explained.
+prefetch (TC8g); none improved over TC5_regpruned. Triton leads by a consistent
+2–4% across all sizes; the gap is not yet explained.
 
 ---
 
