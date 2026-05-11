@@ -57,11 +57,11 @@ def _ensure_ctx() -> None:
 
 def _find_cu(ext_name: str) -> str:
     gpu_dir = os.path.dirname(os.path.abspath(__file__))
-    for sub in ("cuda_core", "tensor_core"):
+    for sub in ("cuda_core", "tensor_core", "hopper"):
         path = os.path.join(gpu_dir, sub, f"{ext_name}.cu")
         if os.path.exists(path):
             return path
-    raise FileNotFoundError(f"{ext_name}.cu not found under cuda_core/ or tensor_core/")
+    raise FileNotFoundError(f"{ext_name}.cu not found under cuda_core/, tensor_core/, or hopper/")
 
 
 def _cubin_path(cu_path: str) -> str:
