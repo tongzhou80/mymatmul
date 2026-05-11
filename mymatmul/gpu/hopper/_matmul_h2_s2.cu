@@ -212,6 +212,11 @@ __device__ __forceinline__ void h2s2_impl(
     // ── Accumulators (zero-initialised) ──────────────────────────────────────
     float acc[D] = {};
 
+    // A swizzle: only BK=64 uses TMA 128B swizzle (period=8 rows, 16B-chunk-aligned XOR).
+    // BK=16/32 use SWIZZLE_NONE (64B/32B swizzle XORs at 8B granularity which
+    // breaks ldmatrix 16B chunk boundaries and corrupts data).
+    constexpr int A_SWZ_PERIOD = (BK == 64) ? 8 : 0;
+
     const int num_tiles = K / BK;
 
     // ── B SMEM sub-tile helpers ───────────────────────────────────────────────
@@ -265,14 +270,13 @@ __device__ __forceinline__ void h2s2_impl(
         // Inner BK/16 wgmma steps
         #pragma unroll
         for (int kk = 0; kk < BK / 16; kk++) {
-            // Load A[cur][warp*16 : warp*16+16][kk*16 : kk*16+16] via ldmatrix.x4
-            // Thread layout: each thread in the warpgroup loads 8 BF16 elements.
-            // a_row = warp*16 + lane%16, a_col_group = kk*2 + lane/16
             uint32_t a[4];
-            const int a_row = warp * 16 + (lane % 16);
-            const int a_col = kk * 2 + (lane / 16);
+            const int a_row     = warp * 16 + (lane % 16);
+            const int a_col_log  = kk * 2 + (lane / 16);
+            const int a_col_phys = (A_SWZ_PERIOD > 0)
+                ? (a_col_log ^ (a_row % A_SWZ_PERIOD)) : a_col_log;
             ldmatrix_x4(a[0], a[1], a[2], a[3],
-                (uint32_t)__cvta_generic_to_shared(&A_sh[cur][a_row][a_col * 8]));
+                (uint32_t)__cvta_generic_to_shared(&A_sh[cur][a_row][a_col_phys * 8]));
 
             // B descriptor: advance by kk × K_STEP_BYTES from sub-tile 0 base.
             // Each kk step = 16 K-rows × 64 BF16-wide × 2 bytes = 2048 bytes.
@@ -300,10 +304,12 @@ __device__ __forceinline__ void h2s2_impl(
     #pragma unroll
     for (int kk = 0; kk < BK / 16; kk++) {
         uint32_t a[4];
-        const int a_row = warp * 16 + (lane % 16);
-        const int a_col = kk * 2 + (lane / 16);
+        const int a_row      = warp * 16 + (lane % 16);
+        const int a_col_log  = kk * 2 + (lane / 16);
+        const int a_col_phys = (A_SWZ_PERIOD > 0)
+            ? (a_col_log ^ (a_row % A_SWZ_PERIOD)) : a_col_log;
         ldmatrix_x4(a[0], a[1], a[2], a[3],
-            (uint32_t)__cvta_generic_to_shared(&A_sh[last][a_row][a_col * 8]));
+            (uint32_t)__cvta_generic_to_shared(&A_sh[last][a_row][a_col_phys * 8]));
         uint32_t b_base_last = (uint32_t)__cvta_generic_to_shared(&B_sh[last][0][0]);
         uint64_t desc_b = make_wgmma_b_desc<BN, BK>(b_base_last + kk * K_STEP_BYTES);
         wgmma_call<BN>(acc, a, desc_b);

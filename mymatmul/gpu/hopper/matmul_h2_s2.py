@@ -69,7 +69,19 @@ def _get_mod():
 
 _DTYPE_BF16      = cudrvr.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
 _SWIZZLE_NONE    = cudrvr.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_NONE
+_SWIZZLE_32B     = cudrvr.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_32B
+_SWIZZLE_64B     = cudrvr.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_64B
 _SWIZZLE_128B    = cudrvr.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B
+
+def _a_swizzle(bk):
+    """TMA swizzle for A[BM][BK].
+    Only BK=64 (128B rows) is compatible with ldmatrix.x4 which reads 16-byte chunks:
+    128B swizzle XORs in 16-byte multiples → chunk boundaries preserved → correct.
+    64B/32B swizzle XORs at 8-byte granularity → splits 16-byte ldmatrix chunks → garbage.
+    For BK=16/32, use NONE (bank conflicts remain; swizzle is addressed in a later stage).
+    """
+    if bk == 64: return _SWIZZLE_128B
+    return _SWIZZLE_NONE
 _INTERLEAVE_NONE = cudrvr.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE
 _L2_PROMO_NONE   = cudrvr.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE
 _OOB_FILL_NONE   = cudrvr.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
@@ -138,12 +150,10 @@ def _launch(mod, kname, A, B, bn, bk):
     sb = _smem(bn, bk)
     _set_max_smem(fn, sb)
 
-    # A: no swizzle, boxDim = [bk, BM]
-    # B: 128B swizzle, boxDim = [64, bk]
-    #    (128B swizzle requires boxDim[0]*sizeof(bf16) <= 128 bytes → max 64 elements)
-    #    The kernel issues BN/64 TMA loads per stage to cover the full BN width.
+    # A: swizzle matched to row width (BK*2 bytes), boxDim = [bk, BM]
+    # B: 128B swizzle, boxDim = [64, bk]; BN/64 loads per stage
     buf_a = ctypes.create_string_buffer(
-        _make_tma_desc(A.data_ptr(), M, K, _BM, bk, _SWIZZLE_NONE), 128)
+        _make_tma_desc(A.data_ptr(), M, K, _BM, bk, _a_swizzle(bk)), 128)
     buf_b = ctypes.create_string_buffer(
         _make_tma_desc(B.data_ptr(), K, N, bk, 64, _SWIZZLE_128B), 128)
     c_C = ctypes.c_void_p(C.data_ptr())
