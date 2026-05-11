@@ -175,6 +175,11 @@ disk by LB value.
 **Hardware:** NVIDIA RTX 4090 (Ada Lovelace, sm_89), 128 SMs, 82.6 TFLOPS FP32 peak.
 **Precision:** FP32, no TF32, no tensor cores.
 
+**Measurement methodology.** Each kernel is timed with `triton.testing.do_bench`
+(100 ms warmup budget, 500 ms timed budget). `do_bench` flushes the GPU L2 cache
+between iterations using a built-in cache-flushing buffer. GFLOPS is reported from
+the best (minimum) kernel time; FLOP count = 2·M·N·K.
+
 Triton FP32 SIMT autotuned with configs: BM, BN ∈ {64,128,256}, BK ∈ {16,32},
 num_stages ∈ {3,4}, num_warps=8 (fixed), GROUP_M=8 (fixed).
 
@@ -522,6 +527,11 @@ Valid configs: **42** for TC5, **90** for TC5_regpruned (after pruning).
 **Hardware:** NVIDIA RTX 4090 (Ada Lovelace, sm_89), 128 SMs.  
 **Precision:** BF16 inputs, FP32 accumulators, BF16 output.  
 **Peak BF16 tensor-core throughput:** 164 TFLOPS (dense).
+
+**Measurement methodology.** Each kernel is timed with `triton.testing.do_bench`
+(100 ms warmup budget, 500 ms timed budget). `do_bench` flushes the GPU L2 cache
+between iterations using a built-in cache-flushing buffer. GFLOPS is reported from
+the best (minimum) kernel time; FLOP count = 2·M·N·K.
 
 ### TC5_regpruned vs cuBLAS vs Triton
 
