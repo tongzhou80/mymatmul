@@ -138,23 +138,6 @@ def _make_tma_desc(ptr_int: int, nrows: int, ncols: int,
     return np.array([int(v) for v in tmap.opaque], dtype=np.uint64).tobytes()
 
 
-# GPU buffer cache: (ptr_int, nrows, ncols, box_rows, box_cols) → CUdeviceptr
-_tma_bufs: dict = {}
-
-
-def _tma_gpu_ptr(ptr_int, nrows, ncols, box_rows, box_cols):
-    """Copy a TMA descriptor to a cached GPU buffer; return CUdeviceptr."""
-    key = (ptr_int, nrows, ncols, box_rows, box_cols)
-    if key not in _tma_bufs:
-        desc = _make_tma_desc(ptr_int, nrows, ncols, box_rows, box_cols)
-        err, buf = cudrvr.cuMemAlloc(128)
-        _chk(err, "cuMemAlloc(tma)")
-        (err,) = cudrvr.cuMemcpyHtoD(buf, desc, 128)
-        _chk(err, "cuMemcpyHtoD(tma)")
-        _tma_bufs[key] = buf
-    return _tma_bufs[key]
-
-
 # ── Config space (same constraints as tc5_regpruned) ─────────────────────────
 
 _BMS = [64, 128, 256]
@@ -213,25 +196,23 @@ def _launch(mod, kname, A, B, nw, bm, bn, bk, lb):
     _, N = B.shape
     C = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
 
-    tma_a = _tma_gpu_ptr(A.data_ptr(), M, K, bm, bk)
-    tma_b = _tma_gpu_ptr(B.data_ptr(), K, N, bk, bn)
-
     fn = _get_fn(mod, kname)
     sb = _smem(bm, bn, bk)
     _set_max_smem(fn, sb)
 
-    # Pack kernel arguments: each ctypes value lives on the stack; we pass
-    # pointers to those values as the kernelParams array.
-    c_tma_a = ctypes.c_void_p(int(tma_a))
-    c_tma_b = ctypes.c_void_p(int(tma_b))
-    c_C     = ctypes.c_void_p(C.data_ptr())
-    c_M     = ctypes.c_int(M)
-    c_K     = ctypes.c_int(K)
-    c_N     = ctypes.c_int(N)
-    params  = np.array([ctypes.addressof(c_tma_a), ctypes.addressof(c_tma_b),
-                        ctypes.addressof(c_C), ctypes.addressof(c_M),
-                        ctypes.addressof(c_K), ctypes.addressof(c_N)],
-                       dtype=np.intp)
+    # Build TMA descriptors on the CPU (pure arithmetic, no GPU alloc/copy).
+    # Pass as __grid_constant__ by value: kernelParams[i] points to the 128-byte
+    # struct; the CUDA runtime copies it into per-CTA constant memory at launch.
+    buf_a = ctypes.create_string_buffer(_make_tma_desc(A.data_ptr(), M, K, bm, bk), 128)
+    buf_b = ctypes.create_string_buffer(_make_tma_desc(B.data_ptr(), K, N, bk, bn), 128)
+    c_C   = ctypes.c_void_p(C.data_ptr())
+    c_M   = ctypes.c_int(M)
+    c_K   = ctypes.c_int(K)
+    c_N   = ctypes.c_int(N)
+    params = np.array([ctypes.addressof(buf_a), ctypes.addressof(buf_b),
+                       ctypes.addressof(c_C), ctypes.addressof(c_M),
+                       ctypes.addressof(c_K), ctypes.addressof(c_N)],
+                      dtype=np.intp)
 
     grid = ((N + bn - 1) // bn, (M + bm - 1) // bm, 1)
     (err,) = cudrvr.cuLaunchKernel(

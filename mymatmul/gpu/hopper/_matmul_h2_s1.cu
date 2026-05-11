@@ -133,8 +133,8 @@ __device__ __forceinline__ void mma_m16n8k16(
 
 template <int BM, int BN, int BK, int NUM_WARPS>
 __device__ __forceinline__ void h2s1_impl(
-    const TmaDesc* __restrict__ tma_A,
-    const TmaDesc* __restrict__ tma_B,
+    const TmaDesc& tma_A,
+    const TmaDesc& tma_B,
     __nv_bfloat16* __restrict__ C,
     int M, int K, int N
 ) {
@@ -182,8 +182,8 @@ __device__ __forceinline__ void h2s1_impl(
         mbar_init(&mbar[0], 1);
         mbar_init(&mbar[1], 1);
         mbar_arrive_expect_tx(&mbar[0], (BM * BK + BK * BN) * 2);
-        tma_load_2d(tma_A, &A_shared[0][0][0], &mbar[0], /*col=*/0, /*row=*/block_row);
-        tma_load_2d(tma_B, &B_shared[0][0][0], &mbar[0], /*col=*/block_col, /*row=*/0);
+        tma_load_2d(&tma_A, &A_shared[0][0][0], &mbar[0], /*col=*/0, /*row=*/block_row);
+        tma_load_2d(&tma_B, &B_shared[0][0][0], &mbar[0], /*col=*/block_col, /*row=*/0);
     }
     // Ensure mbar[0] is initialised and TMA is issued before any thread waits on it.
     __syncthreads();
@@ -199,9 +199,9 @@ __device__ __forceinline__ void h2s1_impl(
         if (tid == 0) {
             mbar_init(&mbar[nxt], 1);
             mbar_arrive_expect_tx(&mbar[nxt], (BM * BK + BK * BN) * 2);
-            tma_load_2d(tma_A, &A_shared[nxt][0][0], &mbar[nxt],
+            tma_load_2d(&tma_A, &A_shared[nxt][0][0], &mbar[nxt],
                         /*col=*/(k + 1) * BK, /*row=*/block_row);
-            tma_load_2d(tma_B, &B_shared[nxt][0][0], &mbar[nxt],
+            tma_load_2d(&tma_B, &B_shared[nxt][0][0], &mbar[nxt],
                         /*col=*/block_col, /*row=*/(k + 1) * BK);
         }
 
@@ -306,8 +306,8 @@ __device__ __forceinline__ void h2s1_impl(
 #define MAKE_LAUNCHER(BM_, BN_, BK_, NW_)                                      \
 extern "C" __global__ __launch_bounds__(NW_ * 32, LB_MIN_BLOCKS)              \
 void matmul_h2s1_bm##BM_##_bn##BN_##_bk##BK_##_nw##NW_(                       \
-    const TmaDesc* __restrict__ tma_A,                                         \
-    const TmaDesc* __restrict__ tma_B,                                         \
+    const __grid_constant__ TmaDesc tma_A,                                     \
+    const __grid_constant__ TmaDesc tma_B,                                     \
     __nv_bfloat16* __restrict__ C, int M, int K, int N)                        \
 {                                                                               \
     h2s1_impl<BM_, BN_, BK_, NW_>(tma_A, tma_B, C, M, K, N);                  \
