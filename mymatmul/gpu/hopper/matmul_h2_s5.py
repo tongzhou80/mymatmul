@@ -90,7 +90,7 @@ _BMS  = [64, 128, 256]
 _BNS  = [64, 128, 256]
 _BKS  = [16, 32, 64]
 _NWS  = [1, 2]
-_NSS  = [2, 3, 4]          # pipeline stages
+_NSS  = [2, 3, 4, 5]       # pipeline stages
 _MAX_SMEM = 200 * 1024
 
 DTYPE = torch.bfloat16

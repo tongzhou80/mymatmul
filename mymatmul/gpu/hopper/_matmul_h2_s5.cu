@@ -3,17 +3,29 @@
 #include <cuda_bf16.h>
 
 /*
- * H2 Stage 5: Stage 4 + tunable NUM_STAGES pipeline depth.
+ * H2 Stage 5: TMA + wgmma multi-stage pipeline with tunable depth (NS ∈ {2..5}).
  *
- * Key change vs H2-S4:
- *   NUM_STAGES is now a free template parameter (was hardcoded 2).
- *   SMEM: A[NS][BM][BK], B[NS][BK][BN], mbar[NS].
- *   Prologue issues NS-1 tiles; main loop k=0..num_tiles-NS;
- *   drain (#pragma unroll) processes the last NS-1 tiles without new issues.
+ * ── Three hardware engines, three coordination problems ──────────────────────
  *
- * Deeper pipelines (NS=3,4) keep more TMA transfers in flight, overlapping
- * data movement with compute to hide the mbarrier::wait latency that dominates
- * h2_s4 (62% barrier+membar stalls at N=8192).
+ *   ┌────────────┐  doorbell (mbarrier)  ┌──────────────────┐
+ *   │ TMA engine │ ──── rings when ────► │  Warp execution  │
+ *   │ (DMA unit) │      data arrives     │  (ldmatrix, ctrl)│
+ *   └────────────┘                       └────────┬─────────┘
+ *        │  writes SMEM                           │ issues wgmma calls
+ *        │                    fence.proxy.async   ▼
+ *        └──────────────────────────────► ┌──────────────┐
+ *              makes writes visible to    │ Tensor core  │
+ *              wgmma's async SMEM view    │  (wgmma unit)│
+ *                                         └──────────────┘
+ *
+ * ── Pipeline: NS slots, each holding one A+B tile ────────────────────────────
+ *
+ *   Prologue  : fill NS-1 slots with TMA loads (ring doorbells when ready)
+ *   Main loop : for each k-tile: load next slot, wait current doorbell, compute
+ *   Drain     : drain last NS-1 slots (no new loads, just wait+compute)
+ *
+ *   Deeper NS → more tiles in flight → more time for TMA to finish → fewer stalls.
+ *   Limit: SMEM = NS × (BM×BK + BK×BN) × 2 bytes must fit in 200 KB.
  *
  * Compiled with -arch=sm_90a, single cubin LB=1.
  */
@@ -22,45 +34,75 @@
 #define LB_MIN_BLOCKS 1
 #endif
 
-// ── Reuse TMA / mbarrier helpers from S1 ─────────────────────────────────────
-
 struct alignas(64) TmaDesc { uint64_t opaque[16]; };
 
-__device__ __forceinline__ void mbar_init(uint64_t* mbar, uint32_t count) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n"
-                 :: "r"((uint32_t)__cvta_generic_to_shared(mbar)), "r"(count) : "memory");
+// ── Doorbell (mbarrier): hardware signal between TMA engine and warps ─────────
+//
+// Each pipeline slot has one doorbell in SMEM. The protocol per slot:
+//   1. doorbell_reset()  — arm it: "not ready, expecting one TMA delivery"
+//   2. doorbell_arm_tma()— tell TMA engine: "ring this doorbell when N bytes arrive"
+//      + issue the actual TMA load (tma_load_tile)
+//   3. doorbell_wait()   — block all warps until TMA rings (tile is in SMEM)
+
+__device__ __forceinline__ void doorbell_reset(uint64_t* db) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n"
+                 :: "r"((uint32_t)__cvta_generic_to_shared(db)) : "memory");
 }
 
-__device__ __forceinline__ void mbar_arrive_expect_tx(uint64_t* mbar, uint32_t tx_bytes) {
-    uint32_t addr = (uint32_t)__cvta_generic_to_shared(mbar);
-    uint64_t state;
+__device__ __forceinline__ void doorbell_arm_tma(uint64_t* db, uint32_t bytes_expected) {
+    // "arrive" (software side of count=1) + declare how many bytes TMA will deliver
+    uint32_t addr = (uint32_t)__cvta_generic_to_shared(db);
+    uint64_t token;
     asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 %0, [%1], %2;\n"
-                 : "=l"(state) : "r"(addr), "r"(tx_bytes) : "memory");
+                 : "=l"(token) : "r"(addr), "r"(bytes_expected) : "memory");
 }
 
-__device__ __forceinline__ void mbar_wait(uint64_t* mbar, uint32_t phase) {
-    uint32_t done = 0, addr = (uint32_t)__cvta_generic_to_shared(mbar);
+__device__ __forceinline__ void doorbell_wait(uint64_t* db) {
+    // Spin until TMA rings: tile is safe to read
+    uint32_t done = 0, addr = (uint32_t)__cvta_generic_to_shared(db);
     while (!done) {
         asm volatile("{\n.reg .pred P;\n"
-                     "mbarrier.test_wait.parity.acquire.cta.shared::cta.b64 P, [%1], %2;\n"
+                     "mbarrier.test_wait.parity.acquire.cta.shared::cta.b64 P, [%1], 0;\n"
                      "selp.u32 %0, 1, 0, P;\n}\n"
-                     : "=r"(done) : "r"(addr), "r"(phase) : "memory");
+                     : "=r"(done) : "r"(addr) : "memory");
     }
 }
 
-__device__ __forceinline__ void tma_load_2d(
-    const TmaDesc* desc, void* smem_ptr, uint64_t* mbar, int32_t coord0, int32_t coord1
+// ── TMA tile load: DMA engine pulls one A+B tile from HBM into SMEM ──────────
+// Thread 0 issues this; hardware notifies the doorbell when delivery completes.
+
+__device__ __forceinline__ void tma_load_tile(
+    const TmaDesc* desc, void* smem_ptr, uint64_t* db, int32_t coord0, int32_t coord1
 ) {
-    uint32_t dst  = (uint32_t)__cvta_generic_to_shared(smem_ptr);
-    uint32_t mbar_addr = (uint32_t)__cvta_generic_to_shared(mbar);
+    uint32_t dst = (uint32_t)__cvta_generic_to_shared(smem_ptr);
+    uint32_t db_addr = (uint32_t)__cvta_generic_to_shared(db);
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cluster.global"
         ".tile.mbarrier::complete_tx::bytes [%0], [%1, {%3, %4}], [%2];\n"
-        : : "r"(dst), "l"((unsigned long long)desc), "r"(mbar_addr),
-            "r"(coord0), "r"(coord1) : "memory");
+        :: "r"(dst), "l"((unsigned long long)desc), "r"(db_addr),
+           "r"(coord0), "r"(coord1) : "memory");
 }
 
-// ── ldmatrix for A (unchanged from tc5_lb) ────────────────────────────────────
+// ── wgmma coordination: three fences that bridge the three hardware worlds ────
+//
+//   wgmma_begin():  two fences before issuing wgmma calls —
+//     fence.proxy.async  : TMA's SMEM writes → visible to wgmma's async-proxy view
+//     wgmma.fence        : ldmatrix's register writes → visible to wgmma's engine
+//   wgmma_commit():  tell tensor core "here is a batch of multiply work"
+//   wgmma_drain():   block thread until accumulator registers are ready to read
+
+__device__ __forceinline__ void wgmma_begin() {
+    asm volatile("fence.proxy.async;\n"          ::: "memory");
+    asm volatile("wgmma.fence.sync.aligned;\n"   ::: "memory");
+}
+__device__ __forceinline__ void wgmma_commit() {
+    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+}
+__device__ __forceinline__ void wgmma_drain() {
+    asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+}
+
+// ── ldmatrix: load A fragment from SMEM into registers (one per wgmma call) ──
 
 __device__ __forceinline__ void ldmatrix_x4(
     uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, uint32_t smem_ptr
@@ -236,32 +278,36 @@ __device__ __forceinline__ void h2s5_impl(
     constexpr int K_STEP_BYTES = 16 * SUBTILE_COL * 2;       // = 2048: bytes per kk advance
     // (For BN==64, sub-tile stride = BK*128 = BK*K_STEP_BYTES/16 = ... but only one sub-tile)
 
-    // ── Helper: issue one tile into slot s ───────────────────────────────────
-#define ISSUE_TILE(s_, k0_)                                                         \
+    // ── LOAD_TILE: thread 0 arms the doorbell then tells TMA to deliver the tile ─
+    // A: one load of BM×BK BF16 rows.
+    // B: BN/64 loads of 64-column sub-tiles (128B-swizzle constraint forces boxDim=64).
+#define LOAD_TILE(slot_, k_start_)                                                  \
     do {                                                                            \
-        mbar_arrive_expect_tx(&mbar[(s_)], (BM * BK + BK * BN) * 2);              \
-        tma_load_2d(&tma_A, &A_sh[(s_)][0][0], &mbar[(s_)], (k0_), block_row);    \
+        doorbell_arm_tma(&mbar[(slot_)], (BM * BK + BK * BN) * 2);                \
+        tma_load_tile(&tma_A, &A_sh[(slot_)][0][0], &mbar[(slot_)],               \
+                      (k_start_), block_row);                                       \
         _Pragma("unroll")                                                           \
         for (int _i = 0; _i < BN / SUBTILE_COL; _i++) {                            \
-            void* _b = (char*)(&B_sh[(s_)][0][0]) + _i * BK * SUBTILE_COL * 2;    \
-            tma_load_2d(&tma_B, _b, &mbar[(s_)], block_col+_i*SUBTILE_COL, (k0_));\
+            void* _b = (char*)(&B_sh[(slot_)][0][0]) + _i * BK * SUBTILE_COL * 2; \
+            tma_load_tile(&tma_B, _b, &mbar[(slot_)],                              \
+                          block_col + _i * SUBTILE_COL, (k_start_));               \
         }                                                                           \
     } while (0)
 
-    // ── Prologue: init all NS mbarriers, issue first NS-1 tiles ──────────────
+    // ── Prologue: install NS doorbells, prefill pipeline with NS-1 tiles ─────
     if (tid == 0) {
         #pragma unroll
-        for (int s = 0; s < NS; s++) mbar_init(&mbar[s], 1);
+        for (int s = 0; s < NS; s++) doorbell_reset(&mbar[s]);
         #pragma unroll
-        for (int s = 0; s < NS - 1; s++) ISSUE_TILE(s, s * BK);
+        for (int s = 0; s < NS - 1; s++) LOAD_TILE(s, s * BK);
     }
     __syncthreads();
 
-    // ── Compute helper (used in main loop and drain) ─────────────────────────
-#define COMPUTE_SLOT(slot_)                                                         \
+    // ── MULTIPLY_TILE: wgmma compute on one pipeline slot ────────────────────
+    // See wgmma_begin/commit/drain above for the 3-step protocol explanation.
+#define MULTIPLY_TILE(slot_)                                                        \
     do {                                                                            \
-        asm volatile("fence.proxy.async;\n" ::: "memory");                         \
-        asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");                  \
+        wgmma_begin();                   /* bridge TMA→async-proxy, regs→wgmma */  \
         _Pragma("unroll")                                                           \
         for (int _kk = 0; _kk < BK / 16; _kk++) {                                 \
             uint32_t _bb = (uint32_t)__cvta_generic_to_shared(&B_sh[(slot_)][0][0]);\
@@ -274,11 +320,11 @@ __device__ __forceinline__ void h2s5_impl(
                 const int _aph = (A_SWZ_PERIOD>0) ? (_alg^(_ar%A_SWZ_PERIOD)):_alg;\
                 ldmatrix_x4(_a[0],_a[1],_a[2],_a[3],                              \
                     (uint32_t)__cvta_generic_to_shared(&A_sh[(slot_)][_ar][_aph*8]));\
-                wgmma_call<BN>((float*)acc[_m], _a, _db);                          \
+                wgmma_call<BN>((float*)acc[_m], _a, _db);  /* acc += A × B */      \
             }                                                                       \
         }                                                                           \
-        asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");           \
-        asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");           \
+        wgmma_commit();                  /* submit batch to tensor core engine */   \
+        wgmma_drain();                   /* acc[] is ready for next iteration  */   \
     } while (0)
 
     // ── Main K loop: tiles 0..num_tiles-NS  (always issues a new tile) ───────
@@ -287,27 +333,28 @@ __device__ __forceinline__ void h2s5_impl(
         const int nxt = (k + NS - 1) % NS;
 
         if (tid == 0) {
-            // nxt slot is free (last consumed NS-1 iters ago, __syncthreads'd)
-            mbar_init(&mbar[nxt], 1);
-            ISSUE_TILE(nxt, (k + NS - 1) * BK);
+            // Reset and arm the nxt doorbell, then kick off TMA for the next tile.
+            // Safe: nxt slot was consumed NS-1 iterations ago (behind __syncthreads).
+            doorbell_reset(&mbar[nxt]);
+            LOAD_TILE(nxt, (k + NS - 1) * BK);
         }
 
-        mbar_wait(&mbar[cur], 0);
-        COMPUTE_SLOT(cur);
-        __syncthreads();
+        doorbell_wait(&mbar[cur]);    // wait: cur tile is in SMEM
+        MULTIPLY_TILE(cur);           // compute: acc += A[cur] × B[cur]
+        __syncthreads();              // all warps done before next iter reuses cur
     }
 
-    // ── Drain: last NS-1 tiles (no new issues, unrolled so constants are CT) ─
+    // ── Drain: last NS-1 tiles that were issued but not yet waited on ────────
     #pragma unroll
     for (int d = NS - 2; d >= 0; d--) {
         const int slot = (num_tiles - d - 1) % NS;
-        mbar_wait(&mbar[slot], 0);
-        COMPUTE_SLOT(slot);
+        doorbell_wait(&mbar[slot]);
+        MULTIPLY_TILE(slot);
         __syncthreads();
     }
 
-#undef ISSUE_TILE
-#undef COMPUTE_SLOT
+#undef LOAD_TILE
+#undef MULTIPLY_TILE
 
     // ── Write accumulators to C ───────────────────────────────────────────────
     // Same wgmma output layout as h2_s3, now wrapped in an m-iteration loop.
@@ -352,7 +399,8 @@ void matmul_h2s5_bm##BM_##_bn##BN_##_bk##BK_##_wg##NG_##_ns##NS_(              \
 #define MAKE3(BM_, BN_, BK_, NG_) \
     MAKE_LAUNCHER(BM_, BN_, BK_, NG_, 2) \
     MAKE_LAUNCHER(BM_, BN_, BK_, NG_, 3) \
-    MAKE_LAUNCHER(BM_, BN_, BK_, NG_, 4)
+    MAKE_LAUNCHER(BM_, BN_, BK_, NG_, 4) \
+    MAKE_LAUNCHER(BM_, BN_, BK_, NG_, 5)
 
 // NW=1 warpgroup
 MAKE3( 64,  64, 16, 1) MAKE3( 64,  64, 32, 1) MAKE3( 64,  64, 64, 1)
