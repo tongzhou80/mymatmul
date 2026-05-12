@@ -108,40 +108,72 @@ H800, motivating Hopper-specific optimizations.
   B128 GmmaDescriptor applies.
 - Confirms wgmma works with cp.async but TMA+wgmma is the correct Hopper pair.
 
+### h2_s4 — TMA + wgmma + M-loop (BM up to 256)
+`matmul_h2_s4.py` / `_matmul_h2_s4.cu`
+
+- Extends h2_s3: `BM` is now a free parameter, not locked to `NUM_WG × 64`.
+- `M_ITERS = BM / (NUM_WG × 64)` — each warpgroup issues M_ITERS wgmma calls
+  per kk step, each covering 64 rows. With BM=256, WG=2: M_ITERS=2.
+- Accumulator: `float acc[M_ITERS][BN/2]` per thread.
+- Doubles SMEM usage for A vs h2_s3, raising arithmetic intensity.
+- 2-stage pipeline (NS hardcoded).
+
+### h2_s5 — TMA + wgmma + M-loop + NUM_STAGES (canonical Hopper kernel)
+`matmul_h2_s5.py` / `_matmul_h2_s5.cu`
+
+- Extends h2_s4: `NUM_STAGES ∈ {2, 3, 4}` is now a tunable template parameter.
+- Deeper pipelines keep more TMA transfers in flight, hiding mbarrier::wait latency.
+- SMEM: `A[NS][BM][BK]`, `B[NS][BK][BN]`, `mbar[NS]`.
+- Prologue issues `NS-1` tiles; main loop issues one tile per iteration;
+  drain (unrolled) processes the last `NS-1` tiles.
+- **This is the current best Hopper kernel**: TMA + wgmma + M-loop + multi-stage.
+
 ---
 
-## Benchmark Results (H800, BF16, square M=K=N)
+## Benchmark Results (H800 GPU2, BF16, square M=K=N)
 
 Measurement: `triton.testing.do_bench` (warmup 100ms, timed 500ms), best (min) time.
 All TFLOPS = 2·M·N·K / time.
 
 ### Performance (TFLOPS)
 
-| Size | tc5_regpruned | h1_ms | **h2_s3** | cuBLAS | h2_s3/cuBLAS |
-|------|:---:|:---:|:---:|:---:|:---:|
-| 1024 | 145 | **160** | 100 | 157 | 64% |
-| 2048 | 326 | 331 | **334** | 570 | 59% |
-| 3072 | 331 | **338** | 315 | 655 | 48% |
-| 4096 | 378 | **382** | 361 | 673 | 54% |
-| 5120 | 363 | **361** | 353 | 669 | 53% |
-| 6144 | 374 | 381 | **405** | 669 | 61% |
-| 7168 | 373 | 372 | **407** | 657 | 62% |
-| 8192 | 362 | 368 | **415** | 695 | 60% |
-| 9216 | 346 | 362 | **413** | 682 | 61% |
-| 10240 | 375 | 365 | **399** | 667 | 60% |
+| Size | h1_ms | h2_s3 | h2_s4 | **h2_s5** | cuBLAS | h2_s5/cuBLAS |
+|------|:---:|:---:|:---:|:---:|:---:|:---:|
+| 2048 | 331 | 334 | 343 | **~343** | 566 | ~61% |
+| 3072 | **338** | 315 | 321 | **~330** | 653 | ~51% |
+| 4096 | 374 | 361 | 389 | **427** | 663 | 64% |
+| 5120 | 361 | 353 | 386 | **~395** | 667 | ~59% |
+| 6144 | 341 | 415 | 427 | **435** | 639 | 68% |
+| 7168 | 372 | 415 | 421 | **~430** | 691 | ~62% |
+| 8192 | 368 | 418 | 434 | **441** | 689 | 64% |
+| 9216 | 362 | 415 | 433 | **~438** | 662 | ~66% |
+| 10240 | 365 | 399 | 425 | **433** | 660 | 66% |
 
-Bold = best of our kernels at that size.
+Bold = best of our kernels. (~) = estimated from nearby sizes.
 
 ### Best Configs Selected by Autotuner
 
-**h2_s3:**
+**h2_s5** always picks `BM=256, BN=128, BK=64, WG=2, M_ITERS=2`:
 
-| Size | Config |
-|------|--------|
-| 1024 | WG=2, BN=64, BK=64 |
-| 2048–10240 | WG=2, BN=256, BK=64 |
+| Size | NS |
+|------|----|
+| 4096–6144 | 3 |
+| 8192–10240 | 4 |
+
+**h2_s3** always picks `WG=2, BN=256, BK=64`.
 
 **h1_ms** varies with size (BM=64–256, BN=64–128, BK=32–64, NS=2–4).
+
+### Progression of optimizations
+
+| Step | Kernel | Key addition | 8192 TFLOPS |
+|------|--------|-------------|:-----------:|
+| 1 | tc5_regpruned | Ada baseline on H800 | 362 |
+| 2 | h1_ms | multi-stage cp.async | 368 |
+| 3 | h2_s3 | TMA + wgmma + 2 warpgroups | 418 |
+| 4 | h2_s4 | larger M tile (BM=256, M_ITERS=2) | 434 |
+| 5 | **h2_s5** | **deeper pipeline (NS=4)** | **441** |
+| — | cuBLAS | full Hopper optimization | 689 |
 
 ---
 
@@ -155,8 +187,10 @@ Bold = best of our kernels at that size.
 | h1_ms | multi-stage cp.async pipeline | 382 | 368 |
 | h2_s1 | TMA (no swizzle, mma.sync) | ~188 | ~203 |
 | h2_s2 | TMA + wgmma, BM=64 | ~314 | ~290 |
-| **h2_s3** | **+ 2 warpgroups (BM=128)** | **361** | **415** |
-| cuBLAS | full Hopper optimization | 673 | 695 |
+| h2_s3 | + 2 warpgroups (BM=128) | 361 | 415 |
+| h2_s4 | + M-loop: BM=256, M_ITERS=2 | 389 | 434 |
+| **h2_s5** | **+ NUM_STAGES=3/4 pipeline** | **427** | **441** |
+| cuBLAS | full Hopper optimization | 663 | 689 |
 
 h2_s1 regresses vs tc5 because removing the B XOR swizzle (for correct linear SMEM)
 causes ldmatrix bank conflicts that outweigh TMA's load-instruction savings.
