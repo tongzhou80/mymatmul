@@ -133,6 +133,19 @@ def _tune(M, N, K):
     return best_cfg
 
 
+def _launch_by_name(kname: str, M: int, N: int, K: int) -> torch.Tensor:
+    """Launch a specific named kernel directly — no autotuning. Used by profilers."""
+    cfg = next((c for c in _CONFIGS
+                if _kname(c[0], c[1], c[2], c[3], c[5]) == kname), None)
+    if cfg is None:
+        raise ValueError(f"Kernel {kname!r} not found in _CONFIGS")
+    bm, bn, bk, nw, lb, ns = cfg
+    A = torch.randn(M, K, device='cuda', dtype=torch.bfloat16)
+    B = torch.randn(K, N, device='cuda', dtype=torch.bfloat16)
+    return _launch(_get_mod(lb), kname, A, B,
+                   _block(nw), _grid(M, N, bm, bn), _smem_val(bm, bn, bk, ns))
+
+
 def matmul_h1_ms(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     M, K = A.shape;  _, N = B.shape
     key = (M, N, K)

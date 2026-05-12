@@ -170,6 +170,8 @@ IMPLEMENTATIONS = {
     "h2_s3": ("mymatmul.gpu.hopper.matmul_h2_s3.matmul_h2_s3", None, torch.bfloat16),
     # Hopper H1 multi-stage: tc5_lb + NUM_STAGES ∈ {2,3,4,5} pipeline depth
     "h1_ms": ("mymatmul.gpu.hopper.matmul_h1_ms.matmul_h1_ms", None, torch.bfloat16),
+    # Hopper H3: h1_ms pipeline + wgmma (B128 swizzle, A in regs, B from SMEM)
+    "h3": ("mymatmul.gpu.hopper.matmul_h3.matmul_h3", None, torch.bfloat16),
     "tc6_x4b":       ("mymatmul.gpu.tensor_core.matmul_cuda_tc6_x4b.matmul_tc6_x4b",             None, torch.bfloat16),
     "tc8_4096":     ("mymatmul.gpu.tensor_core.matmul_cuda_tc8_4096.matmul_tc8_4096",             None, torch.bfloat16),
     "tc8_4096_ptx": ("mymatmul.gpu.tensor_core.matmul_cuda_tc8_4096_ptx.matmul_tc8_4096_ptx",   None, torch.bfloat16),

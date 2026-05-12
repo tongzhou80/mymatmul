@@ -55,9 +55,40 @@ METRICS = {
 }
 
 
+# Mapping from CUDA kernel name prefix → bench_gpu impl name, for Hopper kernels
+# that don't use the matmul_cuda_<prefix>_* convention.
+_HOPPER_PREFIX_MAP = {
+    "matmul_h1ms": "h1_ms",
+    "matmul_h2s1": "h2_s1",
+    "matmul_h2s2": "h2_s2",
+    "matmul_h2s3": "h2_s3",
+}
+
+
+def _hopper_impl_name(kname: str) -> str | None:
+    """Return the bench_gpu impl name for a Hopper kernel, or None."""
+    for prefix, impl in _HOPPER_PREFIX_MAP.items():
+        if kname.startswith(prefix + "_"):
+            return impl
+    return None
+
+
 def find_impl(kname: str, all_i: dict):
     """Return (impl_name, module_path, dtype_str) for a kernel name or CUDA kernel name."""
     import torch
+
+    # Hopper kernels: matmul_h1ms_*, matmul_h2s3_*, etc.
+    hopper_impl = _hopper_impl_name(kname)
+    if hopper_impl:
+        entry = all_i.get(hopper_impl)
+        if entry is None:
+            return None
+        dotpath, _, dtype = entry
+        module_path = dotpath.rsplit(".", 1)[0]
+        dtype_str = "torch.bfloat16" if dtype == torch.bfloat16 else "torch.float32"
+        return hopper_impl, module_path, dtype_str
+
+    # Legacy kernels: matmul_cuda_<prefix>_* or bare <prefix>
     stem = kname[len("matmul_cuda_"):] if kname.startswith("matmul_cuda_") else kname
     prefix = stem.split("_")[0]
     entry = all_i.get(prefix)
@@ -71,7 +102,21 @@ def find_impl(kname: str, all_i: dict):
 
 def make_target_script(module_path: str, kname: str, size: int, path: str, dtype: str) -> None:
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    script = f"""\
+
+    # Hopper-style modules expose _launch_by_name(kname, M, N, K) — use that.
+    # This is detected by checking if the kernel name has a Hopper prefix.
+    if _hopper_impl_name(kname):
+        script = f"""\
+import sys
+sys.path.insert(0, {repr(repo_root)})
+import torch, importlib
+_mod = importlib.import_module({repr(module_path)})
+_mod._launch_by_name({repr(kname)}, {size}, {size}, {size})
+torch.cuda.synchronize()
+"""
+    else:
+        # Legacy pycuda path (tc5, tc6, tc7, s6_lb, …)
+        script = f"""\
 import sys, inspect
 sys.path.insert(0, {repr(repo_root)})
 import torch, importlib
@@ -142,8 +187,11 @@ def parse_ncu_csv(csv_text: str, kname: str) -> dict:
 
 
 def profile_one(module_path: str, kname: str, size: int, dtype: str) -> dict | None:
-    # NCU and _CONFIGS both use the full "matmul_cuda_" prefixed name.
-    full_kname = kname if kname.startswith("matmul_cuda_") else f"matmul_cuda_{kname}"
+    # Hopper kernels already carry their full name; legacy kernels need "matmul_cuda_" prepended.
+    if _hopper_impl_name(kname):
+        full_kname = kname
+    else:
+        full_kname = kname if kname.startswith("matmul_cuda_") else f"matmul_cuda_{kname}"
     with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as f:
         tmp = f.name
     try:
