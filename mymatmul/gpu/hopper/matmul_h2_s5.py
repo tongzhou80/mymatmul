@@ -1,12 +1,11 @@
-"""H2 Stage 4: Stage 3 + M-dimension loop per warpgroup (larger BM tiles).
+"""H2 Stage 5: Stage 4 + tunable NUM_STAGES pipeline depth.
 
-Key change vs H2-S3:
-  BM is now a free parameter (not locked to NUM_WG*64).
-  M_ITERS = BM / (NUM_WG * 64): each warpgroup issues M_ITERS wgmma calls
-  per kk step, each covering the next 64 M-rows.
+Key change vs H2-S4:
+  NS ∈ {2, 3, 4} — deeper pipelines keep more TMA transfers in flight,
+  hiding the mbarrier::wait latency that dominates h2_s4.
 
-  BM=256, NUM_WG=2 → M_ITERS=2: 2× arithmetic intensity vs h2_s3 (BM=128)
-  for the same BN/BK, using ~128 KB SMEM vs ~96 KB.
+  NS=3 example with BM=256, BN=128, BK=64:
+    SMEM = 3×(256×64 + 64×128)×2 = 147 KB  (within 200 KB)
 """
 
 import ctypes, os, subprocess, threading, atexit
@@ -39,10 +38,10 @@ def _chk(err, op=""):
 # ── Compilation ───────────────────────────────────────────────────────────────
 
 _HOPPER_DIR = os.path.dirname(os.path.abspath(__file__))
-_CU_PATH    = os.path.join(_HOPPER_DIR, "_matmul_h2_s4.cu")
+_CU_PATH    = os.path.join(_HOPPER_DIR, "_matmul_h2_s5.cu")
 _NVCC       = "/usr/local/cuda/bin/nvcc"
 _ARCH       = "sm_90a"
-_CUBIN      = os.path.join(_HOPPER_DIR, f"_matmul_h2s4_{_ARCH}.cubin")
+_CUBIN      = os.path.join(_HOPPER_DIR, f"_matmul_h2s5_{_ARCH}.cubin")
 
 _mod_lock = threading.Lock()
 _module   = None
@@ -53,7 +52,7 @@ def _get_mod():
         if _module is not None: return _module
         _ensure_ctx()
         if not os.path.exists(_CUBIN) or os.path.getmtime(_CU_PATH) > os.path.getmtime(_CUBIN):
-            print(f"[h2s4] compiling for {_ARCH} ...", end=" ", flush=True)
+            print(f"[h2s5] compiling for {_ARCH} ...", end=" ", flush=True)
             cmd = [_NVCC, f"-arch={_ARCH}", "-O3", "--std=c++17", "--cubin",
                    "-DLB_MIN_BLOCKS=1", _CU_PATH, "-o", _CUBIN]
             r = subprocess.run(cmd, capture_output=True, text=True)
@@ -87,10 +86,11 @@ def _make_tma_desc(ptr_int, nrows, ncols, box_rows, box_cols, swizzle):
 
 # ── Config space ──────────────────────────────────────────────────────────────
 
-_BMS  = [64, 128, 256]   # NEW: BM can now be 128 or 256 (M_ITERS > 1)
+_BMS  = [64, 128, 256]
 _BNS  = [64, 128, 256]
 _BKS  = [16, 32, 64]
 _NWS  = [1, 2]
+_NSS  = [2, 3, 4]          # pipeline stages
 _MAX_SMEM = 200 * 1024
 
 DTYPE = torch.bfloat16
@@ -98,25 +98,26 @@ DTYPE = torch.bfloat16
 
 def _m_iters(bm, nwg): return bm // (nwg * 64)
 
-def _smem(bm, bn, bk):
-    return (2 * bm * bk + 2 * bk * bn) * 2 + 16   # 2-stage + 2 mbarriers
+def _smem(bm, bn, bk, ns):
+    return (ns * bm * bk + ns * bk * bn) * 2 + ns * 8  # NS stages + NS mbarriers
 
 def _reg_estimate(bm, bn, bk, nwg):
     mi = _m_iters(bm, nwg)
-    return mi * (bn // 2) + 20               # acc[M_ITERS][BN/2] + misc
+    return mi * (bn // 2) + 20
 
 
 _CONFIGS = [
-    (bm, bn, bk, nwg)
-    for bm in _BMS for bn in _BNS for bk in _BKS for nwg in _NWS
-    if bm % (nwg * 64) == 0                         # M_ITERS is integer
-    and _smem(bm, bn, bk) <= _MAX_SMEM
-    and _reg_estimate(bm, bn, bk, nwg) <= 512        # fits in 512 regs (LB=1, 128 threads)
+    (bm, bn, bk, nwg, ns)
+    for bm in _BMS for bn in _BNS for bk in _BKS
+    for nwg in _NWS for ns in _NSS
+    if bm % (nwg * 64) == 0
+    and _smem(bm, bn, bk, ns) <= _MAX_SMEM
+    and _reg_estimate(bm, bn, bk, nwg) <= 512
 ]
 
 
-def _kname(bm, bn, bk, nwg):
-    return f"matmul_h2s4_bm{bm}_bn{bn}_bk{bk}_wg{nwg}"
+def _kname(bm, bn, bk, nwg, ns):
+    return f"matmul_h2s5_bm{bm}_bn{bn}_bk{bk}_wg{nwg}_ns{ns}"
 
 # ── Launch ────────────────────────────────────────────────────────────────────
 
@@ -131,11 +132,11 @@ def _set_max_smem(fn, sb):
     _chk(err, "cuFuncSetAttribute")
 
 
-def _launch(mod, kname, A, B, bm, bn, bk, nwg):
+def _launch(mod, kname, A, B, bm, bn, bk, nwg, ns):
     M, K = A.shape;  _, N = B.shape
     C = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
     fn = _get_fn(mod, kname)
-    sb = _smem(bm, bn, bk)
+    sb = _smem(bm, bn, bk, ns)
     _set_max_smem(fn, sb)
     # A: boxDim = [bk, bm] — bm is now the full M tile (may be 256)
     # B: boxDim = [64, bk] — 128B swizzle, BN/64 sub-tiles per stage
@@ -157,10 +158,10 @@ def _launch_by_name(kname: str, M: int, N: int, K: int) -> torch.Tensor:
     cfg = next((c for c in _CONFIGS if _kname(*c) == kname), None)
     if cfg is None:
         raise ValueError(f"Kernel {kname!r} not found in _CONFIGS")
-    bm, bn, bk, nwg = cfg
+    bm, bn, bk, nwg, ns = cfg
     A = torch.randn(M, K, device='cuda', dtype=torch.bfloat16)
     B = torch.randn(K, N, device='cuda', dtype=torch.bfloat16)
-    return _launch(_get_mod(), kname, A, B, bm, bn, bk, nwg)
+    return _launch(_get_mod(), kname, A, B, bm, bn, bk, nwg, ns)
 
 # ── Autotuner ─────────────────────────────────────────────────────────────────
 
@@ -171,48 +172,39 @@ def _tune(M, N, K):
     A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     B = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
     mod = _get_mod()
-    cfgs = [(bm, bn, bk, nwg) for bm, bn, bk, nwg in _CONFIGS
-            if M % bm == 0 and N % bn == 0 and K % bk == 0]
+    cfgs = [(bm, bn, bk, nwg, ns) for bm, bn, bk, nwg, ns in _CONFIGS
+            if M % bm == 0 and N % bn == 0 and K % bk == 0
+            and K // bk >= ns]
     best_t, best = float("inf"), cfgs[0]
-    for i, (bm, bn, bk, nwg) in enumerate(cfgs):
-        kn = _kname(bm, bn, bk, nwg)
+    for i, (bm, bn, bk, nwg, ns) in enumerate(cfgs):
+        kn = _kname(bm, bn, bk, nwg, ns)
         try:
             _, ms, _ = triton.testing.do_bench(
-                lambda bm=bm,bn=bn,bk=bk,nwg=nwg,kn=kn:
-                    _launch(mod, kn, A, B, bm, bn, bk, nwg),
+                lambda bm=bm,bn=bn,bk=bk,nwg=nwg,ns=ns,kn=kn:
+                    _launch(mod, kn, A, B, bm, bn, bk, nwg, ns),
                 warmup=10, rep=50, quantiles=(0.5, 0.0, 1.0))
         except Exception as e:
             print(f"  [{i+1}/{len(cfgs)}] {kn} FAILED: {e}"); continue
         tf = 2 * M * N * K / (ms / 1e3) / 1e12
         mi = _m_iters(bm, nwg)
         print(f"  [{i+1:3d}/{len(cfgs)}] BM={bm:3d} BN={bn:3d} BK={bk:2d} "
-              f"WG={nwg} M_ITERS={mi}  {tf:6.1f} TFLOPS")
+              f"WG={nwg} NS={ns} M_ITERS={mi}  {tf:6.1f} TFLOPS")
         if ms < best_t:
-            best_t, best = ms, (bm, bn, bk, nwg)
+            best_t, best = ms, (bm, bn, bk, nwg, ns)
     return best
 
 
-def _launch_by_name(kname: str, M: int, N: int, K: int) -> torch.Tensor:
-    """Launch a specific named kernel directly — used by profilers."""
-    cfg = next((c for c in _CONFIGS if _kname(*c) == kname), None)
-    if cfg is None:
-        raise ValueError(f"Kernel {kname!r} not found in _CONFIGS")
-    bm, bn, bk, nwg = cfg
-    A = torch.randn(M, K, device='cuda', dtype=torch.bfloat16)
-    B = torch.randn(K, N, device='cuda', dtype=torch.bfloat16)
-    return _launch(_get_mod(), kname, A, B, bm, bn, bk, nwg)
-
-
-def matmul_h2_s4(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+def matmul_h2_s5(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     M, K = A.shape;  _, N = B.shape
     key = (M, N, K)
     if key not in _best:
-        cfgs = [(bm, bn, bk, nwg) for bm, bn, bk, nwg in _CONFIGS
-                if M % bm == 0 and N % bn == 0 and K % bk == 0]
-        print(f"[h2_s4] autotuning {M}×{N}×{K} over {len(cfgs)} configs ...")
+        cfgs = [(bm, bn, bk, nwg, ns) for bm, bn, bk, nwg, ns in _CONFIGS
+                if M % bm == 0 and N % bn == 0 and K % bk == 0
+                and K // bk >= ns]
+        print(f"[h2_s5] autotuning {M}×{N}×{K} over {len(cfgs)} configs ...")
         _best[key] = _tune(M, N, K)
-        bm, bn, bk, nwg = _best[key]
+        bm, bn, bk, nwg, ns = _best[key]
         mi = _m_iters(bm, nwg)
-        print(f"[h2_s4] best: BM={bm} BN={bn} BK={bk} WG={nwg} M_ITERS={mi}")
-    bm, bn, bk, nwg = _best[key]
-    return _launch(_get_mod(), _kname(bm, bn, bk, nwg), A, B, bm, bn, bk, nwg)
+        print(f"[h2_s5] best: BM={bm} BN={bn} BK={bk} WG={nwg} NS={ns} M_ITERS={mi}")
+    bm, bn, bk, nwg, ns = _best[key]
+    return _launch(_get_mod(), _kname(bm, bn, bk, nwg, ns), A, B, bm, bn, bk, nwg, ns)

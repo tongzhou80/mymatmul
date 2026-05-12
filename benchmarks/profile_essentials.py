@@ -62,6 +62,8 @@ _HOPPER_PREFIX_MAP = {
     "matmul_h2s1": "h2_s1",
     "matmul_h2s2": "h2_s2",
     "matmul_h2s3": "h2_s3",
+    "matmul_h2s4": "h2_s4",
+    "matmul_h3":   "h3",
 }
 
 

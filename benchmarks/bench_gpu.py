@@ -174,6 +174,9 @@ IMPLEMENTATIONS = {
     "h3": ("mymatmul.gpu.hopper.matmul_h3.matmul_h3", None, torch.bfloat16),
     # Hopper H2-S4: h2_s3 + M-loop per warpgroup (BM up to 256, M_ITERS up to 4)
     "h2_s4": ("mymatmul.gpu.hopper.matmul_h2_s4.matmul_h2_s4", None, torch.bfloat16),
+    "h2s4":  ("mymatmul.gpu.hopper.matmul_h2_s4.matmul_h2_s4", None, torch.bfloat16),
+    # Hopper H2-S5: h2_s4 + tunable NUM_STAGES ∈ {2,3,4}
+    "h2_s5": ("mymatmul.gpu.hopper.matmul_h2_s5.matmul_h2_s5", None, torch.bfloat16),
     "tc6_x4b":       ("mymatmul.gpu.tensor_core.matmul_cuda_tc6_x4b.matmul_tc6_x4b",             None, torch.bfloat16),
     "tc8_4096":     ("mymatmul.gpu.tensor_core.matmul_cuda_tc8_4096.matmul_tc8_4096",             None, torch.bfloat16),
     "tc8_4096_ptx": ("mymatmul.gpu.tensor_core.matmul_cuda_tc8_4096_ptx.matmul_tc8_4096_ptx",   None, torch.bfloat16),
