@@ -3,21 +3,29 @@
 #include <cuda_bf16.h>
 
 /*
- * H2 Stage 4: Stage 3 + M-dimension loop per warpgroup.
+ * H2 Stage 4: TMA + wgmma + M-dimension loop (BM up to 256, M_ITERS up to 4).
  *
- * Key change vs H2-S3:
- *   BM is now a free parameter, not locked to NUM_WG * 64.
- *   M_ITERS = BM / (NUM_WG * 64) — each warpgroup does M_ITERS wgmma calls
- *   per kk step, each covering its next 64 M-rows.
+ * ── Three hardware engines, three coordination problems ──────────────────────
  *
- * With BM=256, NUM_WG=2 (M_ITERS=2, 256 threads):
- *   - warpgroup 0 owns rows [0,128), warpgroup 1 owns rows [128,256).
- *   - Each warpgroup issues 2 wgmma calls per kk step (rows 0..63, 64..127
- *     within its 128-row slice) sharing the same B descriptor.
- *   - Accumulator: float acc[M_ITERS][BN/2] per thread.
- *   - Arithmetic intensity ~ 2× vs h2_s3 (BM=128) for same BN/BK.
+ *   ┌────────────┐  doorbell (mbarrier)  ┌──────────────────┐
+ *   │ TMA engine │ ──── rings when ────► │  Warp execution  │
+ *   │ (DMA unit) │      data arrives     │  (ldmatrix, ctrl)│
+ *   └────────────┘                       └────────┬─────────┘
+ *        │  writes SMEM                           │ issues wgmma calls
+ *        │                    fence.proxy.async   ▼
+ *        └──────────────────────────────► ┌──────────────┐
+ *              makes writes visible to    │ Tensor core  │
+ *              wgmma's async SMEM view    │  (wgmma unit)│
+ *                                         └──────────────┘
  *
- * Everything else (TMA, mbarrier, B sub-tiles, descriptor) unchanged.
+ * ── 2-stage double-buffer pipeline ──────────────────────────────────────────
+ *   Slot 0 and slot 1 alternate: while wgmma computes slot k%2, TMA loads
+ *   slot (k+1)%2. Doorbell per slot signals when TMA delivery is complete.
+ *
+ * ── M-loop: BM / (NUM_WG * 64) wgmma calls per warpgroup per kk step ────────
+ *   Each call covers the next 64 M-rows. All calls share the same B descriptor.
+ *   acc[M_ITERS][BN/2] holds the partial sums for all M-slices.
+ *
  * Compiled with -arch=sm_90a, single cubin LB=1.
  */
 
@@ -25,45 +33,63 @@
 #define LB_MIN_BLOCKS 1
 #endif
 
-// ── Reuse TMA / mbarrier helpers from S1 ─────────────────────────────────────
-
 struct alignas(64) TmaDesc { uint64_t opaque[16]; };
 
-__device__ __forceinline__ void mbar_init(uint64_t* mbar, uint32_t count) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n"
-                 :: "r"((uint32_t)__cvta_generic_to_shared(mbar)), "r"(count) : "memory");
+// ── Doorbell (mbarrier): hardware signal between TMA engine and warps ─────────
+
+__device__ __forceinline__ void doorbell_reset(uint64_t* db) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n"
+                 :: "r"((uint32_t)__cvta_generic_to_shared(db)) : "memory");
 }
 
-__device__ __forceinline__ void mbar_arrive_expect_tx(uint64_t* mbar, uint32_t tx_bytes) {
-    uint32_t addr = (uint32_t)__cvta_generic_to_shared(mbar);
-    uint64_t state;
+__device__ __forceinline__ void doorbell_arm_tma(uint64_t* db, uint32_t bytes_expected) {
+    uint32_t addr = (uint32_t)__cvta_generic_to_shared(db);
+    uint64_t token;
     asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 %0, [%1], %2;\n"
-                 : "=l"(state) : "r"(addr), "r"(tx_bytes) : "memory");
+                 : "=l"(token) : "r"(addr), "r"(bytes_expected) : "memory");
 }
 
-__device__ __forceinline__ void mbar_wait(uint64_t* mbar, uint32_t phase) {
-    uint32_t done = 0, addr = (uint32_t)__cvta_generic_to_shared(mbar);
+__device__ __forceinline__ void doorbell_wait(uint64_t* db) {
+    uint32_t done = 0, addr = (uint32_t)__cvta_generic_to_shared(db);
     while (!done) {
         asm volatile("{\n.reg .pred P;\n"
-                     "mbarrier.test_wait.parity.acquire.cta.shared::cta.b64 P, [%1], %2;\n"
+                     "mbarrier.test_wait.parity.acquire.cta.shared::cta.b64 P, [%1], 0;\n"
                      "selp.u32 %0, 1, 0, P;\n}\n"
-                     : "=r"(done) : "r"(addr), "r"(phase) : "memory");
+                     : "=r"(done) : "r"(addr) : "memory");
     }
 }
 
-__device__ __forceinline__ void tma_load_2d(
-    const TmaDesc* desc, void* smem_ptr, uint64_t* mbar, int32_t coord0, int32_t coord1
+// ── TMA tile load: DMA engine pulls one A+B tile from HBM into SMEM ──────────
+
+__device__ __forceinline__ void tma_load_tile(
+    const TmaDesc* desc, void* smem_ptr, uint64_t* db, int32_t coord0, int32_t coord1
 ) {
-    uint32_t dst  = (uint32_t)__cvta_generic_to_shared(smem_ptr);
-    uint32_t mbar_addr = (uint32_t)__cvta_generic_to_shared(mbar);
+    uint32_t dst = (uint32_t)__cvta_generic_to_shared(smem_ptr);
+    uint32_t db_addr = (uint32_t)__cvta_generic_to_shared(db);
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cluster.global"
         ".tile.mbarrier::complete_tx::bytes [%0], [%1, {%3, %4}], [%2];\n"
-        : : "r"(dst), "l"((unsigned long long)desc), "r"(mbar_addr),
-            "r"(coord0), "r"(coord1) : "memory");
+        :: "r"(dst), "l"((unsigned long long)desc), "r"(db_addr),
+           "r"(coord0), "r"(coord1) : "memory");
 }
 
-// ── ldmatrix for A (unchanged from tc5_lb) ────────────────────────────────────
+// ── wgmma coordination ────────────────────────────────────────────────────────
+//   wgmma_begin():  fence.proxy.async (TMA→async-proxy) + wgmma.fence (regs→wgmma)
+//   wgmma_commit(): submit wgmma batch to tensor core engine
+//   wgmma_drain():  block until acc[] registers are ready
+
+__device__ __forceinline__ void wgmma_begin()  {
+    asm volatile("fence.proxy.async;\n"         ::: "memory");
+    asm volatile("wgmma.fence.sync.aligned;\n"  ::: "memory");
+}
+__device__ __forceinline__ void wgmma_commit() {
+    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+}
+__device__ __forceinline__ void wgmma_drain()  {
+    asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+}
+
+// ── ldmatrix: load A fragment from SMEM into registers ───────────────────────
 
 __device__ __forceinline__ void ldmatrix_x4(
     uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, uint32_t smem_ptr
@@ -239,95 +265,71 @@ __device__ __forceinline__ void h2s4_impl(
     constexpr int K_STEP_BYTES = 16 * SUBTILE_COL * 2;       // = 2048: bytes per kk advance
     // (For BN==64, sub-tile stride = BK*128 = BK*K_STEP_BYTES/16 = ... but only one sub-tile)
 
-    // ── Prologue ──────────────────────────────────────────────────────────────
+    // ── LOAD_TILE: thread 0 arms doorbell then tells TMA to deliver the tile ────
+#define LOAD_TILE(slot_, k_start_)                                                  \
+    do {                                                                            \
+        doorbell_arm_tma(&mbar[(slot_)], (BM * BK + BK * BN) * 2);                \
+        tma_load_tile(&tma_A, &A_sh[(slot_)][0][0], &mbar[(slot_)],               \
+                      (k_start_), block_row);                                       \
+        _Pragma("unroll")                                                           \
+        for (int _i = 0; _i < BN / SUBTILE_COL; _i++) {                            \
+            void* _b = (char*)(&B_sh[(slot_)][0][0]) + _i * BK * SUBTILE_COL * 2; \
+            tma_load_tile(&tma_B, _b, &mbar[(slot_)],                              \
+                          block_col + _i * SUBTILE_COL, (k_start_));               \
+        }                                                                           \
+    } while (0)
+
+    // ── MULTIPLY_TILE: compute acc += A[slot] × B[slot] ──────────────────────
+#define MULTIPLY_TILE(slot_)                                                        \
+    do {                                                                            \
+        wgmma_begin();                   /* bridge TMA→async-proxy, regs→wgmma */  \
+        _Pragma("unroll")                                                           \
+        for (int _kk = 0; _kk < BK / 16; _kk++) {                                 \
+            uint32_t _bb = (uint32_t)__cvta_generic_to_shared(&B_sh[(slot_)][0][0]);\
+            uint64_t _db = make_wgmma_b_desc<BN,BK>(_bb + _kk * K_STEP_BYTES);    \
+            _Pragma("unroll")                                                       \
+            for (int _m = 0; _m < M_ITERS; _m++) {                                 \
+                uint32_t _a[4];                                                     \
+                const int _ar  = wg_id*M_PER_WG + _m*64 + local_warp*16+(lane%16);\
+                const int _alg = _kk*2 + (lane/16);                                \
+                const int _aph = (A_SWZ_PERIOD>0) ? (_alg^(_ar%A_SWZ_PERIOD)):_alg;\
+                ldmatrix_x4(_a[0],_a[1],_a[2],_a[3],                              \
+                    (uint32_t)__cvta_generic_to_shared(&A_sh[(slot_)][_ar][_aph*8]));\
+                wgmma_call<BN>((float*)acc[_m], _a, _db);  /* acc += A × B */      \
+            }                                                                       \
+        }                                                                           \
+        wgmma_commit();                  /* submit batch to tensor core engine */   \
+        wgmma_drain();                   /* acc[] ready; slot SMEM safe to reuse */ \
+    } while (0)
+
+    // ── Prologue: install 2 doorbells, prefill slot 0 ────────────────────────
     if (tid == 0) {
-        mbar_init(&mbar[0], 1); mbar_init(&mbar[1], 1);
-        mbar_arrive_expect_tx(&mbar[0], (BM * BK + BK * BN) * 2);
-        tma_load_2d(&tma_A, &A_sh[0][0][0], &mbar[0], /*col=*/0, /*row=*/block_row);
-        // Load BN/64 sub-tiles of B (each 64 columns wide, BK rows tall)
-        #pragma unroll
-        for (int i = 0; i < BN / SUBTILE_COL; i++) {
-            void* b_dst = (char*)(&B_sh[0][0][0]) + i * BK * SUBTILE_COL * 2;
-            tma_load_2d(&tma_B, b_dst, &mbar[0], block_col + i * SUBTILE_COL, /*row=*/0);
-        }
+        doorbell_reset(&mbar[0]); doorbell_reset(&mbar[1]);
+        LOAD_TILE(0, 0);
     }
     __syncthreads();
 
-    // ── Main K loop ───────────────────────────────────────────────────────────
+    // ── Main K loop: 2-stage double buffer ───────────────────────────────────
     for (int k = 0; k < num_tiles - 1; k++) {
         const int cur = k & 1, nxt = 1 - cur;
 
         if (tid == 0) {
-            mbar_init(&mbar[nxt], 1);
-            mbar_arrive_expect_tx(&mbar[nxt], (BM * BK + BK * BN) * 2);
-            tma_load_2d(&tma_A, &A_sh[nxt][0][0], &mbar[nxt], (k+1)*BK, block_row);
-            #pragma unroll
-            for (int i = 0; i < BN / SUBTILE_COL; i++) {
-                void* b_dst = (char*)(&B_sh[nxt][0][0]) + i * BK * SUBTILE_COL * 2;
-                tma_load_2d(&tma_B, b_dst, &mbar[nxt], block_col + i * SUBTILE_COL, (k+1)*BK);
-            }
+            doorbell_reset(&mbar[nxt]);   // arm nxt for reuse
+            LOAD_TILE(nxt, (k + 1) * BK);
         }
 
-        mbar_wait(&mbar[cur], 0);
-
-        // Make SMEM visible to async proxy, then fence wgmma register state.
-        asm volatile("fence.proxy.async;\n" ::: "memory");
-        asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-
-        // Inner BK/16 wgmma steps, with M_ITERS per kk.
-        // B descriptor is the same for all m-iterations (same K-slice, same N tile).
-        // A changes per m-iteration (different 64-row slice within the warpgroup's range).
-        #pragma unroll
-        for (int kk = 0; kk < BK / 16; kk++) {
-            uint32_t b_base = (uint32_t)__cvta_generic_to_shared(&B_sh[cur][0][0]);
-            uint64_t desc_b = make_wgmma_b_desc<BN, BK>(b_base + kk * K_STEP_BYTES);
-            #pragma unroll
-            for (int m = 0; m < M_ITERS; m++) {
-                uint32_t a[4];
-                const int a_row     = wg_id * M_PER_WG + m * 64
-                                      + local_warp * 16 + (lane % 16);
-                const int a_col_log  = kk * 2 + (lane / 16);
-                const int a_col_phys = (A_SWZ_PERIOD > 0)
-                    ? (a_col_log ^ (a_row % A_SWZ_PERIOD)) : a_col_log;
-                ldmatrix_x4(a[0], a[1], a[2], a[3],
-                    (uint32_t)__cvta_generic_to_shared(&A_sh[cur][a_row][a_col_phys * 8]));
-                wgmma_call<BN>((float*)acc[m], a, desc_b);
-            }
-        }
-
-        asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-        asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
-
+        doorbell_wait(&mbar[cur]);    // wait: cur tile is in SMEM
+        MULTIPLY_TILE(cur);           // compute: acc += A[cur] × B[cur]
         __syncthreads();
     }
 
     // ── Epilogue: last tile ───────────────────────────────────────────────────
     const int last = (num_tiles - 1) & 1;
-    mbar_wait(&mbar[last], 0);
+    doorbell_wait(&mbar[last]);
+    MULTIPLY_TILE(last);
 
-    asm volatile("fence.proxy.async;\n" ::: "memory");
-    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-
-    #pragma unroll
-    for (int kk = 0; kk < BK / 16; kk++) {
-        uint32_t b_base_last = (uint32_t)__cvta_generic_to_shared(&B_sh[last][0][0]);
-        uint64_t desc_b = make_wgmma_b_desc<BN, BK>(b_base_last + kk * K_STEP_BYTES);
-        #pragma unroll
-        for (int m = 0; m < M_ITERS; m++) {
-            uint32_t a[4];
-            const int a_row      = wg_id * M_PER_WG + m * 64
-                                   + local_warp * 16 + (lane % 16);
-            const int a_col_log  = kk * 2 + (lane / 16);
-            const int a_col_phys = (A_SWZ_PERIOD > 0)
-                ? (a_col_log ^ (a_row % A_SWZ_PERIOD)) : a_col_log;
-            ldmatrix_x4(a[0], a[1], a[2], a[3],
-                (uint32_t)__cvta_generic_to_shared(&A_sh[last][a_row][a_col_phys * 8]));
-            wgmma_call<BN>((float*)acc[m], a, desc_b);
-        }
-    }
-
-    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-    asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+#undef LOAD_TILE
+#undef MULTIPLY_TILE
 
     // ── Write accumulators to C ───────────────────────────────────────────────
     // Same wgmma output layout as h2_s3, now wrapped in an m-iteration loop.
