@@ -118,7 +118,7 @@ H800, motivating Hopper-specific optimizations.
 - Doubles SMEM usage for A vs h2_s3, raising arithmetic intensity.
 - 2-stage pipeline (NS hardcoded).
 
-### h2_s5 — TMA + wgmma + M-loop + NUM_STAGES (canonical Hopper kernel)
+### h2_s5 — TMA + wgmma + M-loop + NUM_STAGES
 `matmul_h2_s5.py` / `_matmul_h2_s5.cu`
 
 - Extends h2_s4: `NUM_STAGES ∈ {2, 3, 4}` is now a tunable template parameter.
@@ -126,54 +126,91 @@ H800, motivating Hopper-specific optimizations.
 - SMEM: `A[NS][BM][BK]`, `B[NS][BK][BN]`, `mbar[NS]`.
 - Prologue issues `NS-1` tiles; main loop issues one tile per iteration;
   drain (unrolled) processes the last `NS-1` tiles.
-- **This is the current best Hopper kernel**: TMA + wgmma + M-loop + multi-stage.
+- Profiling: 26% membar stalls (mbarrier::wait), 186 regs/thread.
+
+### h2_s6 — cp.async + wgmma SS mode
+`matmul_h2_s6.py` / `_matmul_h2_s6.cu`
+
+Inspired by Triton PTX analysis showing Triton uses cp.async (not TMA) + wgmma SS mode.
+
+- **SS mode**: both A and B read from SMEM via `GmmaDescriptor` — no `ldmatrix` for A.
+  A descriptor: `layout_type=B32/B64/B128` (for BK=16/32/64), `LBO=0`, `SBO=BK`.
+  Extra `transA=0` parameter in wgmma PTX vs RS mode.
+- **A swizzle** now works for all BK: XOR formula `(col/8) ^ ((row/(64/BK)) % (BK/8))`,
+  same as h1_ms. In RS mode only BK=64 worked (B64/B32 XOR broke ldmatrix 16B alignment).
+- **B sub-tile format**: `[NS][BN/64][BK][64]` with `row%8` XOR per sub-tile (same as h2_s5).
+- Replaces TMA+mbarrier with `cp.async` + `__pipeline_wait_prior` — simpler synchronisation.
+- Result: **slower than h2_s5** (383–407 vs 427–441 TFLOPS). More membar stalls (40% vs 26%)
+  from `__pipeline_wait_prior`, and SS mode uses more registers (202 vs 186) due to
+  descriptor intermediates being kept live across unrolled kk iterations.
+
+### h2_s7 — cp.async + wgmma SS + wgmma.wait_group 1
+`matmul_h2_s7.py` / `_matmul_h2_s7.cu`
+
+Key insight from Triton PTX reverse-engineering: `wgmma.wait_group 1` instead of 0.
+
+- After committing wgmma group k, only wait for group k-1. Group k stays in the tensor
+  core pipeline while cp.async loads the next tile. Both run concurrently.
+- `wgmma.fence` at the start of each tile acts as the acc[] ordering barrier — the
+  hardware serialises group k+1's reads of acc after group k's writes, without the CPU
+  having to wait for group k to finish.
+- **ISSUE placed after `wait_group 1`** (not before compute): `wait_group 1` at iter k
+  proves wgmma[k-1] has released its SMEM slot `(k-1)%NS`, making it safe to overwrite.
+- Loop restructured: `wait_prior(NS-2)` instead of `(NS-1)` to guarantee the current
+  tile is ready even though ISSUE moved to the end of the iteration.
+- **`wgmma.wait_group 0` only at the epilogue** to drain the final group.
+- Best config: `BM=128, BN=256, BK=64, WG=2, NS=3` (M_ITERS=1).
+
+### triton_ptx — pre-compiled Triton BF16 kernel
+`matmul_triton_ptx.py`
+
+Triton's best Hopper BF16 kernel loaded directly from PTX: BM=128, BN=256, BK=32, NS=4, NW=8.
+Uses `ptxas` to compile to cubin; launched via `cuLaunchKernel`. Beats cuBLAS at large N.
+Used as a reference target for reverse-engineering.
 
 ---
 
 ## Benchmark Results (H800 GPU2, BF16, square M=K=N)
 
-Measurement: `triton.testing.do_bench` (warmup 100ms, timed 500ms), best (min) time.
+Measurement: `triton.testing.do_bench` (warmup 10 reps, timed 50 reps), median time.
 All TFLOPS = 2·M·N·K / time.
 
 ### Performance (TFLOPS)
 
-| Size | h1_ms | h2_s3 | h2_s4 | **h2_s5** | cuBLAS | h2_s5/cuBLAS |
-|------|:---:|:---:|:---:|:---:|:---:|:---:|
-| 2048 | 331 | 334 | 343 | **~343** | 566 | ~61% |
-| 3072 | **338** | 315 | 321 | **~330** | 653 | ~51% |
-| 4096 | 374 | 361 | 389 | **427** | 663 | 64% |
-| 5120 | 361 | 353 | 386 | **~395** | 667 | ~59% |
-| 6144 | 341 | 415 | 427 | **435** | 639 | 68% |
-| 7168 | 372 | 415 | 421 | **~430** | 691 | ~62% |
-| 8192 | 368 | 418 | 434 | **441** | 689 | 64% |
-| 9216 | 362 | 415 | 433 | **~438** | 662 | ~66% |
-| 10240 | 365 | 399 | 425 | **433** | 660 | 66% |
+| Size | h2_s5 | h2_s6 | **h2_s7** | Triton PTX | cuBLAS BF16 | h2_s7/cuBLAS |
+|------|:-----:|:-----:|:---------:|:----------:|:-----------:|:------------:|
+| 4096 | 427 | 407 | **574** | 677 | 672 | 85% |
+| 6144 | 436 | 386 | **560** | 686 | 681 | 82% |
+| 8192 | 440 | 397 | **586** | 697 | 694 | 84% |
+| 10240 | 439 | 383 | **585** | 712 | 687 | 85% |
 
-Bold = best of our kernels. (~) = estimated from nearby sizes.
+Triton PTX = pre-compiled Triton kernel (BM=128, BN=256, BK=32, NS=4, NW=8).
+h2_s6 is slower than h2_s5 despite SS mode — see observations below.
 
 ### Best Configs Selected by Autotuner
 
-**h2_s5** always picks `BM=256, BN=128, BK=64, WG=2, M_ITERS=2`:
+**h2_s7**: always `BM=128, BN=256, BK=64, WG=2, NS=3` (M_ITERS=1).
+
+**h2_s5**: always `BM=256, BN=128, BK=64, WG=2, M_ITERS=2`:
 
 | Size | NS |
 |------|----|
 | 4096–6144 | 3 |
 | 8192–10240 | 4 |
 
-**h2_s3** always picks `WG=2, BN=256, BK=64`.
-
-**h1_ms** varies with size (BM=64–256, BN=64–128, BK=32–64, NS=2–4).
-
 ### Progression of optimizations
 
-| Step | Kernel | Key addition | 8192 TFLOPS |
-|------|--------|-------------|:-----------:|
-| 1 | tc5_regpruned | Ada baseline on H800 | 362 |
-| 2 | h1_ms | multi-stage cp.async | 368 |
-| 3 | h2_s3 | TMA + wgmma + 2 warpgroups | 418 |
-| 4 | h2_s4 | larger M tile (BM=256, M_ITERS=2) | 434 |
-| 5 | **h2_s5** | **deeper pipeline (NS=4)** | **441** |
-| — | cuBLAS | full Hopper optimization | 689 |
+| Step | Kernel | Key addition | 8192 TFLOPS | vs cuBLAS |
+|------|--------|-------------|:-----------:|:---------:|
+| 1 | tc5_regpruned | Ada baseline on H800 | 362 | 52% |
+| 2 | h1_ms | multi-stage cp.async | 368 | 53% |
+| 3 | h2_s3 | TMA + wgmma + 2 warpgroups | 418 | 60% |
+| 4 | h2_s4 | larger M tile (BM=256, M_ITERS=2) | 434 | 63% |
+| 5 | h2_s5 | deeper pipeline (NS=3/4) | 441 | 64% |
+| 6 | h2_s6 | cp.async + wgmma SS mode | 397 | 57% |
+| 7 | **h2_s7** | **wgmma.wait_group 1** | **586** | **84%** |
+| — | Triton PTX | reference (BK=32, wait_group 1) | 697 | 100% |
+| — | cuBLAS | full Hopper optimization | 694 | 100% |
 
 ---
 
@@ -189,41 +226,70 @@ Bold = best of our kernels. (~) = estimated from nearby sizes.
 | h2_s2 | TMA + wgmma, BM=64 | ~314 | ~290 |
 | h2_s3 | + 2 warpgroups (BM=128) | 361 | 415 |
 | h2_s4 | + M-loop: BM=256, M_ITERS=2 | 389 | 434 |
-| **h2_s5** | **+ NUM_STAGES=3/4 pipeline** | **427** | **441** |
-| cuBLAS | full Hopper optimization | 663 | 689 |
+| h2_s5 | + NUM_STAGES=3/4 pipeline | 427 | 441 |
+| h2_s6 | cp.async + wgmma SS mode | 407 | 397 |
+| **h2_s7** | **+ wgmma.wait_group 1** | **574** | **586** |
+| Triton PTX | reference target | 677 | 697 |
+| cuBLAS | full Hopper optimization | 672 | 694 |
 
 h2_s1 regresses vs tc5 because removing the B XOR swizzle (for correct linear SMEM)
 causes ldmatrix bank conflicts that outweigh TMA's load-instruction savings.
 
-### Wave quantization in h2_s3
+### Why h2_s6 is slower than h2_s5
 
-h2_s3's best config is always `WG=2, BN=256` (128×256 output tile per CTA). This
-creates few CTAs at medium sizes, causing poor SM utilization:
+h2_s6 (cp.async + wgmma SS mode) was expected to improve over h2_s5 by:
+- Eliminating ldmatrix for A → fewer registers
+- Enabling BK=32 with correct swizzle → smaller SMEM → more CTAs/SM
 
-| Size | h2_s3 CTAs | Waves | Notes |
-|------|-----------|-------|-------|
-| 3072 | 288 | 2.2 | **worst** — last wave only 24 CTAs |
-| 5120 | 800 | 6.1 | slight dip |
-| 6144+ | ≥1152 | ≥8.7 | smooth, h2_s3 consistently wins |
+In practice neither benefit materialised:
+- Registers: 202/thread (h2_s6) vs 186 (h2_s5). SS mode descriptors keep more
+  intermediates live across the unrolled kk loop.
+- BK=32 configs didn't win autotuning — BK=64 still optimal.
+- Membar stalls rose from 26% (h2_s5) to 40% (h2_s6): `__pipeline_wait_prior`
+  generates more stalls than TMA's mbarrier protocol.
 
-h1_ms uses smaller tiles (128×128), giving 3–4× more CTAs and better quantization
-across all sizes.
+### Why h2_s7 is +34% over h2_s5 (the big win)
 
-### Practical recommendation
+The entire gain comes from `wgmma.wait_group 1` instead of `0`.
 
-- **N ≥ 6144**: use h2_s3 (TMA + wgmma wins by 8–13%)
-- **N ≤ 5120**: use h1_ms (better wave utilization, lower wgmma overhead)
-- A simple dispatcher switching at N=6144 covers the full range optimally.
+With `wait_group 0` (h2_s6/h2_s5): after committing wgmma[k], the warp scheduler
+stalls until the tensor core finishes. The tensor core and DMA engine do not overlap.
 
-### Why the remaining gap to cuBLAS (~40%) persists
+With `wait_group 1` (h2_s7): after committing wgmma[k], only wait for wgmma[k-1].
+Group k stays in the tensor core pipeline while the warp scheduler issues cp.async for
+the next tile. Tensor core and DMA run concurrently.
 
-Our h2_s3 hits ~55–62% of cuBLAS at large sizes. The remaining gap requires:
-1. **Deeper pipeline** (3–4 TMA stages) to fully hide HBM3 latency
-2. **Persistent kernels** (stream-K) for better load balancing
-3. **Thread Block Clusters** for B-tile broadcast across CTAs
+This works because on H800, MMA time >> memory fetch time (compute-bound regime):
+each tile takes ~5 μs on tensor cores; HBM fetch also ~5 μs. With NS=3, the fetch
+for tile k+2 has 2 full compute iterations (~10 μs) to complete before it's needed.
+`wait_group 1` eliminates the idle period between tensor core operations.
 
-Each of these is a meaningful additional implementation effort, and cuBLAS almost
-certainly uses all three simultaneously.
+SMEM safety: ISSUE goes to slot `(k+NS-1)%NS = (k-1)%NS`. `wait_group 1` at iter k
+guarantees wgmma[k-1] (which read slot `(k-1)%NS`) is fully done. No race.
+
+### Three synchronisation primitives
+
+| Primitive | Scope | Used for |
+|-----------|-------|----------|
+| `__pipeline_wait_prior(N)` | per-thread | ensure this thread's own cp.async data is in SMEM |
+| `wgmma.wait_group N` | per-warpgroup | ensure this warpgroup's wgmma acc writes are done |
+| `__syncthreads()` | CTA-wide | bridge per-thread/per-warpgroup guarantees to all 256 threads |
+
+`__syncthreads()` is needed after both waits: `wait_prior` only knows about the
+current thread's data; `wait_group` only knows about the current warpgroup's wgmma.
+Without the CTA barrier, one warpgroup could race ahead and read incomplete SMEM.
+
+### Remaining gap to Triton (~15%)
+
+h2_s7 reaches 85% of Triton at N=4096–10240. Triton's additional techniques:
+
+1. **BK=32 instead of BK=64**: smaller K-step = more K-tiles = finer-grained
+   pipeline overlap. Triton's SMEM is 96KB vs our 144KB → fits 2 CTAs/SM in principle.
+2. **More complex B swizzle**: Triton uses a warp-level XOR formula combining warp_id
+   bits (not just row%8). May reduce bank conflicts further.
+3. **2 cp.async commits per tile** (A and B separately): allows `wait_group(NS)` with
+   finer granularity than our single-commit approach.
+4. **Grouped CTA swizzle** for better L2 reuse across CTA block IDs.
 
 ---
 
