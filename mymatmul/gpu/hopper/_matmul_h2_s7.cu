@@ -39,11 +39,9 @@ __device__ __forceinline__ void wgmma_fence() {
 __device__ __forceinline__ void wgmma_commit() {
     asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
 }
+// wgmma drain helpers kept for reference; pipeline uses WAIT_MMA(n) macro instead
 __device__ __forceinline__ void wgmma_wait_0() {
     asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
-}
-__device__ __forceinline__ void wgmma_wait_1() {
-    asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
 }
 
 // ── GmmaDescriptors (unchanged from h2_s6) ───────────────────────────────────
@@ -190,8 +188,37 @@ __device__ __forceinline__ void h2s7_impl(
 
     const int num_tiles = K / BK;
 
-    // ── ISSUE_TILE: cp.async load into stage slot (unchanged from h2_s6) ──────
-#define ISSUE_TILE(k0_, buf_)                                                       \
+    // ── Pipeline macros ───────────────────────────────────────────────────────
+    //
+    // Four abstract operations that define the pipeline regardless of backend:
+    //
+    //   LOAD_TILE(slot, k0) — issue async load of A+B tile from DRAM into SMEM slot
+    //   WAIT_SMEM(n)        — stall until SMEM data is ready; keep n loads in flight
+    //   COMPUTE_TILE(slot)  — fence + kick off wgmma for slot + commit (no drain)
+    //   WAIT_MMA(n)         — stall until all but n wgmma groups are done
+    //
+    // Pipeline loop (same structure will be reused for TMA backend in h2_s8):
+    //
+    //   Prologue: for s=0..NS-2: LOAD_TILE(s, s*BK)
+    //
+    //   for k=0..num_tiles-(NS-1):
+    //     WAIT_SMEM(NS-2)       ← tile k is now in SMEM
+    //     __syncthreads()       ← all threads see it (WAIT_SMEM is per-thread)
+    //     COMPUTE_TILE(cur)     ← kick off wgmma group k
+    //     WAIT_MMA(1)           ← groups 0..k-1 done; group k still in TC pipeline
+    //     __syncthreads()       ← all warpgroups agree before cooperative LOAD_TILE
+    //     LOAD_TILE(nxt, ...)   ← safe: slot nxt=(k-1)%NS freed by WAIT_MMA(1)
+    //
+    //   for d=NS-2..0:          ← drain last NS-1 tiles (no new loads)
+    //     WAIT_SMEM(d)
+    //     __syncthreads()
+    //     COMPUTE_TILE(slot)
+    //     WAIT_MMA(1)
+    //
+    //   WAIT_MMA(0)             ← drain final group before epilogue
+
+    // cp.async backend: LOAD_TILE = per-thread memcpy_async + pipeline_commit
+#define LOAD_TILE(slot_, k0_)                                                       \
     do {                                                                            \
         _Pragma("unroll")                                                           \
         for (int _i = 0; _i < A_GROUPS; _i++) {                                    \
@@ -200,7 +227,7 @@ __device__ __forceinline__ void h2s7_impl(
             const int _c  = (_g * A_ELEM) % BK;                                    \
             const int _sc = ((_c / 8) ^ ((_r / A_SHIFT) % A_SWZ)) * 8 + (_c % 8);\
             __pipeline_memcpy_async(                                                \
-                &A_sh[(buf_)][_r][_sc],                                             \
+                &A_sh[(slot_)][_r][_sc],                                            \
                 &A[(block_row + _r) * K + (k0_) + _c],                             \
                 A_ELEM * (int)sizeof(__nv_bfloat16));                               \
         }                                                                           \
@@ -213,14 +240,18 @@ __device__ __forceinline__ void h2s7_impl(
             const int _sc0  = (_flat % (BK * 64)) % 64;                            \
             const int _sc   = ((_sc0 / 8) ^ (_kr % 8)) * 8 + (_sc0 % 8);         \
             __pipeline_memcpy_async(                                                \
-                &B_sh[(buf_)][_st][_kr][_sc],                                      \
+                &B_sh[(slot_)][_st][_kr][_sc],                                     \
                 &B[((k0_) + _kr) * N + block_col + _st * 64 + _sc0],              \
                 B_ELEM * (int)sizeof(__nv_bfloat16));                               \
         }                                                                           \
         __pipeline_commit();                                                         \
     } while (0)
 
-    // ── COMPUTE_TILE: fence + wgmma + commit (NO drain — caller handles it) ───
+    // cp.async backend: WAIT_SMEM(n) = pipeline_wait_prior(n)
+    // "keep n commits in flight; guarantee the (n+1)th-oldest tile is in SMEM"
+#define WAIT_SMEM(n_) __pipeline_wait_prior(n_)
+
+    // COMPUTE_TILE: wgmma.fence + wgmma calls + commit (no drain)
 #define COMPUTE_TILE(slot_)                                                         \
     do {                                                                            \
         wgmma_fence();                                                              \
@@ -242,55 +273,45 @@ __device__ __forceinline__ void h2s7_impl(
         wgmma_commit();                                                             \
     } while (0)
 
-    // ── Prologue: issue NS-1 tiles ────────────────────────────────────────────
+    // WAIT_MMA(n): wgmma.wait_group n (compile-time constant via stringification)
+#define WAIT_MMA(n_) \
+    asm volatile("wgmma.wait_group.sync.aligned " #n_ ";\n" ::: "memory")
+
+    // ── Prologue ──────────────────────────────────────────────────────────────
     #pragma unroll
     for (int s = 0; s < NS - 1; s++) {
-        ISSUE_TILE(s * BK, s);
+        LOAD_TILE(s, s * BK);
     }
 
-    // ── Main loop: tiles 0..num_tiles-NS ─────────────────────────────────────
-    //
-    // Two invariants (derived from Triton PTX analysis):
-    //
-    //  1. wait_prior(NS-2) not (NS-1): at iter k, NS-1 prologue commits plus
-    //     k prior main-loop commits = NS-1+k total. Keeping NS-2 forces k+1
-    //     to complete, guaranteeing the current tile k is in SMEM.
-    //     (wait_prior(NS-1) is a no-op at k=0 with exactly NS-1 commits.)
-    //
-    //  2. ISSUE placed AFTER wait_group 1: wait_group 1 at iter k guarantees
-    //     wgmma groups 0..k-1 all done. Slot (k-1)%NS = (k+NS-1)%NS, which
-    //     wgmma[k-1] was reading, is now free to overwrite with cp.async.
-    //     Placing ISSUE before wait_group 1 would create a race on that slot.
+    // ── Main loop ─────────────────────────────────────────────────────────────
     for (int k = 0; k < num_tiles - (NS - 1); k++) {
         const int cur = k % NS;
         const int nxt = (k + NS - 1) % NS;
 
-        __pipeline_wait_prior(NS - 2);   // guarantee tile k is in SMEM
+        WAIT_SMEM(NS - 2);
         __syncthreads();
-
         COMPUTE_TILE(cur);
-        wgmma_wait_1();                  // groups 0..k-1 done, group k in flight
-
+        WAIT_MMA(1);
         __syncthreads();
-        ISSUE_TILE((k + NS - 1) * BK, nxt);  // safe: slot nxt just freed
+        LOAD_TILE(nxt, (k + NS - 1) * BK);
     }
 
-    // ── Drain: last NS-1 tiles (no new issues) ────────────────────────────────
-    // wait_prior(d) decreasing → at d=0 all commits are drained.
-    // wgmma.wait_group 1 between drain tiles; final wait_group 0 after loop.
+    // ── Drain ─────────────────────────────────────────────────────────────────
     #pragma unroll
     for (int d = NS - 2; d >= 0; d--) {
         const int slot = (num_tiles - d - 1) % NS;
-        __pipeline_wait_prior(d);
+        WAIT_SMEM(d);
         __syncthreads();
         COMPUTE_TILE(slot);
-        wgmma_wait_1();
+        WAIT_MMA(1);
     }
 
-    wgmma_wait_0();   // drain the final wgmma group
+    WAIT_MMA(0);
 
-#undef ISSUE_TILE
+#undef LOAD_TILE
+#undef WAIT_SMEM
 #undef COMPUTE_TILE
+#undef WAIT_MMA
 
     // ── Epilogue: write C ─────────────────────────────────────────────────────
     const int base_col = (lane % 4) * 2;

@@ -106,3 +106,12 @@ def matmul_triton_ptx(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
                                    _SMEM_BYTES, 0, params, 0)
     _chk(err, "cuLaunchKernel(triton_ptx)")
     return C
+
+
+def _launch_by_name(kname: str, M: int, N: int, K: int) -> torch.Tensor:
+    """profile_essentials interface — kname is always 'matmul_kernel'."""
+    assert M % 128 == 0 and N % 256 == 0 and K % 32 == 0, \
+        f"triton_ptx requires M%128==0, N%256==0, K%32==0 (got {M},{N},{K})"
+    A = torch.randn(M, K, device='cuda', dtype=torch.bfloat16)
+    B = torch.randn(K, N, device='cuda', dtype=torch.bfloat16)
+    return matmul_triton_ptx(A, B)

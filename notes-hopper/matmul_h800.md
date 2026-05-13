@@ -73,40 +73,41 @@ H800, motivating Hopper-specific optimizations.
 - Uses H800's 200 KB SMEM budget (vs 100 KB on 4090) — more configs eligible.
 - Compiled per LB value (1–4); Python register-estimate pruning filters infeasible configs.
 
-### h2_s1 — TMA + mbarrier, mma.sync, no B swizzle
+### h2_s1 — TMA + mbarrier, mma.sync, no swizzle
 `matmul_h2_s1.py` / `_matmul_h2_s1.cu`
 
 - Replaces `cp.async` + `__pipeline_*` with TMA + `mbarrier`.
 - Compute unchanged: `ldmatrix` + `mma.sync`.
-- B SMEM is linear (no XOR swizzle) — intentional to isolate TMA plumbing.
-- Bank conflicts on B `ldmatrix` limit performance; showed TMA alone doesn't help.
+- **Neither A nor B has XOR swizzle** — both SMEM layouts are linear row-major.
+  Intentional: isolates TMA plumbing from swizzle correctness.
+- Bank conflicts on both A and B `ldmatrix` calls limit performance; showed that
+  TMA alone (without swizzle) doesn't help vs cp.async.
 - Uses `cuda.bindings.driver` (cuda-python) for host side; TMA descriptors passed
   as `__grid_constant__` by value.
 
 ### h2_s2 — TMA + mbarrier, wgmma, BM=64 fixed
 `matmul_h2_s2.py` / `_matmul_h2_s2.cu`
 
-- Adds B128 TMA swizzle and wgmma (replaces ldmatrix-B + mma.sync).
-- Single warpgroup (BM=64), NUM_WG=1 only.
-- B stored as BN/64 packed sub-tiles (each 64-BF16-wide × BK-tall), back-to-back.
-- A: XOR swizzle matching TMA 128B for BK=64; no swizzle for BK=16/32 (64B/32B
-  swizzle breaks ldmatrix 16-byte chunk alignment).
+First working wgmma kernel. Kept deliberately simple to validate the wgmma + swizzle combination.
+
+- **BM=64 hardcoded** — one warpgroup (128 threads) covers exactly one 64-row output tile.
+  No M-loop, no multi-warpgroup, no template parameter for BM.
+- Replaces `ldmatrix-B + mma.sync` with `wgmma` reading B directly from SMEM descriptor.
+- **B**: TMA SWIZZLE_128B (boxDim=64 BF16); stored as BN/64 packed sub-tiles of [BK][64].
+- **A**: XOR swizzle for BK=64 only; no swizzle for BK=16/32 (64B/32B XOR breaks
+  ldmatrix's 16-byte chunk alignment — BK<64 has A bank conflicts).
 
 ### h2_s3 — TMA + wgmma + multi-warpgroup (canonical Hopper kernel)
 `matmul_h2_s3.py` / `_matmul_h2_s3.cu`
 
-- Extends h2_s2 with `NUM_WG ∈ {1, 2}` (BM = NUM_WG × 64).
-- Both warpgroups share the same B tile; each owns 64 rows of A/C.
-- **This is the canonical Hopper kernel**: TMA + wgmma + 2 warpgroups.
+Generalises h2_s2 from 1 fixed warpgroup to multiple.
+
+- **`NUM_WG ∈ {1, 2}`** as a template parameter; BM = NUM_WG × 64.
+  With NUM_WG=2: 2 warpgroups share the same B tile, each owns 64 rows of A/C.
+- BM is now a free parameter (64 or 128), vs BM=64 hardcoded in h2_s2.
+- Everything else unchanged from h2_s2: same TMA loading, same B128 swizzle,
+  same wgmma RS mode, same 2-stage pipeline.
 - Single cubin with LB=1; cuda-python (`cuda.bindings.driver`) for all host ops.
-
-### h3 — cp.async + wgmma (hybrid, educational)
-`matmul_h3.py` / `_matmul_h3.cu`
-
-- Uses h1_ms's cp.async pipeline but replaces mma.sync with wgmma.
-- B written with `row%8` XOR via cp.async (same physical layout as TMA 128B) so
-  B128 GmmaDescriptor applies.
-- Confirms wgmma works with cp.async but TMA+wgmma is the correct Hopper pair.
 
 ### h2_s4 — TMA + wgmma + M-loop (BM up to 256)
 `matmul_h2_s4.py` / `_matmul_h2_s4.cu`
@@ -147,7 +148,7 @@ Inspired by Triton PTX analysis showing Triton uses cp.async (not TMA) + wgmma S
 ### h2_s7 — cp.async + wgmma SS + wgmma.wait_group 1
 `matmul_h2_s7.py` / `_matmul_h2_s7.cu`
 
-Key insight from Triton PTX reverse-engineering: `wgmma.wait_group 1` instead of 0.
+Key insight from Triton PTX analysis: `wgmma.wait_group 1` instead of 0.
 
 - After committing wgmma group k, only wait for group k-1. Group k stays in the tensor
   core pipeline while cp.async loads the next tile. Both run concurrently.
@@ -279,17 +280,24 @@ guarantees wgmma[k-1] (which read slot `(k-1)%NS`) is fully done. No race.
 current thread's data; `wait_group` only knows about the current warpgroup's wgmma.
 Without the CTA barrier, one warpgroup could race ahead and read incomplete SMEM.
 
-### Remaining gap to Triton (~15%)
+### h2_s7 vs Triton PTX profiling comparison
 
-h2_s7 reaches 85% of Triton at N=4096–10240. Triton's additional techniques:
+From NCU profiling at N=4096:
 
-1. **BK=32 instead of BK=64**: smaller K-step = more K-tiles = finer-grained
-   pipeline overlap. Triton's SMEM is 96KB vs our 144KB → fits 2 CTAs/SM in principle.
-2. **More complex B swizzle**: Triton uses a warp-level XOR formula combining warp_id
-   bits (not just row%8). May reduce bank conflicts further.
-3. **2 cp.async commits per tile** (A and B separately): allows `wait_group(NS)` with
-   finer granularity than our single-commit approach.
-4. **Grouped CTA swizzle** for better L2 reuse across CTA block IDs.
+| Metric | h2_s7 | Triton PTX |
+|--------|-------|-----------|
+| SM SoL | 67.6% | 86.7% |
+| Registers/thread | 202 | 168 |
+| SMEM | 144 KB | 96 KB |
+| Occupancy | 12.5% | 12.5% |
+| wait stalls (wgmma) | 24% | 12% |
+| long_sb stalls | 5% | 32% |
+| barrier stalls | 5% | 28% |
+| LD bank conflicts | 0 | 12 420 |
+
+Despite fewer registers and less SMEM, Triton achieves the same 12.5% occupancy —
+both are register-limited to 1 CTA/SM. Triton's bank conflicts (12 420) are higher
+than ours (0). The gap in SM SoL is not fully explained.
 
 ---
 

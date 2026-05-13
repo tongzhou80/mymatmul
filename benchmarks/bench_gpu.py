@@ -181,6 +181,8 @@ IMPLEMENTATIONS = {
     "h2_s6": ("mymatmul.gpu.hopper.matmul_h2_s6.matmul_h2_s6", None, torch.bfloat16),
     # Hopper H2-S7: h2_s6 + wgmma.wait_group 1 (overlap wgmma with next tile load)
     "h2_s7": ("mymatmul.gpu.hopper.matmul_h2_s7.matmul_h2_s7", None, torch.bfloat16),
+    # Hopper H2-S8: h2_s5 (TMA+RS) + wgmma.wait_group 1
+    "h2_s8": ("mymatmul.gpu.hopper.matmul_h2_s8.matmul_h2_s8", None, torch.bfloat16),
     # Triton PTX: pre-compiled BM=128,BN=256,BK=32,NS=4 cp.async+wgmma-SS kernel
     "triton_ptx": ("mymatmul.gpu.hopper.matmul_triton_ptx.matmul_triton_ptx", None, torch.bfloat16),
     "tc6_x4b":       ("mymatmul.gpu.tensor_core.matmul_cuda_tc6_x4b.matmul_tc6_x4b",             None, torch.bfloat16),

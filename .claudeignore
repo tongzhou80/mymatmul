@@ -1,0 +1,21 @@
+# Build artifacts
+*.cubin
+*.so
+*.o
+*.a
+*.ptx
+build/
+mymatmul.egg-info/
+
+# CUDA core implementations (not relevant for Hopper work)
+mymatmul/gpu/cuda_core/
+
+# Profiler outputs
+*.nsys-rep
+*.sqlite
+*.ncu-rep
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo

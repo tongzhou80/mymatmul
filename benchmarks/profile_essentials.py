@@ -65,14 +65,17 @@ _HOPPER_PREFIX_MAP = {
     "matmul_h2s4": "h2_s4",
     "matmul_h2s5": "h2_s5",
     "matmul_h2s6": "h2_s6",
+    "matmul_h2s7": "h2_s7",
     "matmul_h3":   "h3",
+    # Exact-match entries (no config suffix in the CUDA kernel name)
+    "matmul_kernel": "triton_ptx",
 }
 
 
 def _hopper_impl_name(kname: str) -> str | None:
     """Return the bench_gpu impl name for a Hopper kernel, or None."""
     for prefix, impl in _HOPPER_PREFIX_MAP.items():
-        if kname.startswith(prefix + "_"):
+        if kname == prefix or kname.startswith(prefix + "_"):
             return impl
     return None
 
