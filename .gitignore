@@ -11,3 +11,4 @@ build/
 *.sqlite
 notes/tmux_text*.md
 benchmarks/results.csv
+.env
