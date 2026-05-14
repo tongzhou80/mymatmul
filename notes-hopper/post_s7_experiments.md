@@ -14,6 +14,7 @@ re-run the same experiments.
 | h5 | Descriptor advance (no rebuild) | −1–2% (slightly worse) | `_matmul_h5.cu` |
 | h6 | SMEM-staged 16-byte global stores | −10% (after fixing bank conflicts) | `_matmul_h6.cu` |
 | h7 | Split cp.async into 2 commits (A+B) | +3% at BK=32, −4% at BK=64 | `_matmul_h7.cu` |
+| h8 | Counter-based slot tracking (no `k%NS`) | −4% (slightly worse) | `_matmul_h8.cu` |
 | h2c | 2-CTA cluster + DSMEM/TMA-multicast | −50% (h2c_cluster_experiment.md) | `_matmul_h2c.cu` |
 
 ### Same-config head-to-head with Triton (the real puzzle)
@@ -33,6 +34,35 @@ So BK=64 is the right choice **for our pipeline structure**, beating BK=32 by 8%
 But **Triton uses BK=32, NS=4 and gets ~709 TFLOPS**. That means **at the same BK=32 config, Triton is 30% faster than s7**. The BK choice only explains ~8% — the rest is structural to how Triton emits the loop.
 
 h7 (split commits, BK=32 NS=4) gets 555 TFLOPS — closes ~3% of that gap. The remaining ~22% at the same config is from things we can't pinpoint from PTX inspection: instruction scheduling, micro-pipelining, possibly the `// wait for regs:` hint Triton emits before `wgmma.wait_group`.
+
+### Instruction-count audit and h8
+
+We instrumented the count of integer instructions between `wgmma.fence` and the first `wgmma.mma_async`:
+
+```
+s7:     18 ops    (5 for `k mod 3` via mul-by-reciprocal + 13 for descriptors)
+h8:     13 ops    (counter-based slot tracking; mod is gone)
+Triton:  3 ops    (counter already updated above wait_group)
+```
+
+h8 replaces `cur = k % NS` (5 instructions of mul-by-reciprocal for non-power-of-2 NS=3) with a loop-carried counter that wraps via `(c+1==NS) ? 0 : c+1` (3 instructions). Successfully cut the critical-path int ops from 18 → 13.
+
+**Result: h8 is 4% slower than s7 at the same config.**
+
+This is the same lesson as h5: micro-optimizing instruction counts around wgmma doesn't translate to performance. The wgmma issue rate isn't actually the bottleneck. The kernel's wait stalls come from something deeper than instruction issue rate — hardware behavior at the tensor pipe / accumulator scoreboard level.
+
+### Where the remaining gap actually lives
+
+After h4, h4_s2, h5, h6, h7, h8, the structural rules we've derived:
+- Almost any PTX-visible micro-optimization is a wash or slight regression
+- Larger structural changes (clusters, SMEM-staged epilogue, descriptor schemes) are net-negative
+- Triton's ~22% advantage at same config is in things the PTX surface does not show
+
+The remaining lead would require either:
+- **SASS-level analysis** of the actual machine code (nvdisasm the cubins, find where they differ)
+- Or **warp specialization** (structural rewrite), which is the only optimization-class that has consistently won for matmul on Hopper
+
+We have stopped pursuing PTX-level optimizations. s7 at ~600 TFLOPS is the design's ceiling.
 
 ## What we learned about the actual bottleneck
 

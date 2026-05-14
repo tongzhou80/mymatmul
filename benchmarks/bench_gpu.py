@@ -191,6 +191,8 @@ IMPLEMENTATIONS = {
     "h6":    ("mymatmul.gpu.hopper.matmul_h6.matmul_h6", None, torch.bfloat16),
     # Hopper H7: h2_s7 with cp.async split into 2 commit groups per iter
     "h7":    ("mymatmul.gpu.hopper.matmul_h7.matmul_h7", None, torch.bfloat16),
+    # Hopper H8: h2_s7 with counter-based slot tracking (avoid k%NS mod-by-reciprocal)
+    "h8":    ("mymatmul.gpu.hopper.matmul_h8.matmul_h8", None, torch.bfloat16),
     # Hopper H4 Stage 2: sweep over cluster shapes (CX, CY)
     "h4_s2": ("mymatmul.gpu.hopper.matmul_h4_s2.matmul_h4_s2", None, torch.bfloat16),
     # Triton PTX: pre-compiled BM=128,BN=256,BK=32,NS=4 cp.async+wgmma-SS kernel
