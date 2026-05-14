@@ -13,7 +13,26 @@ re-run the same experiments.
 | h4_s2 | Sweep cluster shapes | (1,1)/(1,2) ≈ s7; ≥(2,2) is −5–10% | `_matmul_h4_s2.cu` |
 | h5 | Descriptor advance (no rebuild) | −1–2% (slightly worse) | `_matmul_h5.cu` |
 | h6 | SMEM-staged 16-byte global stores | −10% (after fixing bank conflicts) | `_matmul_h6.cu` |
+| h7 | Split cp.async into 2 commits (A+B) | +3% at BK=32, −4% at BK=64 | `_matmul_h7.cu` |
 | h2c | 2-CTA cluster + DSMEM/TMA-multicast | −50% (h2c_cluster_experiment.md) | `_matmul_h2c.cu` |
+
+### Same-config head-to-head with Triton (the real puzzle)
+
+The most informative experiment was just running s7's autotune at BM=128, BN=256, WG=2 across all BK/NS combinations:
+
+```
+Config (BM=128 BN=256 WG=2)         TFLOPS   vs s7 best
+BK=16 NS=5                            464    0.78x
+BK=32 NS=4                            545    0.91x
+BK=64 NS=3 (s7 autotune-best)         592    1.00x
+BK=64 NS=4                            569    0.96x
+```
+
+So BK=64 is the right choice **for our pipeline structure**, beating BK=32 by 8%.
+
+But **Triton uses BK=32, NS=4 and gets ~709 TFLOPS**. That means **at the same BK=32 config, Triton is 30% faster than s7**. The BK choice only explains ~8% — the rest is structural to how Triton emits the loop.
+
+h7 (split commits, BK=32 NS=4) gets 555 TFLOPS — closes ~3% of that gap. The remaining ~22% at the same config is from things we can't pinpoint from PTX inspection: instruction scheduling, micro-pipelining, possibly the `// wait for regs:` hint Triton emits before `wgmma.wait_group`.
 
 ## What we learned about the actual bottleneck
 
