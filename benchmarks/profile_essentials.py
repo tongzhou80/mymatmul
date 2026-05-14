@@ -41,6 +41,12 @@ METRICS = {
     # Bank conflicts
     "smem_ld_conflicts":    "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum",
     "smem_st_conflicts":    "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum",
+    # Pipe utilization — what % of active SM cycles each pipe is busy
+    "tensor_pipe_pct":      "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active",
+    "tensor_hmma_pct":      "sm__inst_executed_pipe_tensor_op_hmma.avg.pct_of_peak_sustained_active",
+    "alu_pipe_pct":         "sm__inst_executed_pipe_alu.avg.pct_of_peak_sustained_active",
+    "fma_pipe_pct":         "sm__inst_executed_pipe_fma.avg.pct_of_peak_sustained_active",
+    "lsu_pipe_pct":         "sm__inst_executed_pipe_lsu.avg.pct_of_peak_sustained_active",
     # Warp stalls (% of warp-active cycles)
     "stall_math_throt":     "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct",
     "stall_long_sb":        "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct",
@@ -66,6 +72,11 @@ _HOPPER_PREFIX_MAP = {
     "matmul_h2s5": "h2_s5",
     "matmul_h2s6": "h2_s6",
     "matmul_h2s7": "h2_s7",
+    "matmul_h2s8": "h2_s8",
+    "matmul_h4s2": "h4_s2",
+    "matmul_h4":   "h4",
+    "matmul_h5":   "h5",
+    "matmul_h6":   "h6",
     "matmul_h3":   "h3",
     # Exact-match entries (no config suffix in the CUDA kernel name)
     "matmul_kernel": "triton_ptx",
@@ -276,6 +287,11 @@ def print_results(rows: list[tuple[str, dict]], max_warps_per_sm: int) -> None:
               f"  wait={_fv(m,'stall_wait')}%"
               f"  no_inst={_fv(m,'stall_no_inst')}%"
               f"  misc={_fv(m,'stall_misc')}%")
+        print(f"  Pipe: tensor={_fv(m,'tensor_pipe_pct')}%"
+              f"  hmma={_fv(m,'tensor_hmma_pct')}%"
+              f"  alu={_fv(m,'alu_pipe_pct')}%"
+              f"  fma={_fv(m,'fma_pipe_pct')}%"
+              f"  lsu={_fv(m,'lsu_pipe_pct')}%")
 
 
 def save_csv(rows: list[tuple[str, dict]], max_warps_per_sm: int, path: str) -> None:
