@@ -1,14 +1,14 @@
 """Measure per-phase cycle breakdown of h2_s7's main K-loop.
 
-Instruments WAIT_SMEM, COMPUTE_TILE, WAIT_MMA, LOAD_TILE with clock64() reads
-to see which phase is dominant. Useful for answering "is WAIT_SMEM ever
-blocking the tensor pipe?".
+Instruments WAIT_SMEM, COMPUTE_TILE, WAIT_MMA, LOAD_TILE with clock64() reads.
+Configurable BM/BN/BK/WG/NS via CLI args. Default is the s7-best config.
 
-The instrumented kernel is in `_matmul_h2_s7_timed.cu`. We launch with the
-s7-best config (BM=128, BN=256, BK=64, WG=2, NS=3) at N=4096.
+Usage:
+  python benchmarks/profile_s7_phases.py                    # s7 best
+  python benchmarks/profile_s7_phases.py 256 128 64 2 3     # M_ITERS=2
 """
 
-import ctypes, os, subprocess, threading, atexit
+import ctypes, os, subprocess, sys
 import numpy as np, torch
 from cuda.bindings import driver as cudrvr
 
@@ -43,7 +43,11 @@ def main():
 
     err, mod = cudrvr.cuModuleLoad(_CUBIN.encode()); _chk(err, "moduleLoad")
 
-    bm, bn, bk, nwg, ns = 128, 256, 64, 2, 3
+    # CLI: BM BN BK WG NS (defaults to s7 best)
+    if len(sys.argv) >= 6:
+        bm, bn, bk, nwg, ns = (int(x) for x in sys.argv[1:6])
+    else:
+        bm, bn, bk, nwg, ns = 128, 256, 64, 2, 3
     M = N = K = 4096
 
     kname = f"matmul_h2s7_timed_bm{bm}_bn{bn}_bk{bk}_wg{nwg}_ns{ns}"
