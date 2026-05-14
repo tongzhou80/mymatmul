@@ -1,28 +1,33 @@
 #include <stdint.h>
 #include <cuda_runtime.h>
+#include <cuda_pipeline_primitives.h>
 #include <cuda_bf16.h>
+#include <cooperative_groups.h>
+
+namespace cg = cooperative_groups;
 
 /*
- * H2 Stage 8: h2_s7 with cp.async replaced by TMA tile fetch.
+ * H2 Cluster (h2c): 2-CTA cluster version of h2_s7.
  *
- * The ONLY change from h2_s7 is the load mechanism:
- *   - LOAD_TILE: cp.async per-thread memcpy → TMA bulk tensor load (thread 0)
- *   - WAIT_SMEM: __pipeline_wait_prior → mbarrier wait
+ * Cluster geometry: __cluster_dims__(1, 2, 1) — 2 CTAs along M direction.
+ * Both CTAs in a cluster share the same B column → same B tile.
  *
- * Everything else is identical to h2_s7:
- *   - wgmma SS variant (both A and B read from SMEM via descriptors)
- *   - SMEM layout for A and B (same shapes, same swizzle patterns; TMA hardware
- *     applies the swizzle that matches the wgmma descriptor's layout field)
- *   - Pipeline structure (WAIT → fence → __sync → COMPUTE → WAIT_MMA(1) → LOAD)
- *   - Drain, epilogue, accumulator layout
+ * Key change vs h2_s7:
+ *   - A is still loaded per-CTA via cp.async (each CTA loads its own M strip).
+ *   - B is loaded ONCE per cluster via TMA multicast — the TMA engine fetches
+ *     the B tile from DRAM and delivers it into BOTH CTAs' local SMEM in one
+ *     round-trip.  After delivery, each CTA's wgmma reads its local SMEM
+ *     (identical wgmma path to s7).
  *
- * TMA-related details:
- *   - mbarrier per slot tracks tile delivery (init + arm + wait per iter).
- *   - fence.proxy.async at COMPUTE_TILE start ensures TMA's async-proxy writes
- *     are visible to wgmma's reads of the same SMEM.
- *   - A's TMA swizzle is selected by BK to match wgmma A descriptor's layout:
- *       BK=64 → 128B,  BK=32 → 64B,  BK=16 → 32B.
- *   - B uses 128B swizzle uniformly (matches s7's manual B128 cp.async swizzle).
+ *   AI: 85.3 → 128 F/B  (B DRAM bandwidth halved across the cluster).
+ *
+ * Pipeline (preserves s7's structure):
+ *   LOAD_TILE  : cp.async A  +  TMA-multicast B  (arm mbarrier first)
+ *   WAIT_SMEM  : __pipeline_wait_prior(A)  +  mbarrier_wait(B)
+ *   COMPUTE_TILE / WAIT_MMA : identical to s7
+ *
+ * Per-iter cluster sync: needed once before TMA issue so that BOTH CTAs have
+ * armed their mbarrier with expected_tx before the multicast TMA delivers.
  */
 
 #ifndef LB_MIN_BLOCKS
@@ -38,12 +43,14 @@ __device__ __forceinline__ void wgmma_fence() {
 __device__ __forceinline__ void wgmma_commit() {
     asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
 }
-// fence.proxy.async: TMA writes (async proxy) → wgmma reads of SMEM
+
+// fence.proxy.async needed once after TMA so its async-proxy writes are
+// visible to wgmma's async-proxy reads of the same SMEM.
 __device__ __forceinline__ void fence_proxy_async() {
     asm volatile("fence.proxy.async;\n" ::: "memory");
 }
 
-// ── mbarrier helpers (one per pipeline slot, tracks TMA delivery) ────────────
+// ── mbarrier helpers (one per pipeline slot, tracks B's TMA delivery) ────────
 __device__ __forceinline__ void mbar_init(uint64_t* mb) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n"
                  :: "r"((uint32_t)__cvta_generic_to_shared(mb)) : "memory");
@@ -66,19 +73,19 @@ __device__ __forceinline__ void mbar_wait(uint64_t* mb) {
     }
 }
 
-// ── TMA tile load ─────────────────────────────────────────────────────────────
-__device__ __forceinline__ void tma_load_tile(
+// ── TMA multicast load: hardware fetches B once, writes to all CTAs in mask ──
+__device__ __forceinline__ void tma_load_b_multicast(
     const TmaDesc* desc, void* smem_ptr, uint64_t* mbar,
-    int32_t coord0, int32_t coord1)
+    int32_t coord0, int32_t coord1, uint16_t cluster_mask)
 {
-    uint32_t dst = (uint32_t)__cvta_generic_to_shared(smem_ptr);
+    uint32_t dst       = (uint32_t)__cvta_generic_to_shared(smem_ptr);
     uint32_t mbar_addr = (uint32_t)__cvta_generic_to_shared(mbar);
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cluster.global"
-        ".tile.mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%3, %4}], [%2];\n"
+        ".tile.mbarrier::complete_tx::bytes.multicast::cluster"
+        " [%0], [%1, {%3, %4}], [%2], %5;\n"
         :: "r"(dst), "l"((unsigned long long)desc), "r"(mbar_addr),
-           "r"(coord0), "r"(coord1) : "memory");
+           "r"(coord0), "r"(coord1), "h"(cluster_mask) : "memory");
 }
 
 // ── A descriptor (identical to h2_s7) ─────────────────────────────────────────
@@ -90,13 +97,13 @@ __device__ __forceinline__ uint64_t make_wgmma_a_desc(uint32_t smem_addr, int kk
     return start | (sbo << 32) | (layout << 62);
 }
 
-// ── B descriptor (identical to h2_s7) ─────────────────────────────────────────
+// ── B descriptor (TMA-laid layout: [BK][BN] 128B-swizzled subtiles of 64) ────
 template<int BN, int BK>
 __device__ __forceinline__ uint64_t make_wgmma_b_desc(uint32_t smem_addr) {
     constexpr uint64_t LAYOUT_B128 = 1ULL << 62;
     constexpr int n_atoms = BN / 64;
     constexpr uint64_t lbo = (n_atoms <= 1) ? 0ULL : (uint64_t)(8 * BK);
-    constexpr uint64_t sbo = 64ULL;
+    constexpr uint64_t sbo = (n_atoms <= 1) ? (uint64_t)BN : 64ULL;
     uint64_t start = (uint64_t)(smem_addr >> 4) & 0x3FFFULL;
     return start | (lbo << 16) | (sbo << 32) | LAYOUT_B128;
 }
@@ -177,12 +184,11 @@ void wgmma_ss_call(float* acc, uint64_t desc_a, uint64_t desc_b) {
 }
 
 // ── Kernel ────────────────────────────────────────────────────────────────────
-
 template<int BM, int BN, int BK, int NUM_WG, int NUM_STAGES>
-__device__ __forceinline__ void h2s8_impl(
-    const TmaDesc&                tma_A,
-    const TmaDesc&                tma_B,
-    __nv_bfloat16* __restrict__   C,
+__device__ __forceinline__ void h2c_impl(
+    const __nv_bfloat16* __restrict__ A,
+    const TmaDesc&                    tma_B,
+    __nv_bfloat16* __restrict__       C,
     int M, int K, int N)
 {
     static_assert(BM % (NUM_WG * 64) == 0, "BM must be multiple of NUM_WG*64");
@@ -193,8 +199,16 @@ __device__ __forceinline__ void h2s8_impl(
     constexpr int M_PER_WG   = BM / NUM_WG;
     constexpr int D          = BN / 2;
     constexpr int N_SUBTILES = BN / 64;
-    constexpr int K_STEP_BYTES = 16 * 64 * 2;     // wgmma kk advance: 2048 bytes
-    constexpr uint32_t TILE_BYTES = (BM * BK + BK * BN) * 2;
+    constexpr int SUBTILE_COL  = 64;
+    constexpr int K_STEP_BYTES = 16 * SUBTILE_COL * 2;
+    constexpr uint32_t B_BYTES_PER_TILE = BK * BN * 2;
+
+    constexpr int A_SWZ   = BK / 8;
+    constexpr int A_SHIFT = 64 / BK;
+
+    constexpr int THREADS  = NUM_WG * 128;
+    constexpr int A_ELEM   = (BM * BK / THREADS >= 8) ? 8 : 4;
+    constexpr int A_GROUPS = BM * BK / A_ELEM / THREADS;
 
     const int tid        = threadIdx.x;
     const int wg_id      = tid / 128;
@@ -204,49 +218,77 @@ __device__ __forceinline__ void h2s8_impl(
     const int block_row = blockIdx.y * BM;
     const int block_col = blockIdx.x * BN;
 
-    // SMEM: A[NS][BM][BK], B[NS][N_SUBTILES][BK][64], mbar[NS]
+    // Cluster identity — for 2-CTA cluster along Y, rank ∈ {0, 1}.
+    auto cluster = cg::this_cluster();
+    const uint32_t my_rank = cluster.block_rank();
+    constexpr uint16_t CLUSTER_MASK = 0b11;   // multicast to both CTAs
+
+    // SMEM: A[NS][BM][BK] (cp.async-swizzled) + B[NS][BK][BN] (TMA 128B-swizzled)
+    //       + mbar[NS] (one mbarrier per slot for B's TMA delivery).
     extern __shared__ char smem_raw[];
     constexpr int A_BYTES  = NS * BM * BK * 2;
     constexpr int B_BYTES  = NS * BK * BN * 2;
     constexpr int MBAR_OFF = (A_BYTES + B_BYTES + 7) & ~7;
 
     auto A_sh = reinterpret_cast<__nv_bfloat16 (*)[BM][BK]>(smem_raw);
-    auto B_sh = reinterpret_cast<__nv_bfloat16 (*)[N_SUBTILES][BK][64]>(smem_raw + A_BYTES);
+    auto B_sh = reinterpret_cast<__nv_bfloat16 (*)[BK][BN]>(smem_raw + A_BYTES);
     auto mbar = reinterpret_cast<uint64_t*>(smem_raw + MBAR_OFF);
 
     float acc[M_ITERS][D] = {};
     const int num_tiles = K / BK;
 
-    // ── LOAD_TILE: thread 0 inits + arms mbarrier, then issues TMA for A and B
-#define LOAD_TILE(slot_, k0_)                                                       \
+    // ── LOAD_ARM: per-CTA mbarrier init + arm (no cross-CTA work) ─────────
+#define LOAD_ARM(slot_)                                                             \
     do {                                                                            \
         if (tid == 0) {                                                             \
-            mbar_init(&mbar[(slot_)]);                                              \
-            mbar_arm_tma(&mbar[(slot_)], TILE_BYTES);                               \
-            tma_load_tile(&tma_A, &A_sh[(slot_)][0][0], &mbar[(slot_)],            \
-                          (k0_), block_row);                                        \
+            mbar_init(&mbar[(slot_)]);                /* count=1, parity=0 */      \
+            mbar_arm_tma(&mbar[(slot_)], B_BYTES_PER_TILE);                         \
+        }                                                                           \
+    } while (0)
+
+    // ── LOAD_ISSUE: cp.async A (per-CTA) + TMA-multicast B (rank-0 only) ───
+    //   Caller must ensure peer has armed (cluster.sync done) before this runs.
+#define LOAD_ISSUE(slot_, k0_)                                                      \
+    do {                                                                            \
+        _Pragma("unroll")                                                           \
+        for (int _i = 0; _i < A_GROUPS; _i++) {                                    \
+            const int _g  = tid + _i * THREADS;                                    \
+            const int _r  = (_g * A_ELEM) / BK;                                    \
+            const int _c  = (_g * A_ELEM) % BK;                                    \
+            const int _sc = ((_c / 8) ^ ((_r / A_SHIFT) % A_SWZ)) * 8 + (_c % 8);\
+            __pipeline_memcpy_async(                                                \
+                &A_sh[(slot_)][_r][_sc],                                            \
+                &A[(block_row + _r) * K + (k0_) + _c],                             \
+                A_ELEM * (int)sizeof(__nv_bfloat16));                               \
+        }                                                                           \
+        __pipeline_commit();                                                         \
+        if (tid == 0 && my_rank == 0) {                                             \
             _Pragma("unroll")                                                       \
-            for (int _i = 0; _i < N_SUBTILES; _i++) {                              \
-                void* _b = (char*)&B_sh[(slot_)][0][0][0] + _i * BK * 64 * 2;      \
-                tma_load_tile(&tma_B, _b, &mbar[(slot_)],                          \
-                              block_col + _i * 64, (k0_));                         \
+            for (int _sub = 0; _sub < N_SUBTILES; _sub++) {                        \
+                void* _bdst = (char*)&B_sh[(slot_)][0][0]                          \
+                              + _sub * BK * SUBTILE_COL * 2;                       \
+                tma_load_b_multicast(&tma_B, _bdst, &mbar[(slot_)],                \
+                                     block_col + _sub * SUBTILE_COL, (k0_),        \
+                                     CLUSTER_MASK);                                 \
             }                                                                       \
         }                                                                           \
     } while (0)
 
-    // ── WAIT_SMEM(slot): per-thread mbarrier wait (parity 0, set by mbar_init)
-#define WAIT_SMEM(slot_) mbar_wait(&mbar[(slot_)])
+    // ── WAIT_SMEM: wait for A's cp.async AND B's TMA delivery ───────────────
+#define WAIT_SMEM(n_, slot_)                                                        \
+    do {                                                                            \
+        __pipeline_wait_prior(n_);                                                  \
+        mbar_wait(&mbar[(slot_)]);                                                 \
+    } while (0)
 
-    // ── COMPUTE_TILE: identical to h2_s7 (wgmma SS over BK) ──────────────────
-    //   fence_proxy_async makes TMA's async-proxy writes visible to wgmma.
+    // ── COMPUTE_TILE: wgmma SS over BK (identical to s7) ────────────────────
 #define COMPUTE_TILE(slot_)                                                         \
     do {                                                                            \
-        fence_proxy_async();                                                        \
         wgmma_fence();                                                              \
         _Pragma("unroll")                                                           \
         for (int _kk = 0; _kk < BK / 16; _kk++) {                                 \
             const uint32_t _bb = (uint32_t)__cvta_generic_to_shared(               \
-                                     &B_sh[(slot_)][0][0][0]);                     \
+                                     &B_sh[(slot_)][0][0]);                        \
             const uint64_t _db = make_wgmma_b_desc<BN, BK>(                        \
                                      (uint32_t)(_bb + _kk * K_STEP_BYTES));        \
             _Pragma("unroll")                                                       \
@@ -264,36 +306,43 @@ __device__ __forceinline__ void h2s8_impl(
 #define WAIT_MMA(n_) \
     asm volatile("wgmma.wait_group.sync.aligned " #n_ ";\n" ::: "memory")
 
-    // ── Prologue: NS-1 LOAD_TILEs (thread 0 issues all TMA + arms mbarriers) ─
+    // ── Prologue: arm + cluster.sync once, then issue all NS-1 loads ───────
     #pragma unroll
-    for (int s = 0; s < NS - 1; s++) {
-        LOAD_TILE(s, s * BK);
-    }
+    for (int s = 0; s < NS - 1; s++) LOAD_ARM(s);
+    cluster.sync();                            // all CTAs armed for slots 0..NS-2
+    #pragma unroll
+    for (int s = 0; s < NS - 1; s++) LOAD_ISSUE(s, s * BK);
 
     // ── Main loop ─────────────────────────────────────────────────────────────
-    //   Identical pipeline shape to h2_s7:
-    //     WAIT_SMEM(cur)     - mbarrier-wait for slot cur's TMA to complete
-    //     __syncthreads      - all threads see TMA-written SMEM
-    //     COMPUTE_TILE(cur)  - wgmma issues
-    //     WAIT_MMA(1)        - prev wgmma drained, slot nxt safe to overwrite
-    //     LOAD_TILE(nxt, ..) - next TMA load
+    //   Pipeline overlap:
+    //     COMPUTE_TILE issues wgmma (async). While wgmma runs in flight, we
+    //     do the prep work for the NEXT tile: LOAD_ARM + cluster.sync. The
+    //     cluster barrier overlaps with wgmma execution rather than blocking
+    //     the critical path. After WAIT_MMA(1) drains the previous wgmma,
+    //     LOAD_ISSUE kicks off the next async loads.
     for (int k = 0; k < num_tiles - (NS - 1); k++) {
         const int cur = k % NS;
         const int nxt = (k + NS - 1) % NS;
 
-        WAIT_SMEM(cur);
+        WAIT_SMEM(NS - 2, cur);
+        fence_proxy_async();
         __syncthreads();
-        COMPUTE_TILE(cur);
+        COMPUTE_TILE(cur);                     // async wgmma starts
+
+        LOAD_ARM(nxt);                         // prep nxt slot (per-CTA, no sync)
+        cluster.sync();                        // overlaps with wgmma in flight
+
         WAIT_MMA(1);
         __syncthreads();
-        LOAD_TILE(nxt, (k + NS - 1) * BK);
+        LOAD_ISSUE(nxt, (k + NS - 1) * BK);    // issue async loads for nxt
     }
 
     // ── Drain ─────────────────────────────────────────────────────────────────
     #pragma unroll
     for (int d = NS - 2; d >= 0; d--) {
         const int slot = (num_tiles - d - 1) % NS;
-        WAIT_SMEM(slot);
+        WAIT_SMEM(d, slot);
+        fence_proxy_async();
         __syncthreads();
         COMPUTE_TILE(slot);
         WAIT_MMA(1);
@@ -301,12 +350,13 @@ __device__ __forceinline__ void h2s8_impl(
 
     WAIT_MMA(0);
 
-#undef LOAD_TILE
+#undef LOAD_ARM
+#undef LOAD_ISSUE
 #undef WAIT_SMEM
 #undef COMPUTE_TILE
 #undef WAIT_MMA
 
-    // ── Epilogue (identical to h2_s7) ─────────────────────────────────────────
+    // ── Epilogue: write C (identical to s7) ─────────────────────────────────
     const int base_col = (lane % 4) * 2;
     const int base_row = lane / 4;
     #pragma unroll
@@ -330,16 +380,18 @@ __device__ __forceinline__ void h2s8_impl(
 // ── Kernel entry points ───────────────────────────────────────────────────────
 
 #define MAKE_LAUNCHER(BM_, BN_, BK_, NG_, NS_)                                   \
-extern "C" __global__ __launch_bounds__(NG_ * 128, LB_MIN_BLOCKS)               \
-void matmul_h2s8_bm##BM_##_bn##BN_##_bk##BK_##_wg##NG_##_ns##NS_(              \
-    const __grid_constant__ TmaDesc tma_A,                                       \
-    const __grid_constant__ TmaDesc tma_B,                                       \
-    __nv_bfloat16* __restrict__     C,                                           \
+extern "C" __global__ __cluster_dims__(1, 2, 1)                                  \
+__launch_bounds__(NG_ * 128, LB_MIN_BLOCKS)                                      \
+void matmul_h2c_bm##BM_##_bn##BN_##_bk##BK_##_wg##NG_##_ns##NS_(                \
+    const __nv_bfloat16* __restrict__   A,                                       \
+    const __grid_constant__ TmaDesc     tma_B,                                   \
+    __nv_bfloat16* __restrict__         C,                                       \
     int M, int K, int N)                                                         \
 {                                                                                \
-    h2s8_impl<BM_, BN_, BK_, NG_, NS_>(tma_A, tma_B, C, M, K, N);              \
+    h2c_impl<BM_, BN_, BK_, NG_, NS_>(A, tma_B, C, M, K, N);                    \
 }
 
+// BK ∈ {32, 64} (TMA's 128B swizzle and wgmma both fine with these)
 #define MAKE3(BM_, BN_, BK_, NG_) \
     MAKE_LAUNCHER(BM_, BN_, BK_, NG_, 2) \
     MAKE_LAUNCHER(BM_, BN_, BK_, NG_, 3) \
@@ -347,22 +399,22 @@ void matmul_h2s8_bm##BM_##_bn##BN_##_bk##BK_##_wg##NG_##_ns##NS_(              \
     MAKE_LAUNCHER(BM_, BN_, BK_, NG_, 5)
 
 // NW=1 warpgroup
-MAKE3( 64,  64, 16, 1) MAKE3( 64,  64, 32, 1) MAKE3( 64,  64, 64, 1)
-MAKE3( 64, 128, 16, 1) MAKE3( 64, 128, 32, 1) MAKE3( 64, 128, 64, 1)
-MAKE3( 64, 256, 16, 1) MAKE3( 64, 256, 32, 1) MAKE3( 64, 256, 64, 1)
-MAKE3(128,  64, 16, 1) MAKE3(128,  64, 32, 1) MAKE3(128,  64, 64, 1)
-MAKE3(128, 128, 16, 1) MAKE3(128, 128, 32, 1) MAKE3(128, 128, 64, 1)
-MAKE3(128, 256, 16, 1) MAKE3(128, 256, 32, 1) MAKE3(128, 256, 64, 1)
-MAKE3(256,  64, 16, 1) MAKE3(256,  64, 32, 1) MAKE3(256,  64, 64, 1)
-MAKE3(256, 128, 16, 1) MAKE3(256, 128, 32, 1) MAKE3(256, 128, 64, 1)
+MAKE3( 64,  64, 32, 1) MAKE3( 64,  64, 64, 1)
+MAKE3( 64, 128, 32, 1) MAKE3( 64, 128, 64, 1)
+MAKE3( 64, 256, 32, 1) MAKE3( 64, 256, 64, 1)
+MAKE3(128,  64, 32, 1) MAKE3(128,  64, 64, 1)
+MAKE3(128, 128, 32, 1) MAKE3(128, 128, 64, 1)
+MAKE3(128, 256, 32, 1) MAKE3(128, 256, 64, 1)
+MAKE3(256,  64, 32, 1) MAKE3(256,  64, 64, 1)
+MAKE3(256, 128, 32, 1) MAKE3(256, 128, 64, 1)
 
 // NW=2 warpgroups
-MAKE3(128,  64, 16, 2) MAKE3(128,  64, 32, 2) MAKE3(128,  64, 64, 2)
-MAKE3(128, 128, 16, 2) MAKE3(128, 128, 32, 2) MAKE3(128, 128, 64, 2)
-MAKE3(128, 256, 16, 2) MAKE3(128, 256, 32, 2) MAKE3(128, 256, 64, 2)
-MAKE3(256,  64, 16, 2) MAKE3(256,  64, 32, 2) MAKE3(256,  64, 64, 2)
-MAKE3(256, 128, 16, 2) MAKE3(256, 128, 32, 2) MAKE3(256, 128, 64, 2)
-MAKE3(256, 256, 16, 2) MAKE3(256, 256, 32, 2) MAKE3(256, 256, 64, 2)
+MAKE3(128,  64, 32, 2) MAKE3(128,  64, 64, 2)
+MAKE3(128, 128, 32, 2) MAKE3(128, 128, 64, 2)
+MAKE3(128, 256, 32, 2) MAKE3(128, 256, 64, 2)
+MAKE3(256,  64, 32, 2) MAKE3(256,  64, 64, 2)
+MAKE3(256, 128, 32, 2) MAKE3(256, 128, 64, 2)
+MAKE3(256, 256, 32, 2) MAKE3(256, 256, 64, 2)
 
 #undef MAKE3
 #undef MAKE_LAUNCHER

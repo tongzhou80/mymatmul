@@ -169,6 +169,15 @@ Triton's best Hopper BF16 kernel loaded directly from PTX: BM=128, BN=256, BK=32
 Uses `ptxas` to compile to cubin; launched via `cuLaunchKernel`. Beats cuBLAS at large N.
 Used as a reference target for reverse-engineering.
 
+PTX analysis (see `notes-hopper/triton_ptx_analysis.md`):
+- **No advanced Hopper features**: no TMA, no CTA clusters, no distributed SMEM.
+- `cp.async.cg` (cache-global, bypasses L1) + `cp.async.wait_group` for tile loading.
+- `wgmma SS mode` (both A and B from SMEM descriptors) + `wgmma.wait_group 1`.
+- `ldmatrix` appears only in the epilogue to rearrange acc data in SMEM before the
+  global C store — not used for A/B loading.
+- The 87% SM SoL vs our 68% comes from BK=32 (smaller wgmma groups drain faster,
+  wait stalls 12% vs 24%), not from any hardware feature we lack.
+
 ---
 
 ## Benchmark Results (H800 GPU2, BF16, square M=K=N)
