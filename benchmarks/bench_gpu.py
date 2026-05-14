@@ -193,6 +193,8 @@ IMPLEMENTATIONS = {
     "h7":    ("mymatmul.gpu.hopper.matmul_h7.matmul_h7", None, torch.bfloat16),
     # Hopper H8: h2_s7 with counter-based slot tracking (avoid k%NS mod-by-reciprocal)
     "h8":    ("mymatmul.gpu.hopper.matmul_h8.matmul_h8", None, torch.bfloat16),
+    # Hopper H9: h2_s7 with all 128 acc regs as wgmma.wait_group input constraints
+    "h9":    ("mymatmul.gpu.hopper.matmul_h9.matmul_h9", None, torch.bfloat16),
     # Hopper H4 Stage 2: sweep over cluster shapes (CX, CY)
     "h4_s2": ("mymatmul.gpu.hopper.matmul_h4_s2.matmul_h4_s2", None, torch.bfloat16),
     # Triton PTX: pre-compiled BM=128,BN=256,BK=32,NS=4 cp.async+wgmma-SS kernel

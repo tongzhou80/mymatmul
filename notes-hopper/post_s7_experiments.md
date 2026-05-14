@@ -15,6 +15,7 @@ re-run the same experiments.
 | h6 | SMEM-staged 16-byte global stores | −10% (after fixing bank conflicts) | `_matmul_h6.cu` |
 | h7 | Split cp.async into 2 commits (A+B) | +3% at BK=32, −4% at BK=64 | `_matmul_h7.cu` |
 | h8 | Counter-based slot tracking (no `k%NS`) | −4% (slightly worse) | `_matmul_h8.cu` |
+| h9 | Triton's `wait for regs:` register-hint pattern on wait_group | −5% (slightly worse) | `_matmul_h9.cu` |
 | h2c | 2-CTA cluster + DSMEM/TMA-multicast | −50% (h2c_cluster_experiment.md) | `_matmul_h2c.cu` |
 
 ### Same-config head-to-head with Triton (the real puzzle)
@@ -63,6 +64,33 @@ The remaining lead would require either:
 - Or **warp specialization** (structural rewrite), which is the only optimization-class that has consistently won for matmul on Hopper
 
 We have stopped pursuing PTX-level optimizations. s7 at ~600 TFLOPS is the design's ceiling.
+
+### h9 — the "wait for regs" hint that turned out to be nothing
+
+Triton's PTX shows:
+```
+// wait for regs: %r326,%r327,...,%r453,%rd56,%r102,%r103,%rd57,%r104,%r105
+wgmma.wait_group.sync.aligned 1;
+```
+
+This looked like the explicit register-liveness hint we'd been hypothesizing
+about. So we tried it: h9 wraps wgmma.wait_group with all 128 accumulator
+registers as input `"+f"` constraints — the actual C++ mechanism behind that
+PTX annotation. The constraints force nvcc to keep all 128 acc registers
+live across the wait_group asm.
+
+Findings:
+- Compiles and validates correctly
+- nvcc does NOT emit a "// wait for regs:" comment in the PTX (so the textual
+  annotation was a Triton-frontend thing, not something ptxas understands)
+- The PTX around `wgmma.wait_group` is byte-identical to s7's
+- Performance: **−5% vs s7** (slightly worse)
+
+Conclusion: the "wait for regs:" pattern is purely a debug annotation in
+Triton's PTX. The constraints behind it are technically present (we added
+them), but nvcc's scheduler doesn't use them to produce different code for
+our kernel. The whole register-hint hypothesis turned out to be a wild goose
+chase. The PTX-level optimization route is fully exhausted.
 
 ## What we learned about the actual bottleneck
 

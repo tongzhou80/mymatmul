@@ -79,6 +79,7 @@ _HOPPER_PREFIX_MAP = {
     "matmul_h6":   "h6",
     "matmul_h7":   "h7",
     "matmul_h8":   "h8",
+    "matmul_h9":   "h9",
     "matmul_h3":   "h3",
     # Exact-match entries (no config suffix in the CUDA kernel name)
     "matmul_kernel": "triton_ptx",
