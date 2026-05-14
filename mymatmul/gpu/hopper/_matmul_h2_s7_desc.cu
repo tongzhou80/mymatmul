@@ -4,23 +4,21 @@
 #include <cuda_bf16.h>
 
 /*
- * H6: h2_s7 with Triton-style epilogue (SMEM-staged, 16-byte coalesced stores).
+ * H5: h2_s7 with descriptor-advance optimization in COMPUTE_TILE.
  *
- * Single change vs h2_s7: the epilogue.
+ * Single change from h2_s7: instead of rebuilding each wgmma's A/B descriptor
+ * from scratch via shr/and/cvt/or, precompute the kk=0 descriptors outside
+ * the inner kk loop and just `+=` constant offsets to advance per kk step.
  *
- *   h2_s7: each thread writes 2× bfloat162 (4 bytes each) directly to global C.
- *          → 64 store transactions per thread, each 4 bytes.
+ * This mirrors what Triton's autotuned PTX does. In s7's PTX, ~8 integer
+ * instructions appear between each wgmma issue (descriptor rebuild). Triton
+ * has 2 (just `add.s64`). Fewer int ops between wgmma → higher warp-issue
+ * rate of wgmma → tensor pipe stays fed.
  *
- *   h6:    each thread first writes its acc[] values to SMEM at the wgmma-native
- *          positions, __syncthreads, then *all* threads cooperatively re-divide
- *          to read 16 contiguous bytes from SMEM and store 16 bytes to global.
- *          → 16 store transactions per thread, each 16 bytes (st.global.v4.b32).
- *          4× fewer global transactions = much better epilogue throughput.
- *
- *          SMEM cost: BM*BN*2 bytes of staging, reused from the (now-idle) A/B
- *          slot region after WAIT_MMA(0).
- *
- * Everything else (pipeline, wgmma, K loop) is identical to h2_s7.
+ * Encoded-form offsets per kk step:
+ *   B descriptor:  smem_addr advances by K_STEP_BYTES (= 2048 bytes)
+ *                  → descriptor's start field advances by K_STEP_BYTES/16 = 128
+ *   A descriptor:  start += 2 per kk step (already encoded in make_wgmma_a_desc)
  */
 
 #ifndef LB_MIN_BLOCKS
@@ -138,7 +136,7 @@ void wgmma_ss_call(float* acc, uint64_t desc_a, uint64_t desc_b) {
 // ── Kernel ────────────────────────────────────────────────────────────────────
 
 template<int BM, int BN, int BK, int NUM_WG, int NUM_STAGES>
-__device__ __forceinline__ void h6_impl(
+__device__ __forceinline__ void h2_s7_desc_impl(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
     __nv_bfloat16* __restrict__ C,
@@ -246,26 +244,34 @@ __device__ __forceinline__ void h6_impl(
     // "keep n commits in flight; guarantee the (n+1)th-oldest tile is in SMEM"
 #define WAIT_SMEM(n_) __pipeline_wait_prior(n_)
 
-    // COMPUTE_TILE: wgmma.fence + wgmma calls + commit (no drain)
+    // COMPUTE_TILE: precompute descriptors at kk=0; advance via += per kk step
+    //   B desc:    += K_STEP_BYTES >> 4 = 128  (smem_addr advances 2048 bytes)
+    //   A desc:    += 2                        (encoded form of kk*2 advance)
 #define COMPUTE_TILE(slot_)                                                         \
     do {                                                                            \
         wgmma_fence();                                                              \
-        _Pragma("unroll")                                                           \
+        const uint32_t _bb = (uint32_t)__cvta_generic_to_shared(                   \
+                                 &B_sh[(slot_)][0][0][0]);                         \
+        uint64_t _db = make_wgmma_b_desc<BN, BK>(_bb);                            \
+        uint64_t _da[M_ITERS];                                                     \
+        _Pragma("unroll")                                                          \
+        for (int _m = 0; _m < M_ITERS; _m++) {                                    \
+            const int _mrow = wg_id * M_PER_WG + _m * 64;                         \
+            const uint32_t _aa = (uint32_t)__cvta_generic_to_shared(              \
+                                     &A_sh[(slot_)][_mrow][0]);                    \
+            _da[_m] = make_wgmma_a_desc<BK>(_aa, 0);                              \
+        }                                                                          \
+        _Pragma("unroll")                                                          \
         for (int _kk = 0; _kk < BK / 16; _kk++) {                                 \
-            const uint32_t _bb = (uint32_t)__cvta_generic_to_shared(               \
-                                     &B_sh[(slot_)][0][0][0]);                     \
-            const uint64_t _db = make_wgmma_b_desc<BN, BK>(                       \
-                                     (uint32_t)(_bb + _kk * K_STEP_BYTES));        \
-            _Pragma("unroll")                                                       \
-            for (int _m = 0; _m < M_ITERS; _m++) {                                 \
-                const int _mrow = wg_id * M_PER_WG + _m * 64;                     \
-                const uint32_t _aa = (uint32_t)__cvta_generic_to_shared(           \
-                                         &A_sh[(slot_)][_mrow][0]);                \
-                const uint64_t _da = make_wgmma_a_desc<BK>(_aa, _kk);             \
-                wgmma_ss_call<BN>((float*)acc[_m], _da, _db);                      \
-            }                                                                       \
-        }                                                                           \
-        wgmma_commit();                                                             \
+            _Pragma("unroll")                                                      \
+            for (int _m = 0; _m < M_ITERS; _m++) {                                \
+                wgmma_ss_call<BN>((float*)acc[_m], _da[_m], _db);                 \
+            }                                                                      \
+            _db += (uint64_t)(K_STEP_BYTES >> 4);                                  \
+            _Pragma("unroll")                                                      \
+            for (int _m = 0; _m < M_ITERS; _m++) _da[_m] += 2;                    \
+        }                                                                          \
+        wgmma_commit();                                                            \
     } while (0)
 
     // WAIT_MMA(n): wgmma.wait_group n (compile-time constant via stringification)
@@ -308,65 +314,23 @@ __device__ __forceinline__ void h6_impl(
 #undef COMPUTE_TILE
 #undef WAIT_MMA
 
-    // ── Epilogue: SMEM-staged 16-byte coalesced stores ─────────────────────
-    //
-    // Step 1: each thread writes its acc[m][j*4..j*4+3] (4 fp32) to SMEM at the
-    //         wgmma-native position. Uses 4-byte (bfloat162) SMEM stores; SMEM
-    //         bandwidth is plenty.
-    // Step 2: __syncthreads.
-    // Step 3: re-divide work — all THREADS cooperatively write the BM*BN tile
-    //         to global C in 16-byte vector stores (uint4 = 8 BF16 per thread
-    //         per store). Total BM*BN/8 stores spread evenly across THREADS.
-    //
-    // SMEM region (BM*BN*2 bytes) reuses the A/B slot region from the K loop,
-    // which is no longer needed after WAIT_MMA(0).
-    __syncthreads();
-    // Pad row stride by 8 BF16 to break the power-of-2 bank-stride pattern.
-    // Without padding, row stride = BN*2 = 512 bytes → every row aligns to the
-    // same bank set → 4-way conflicts on stores. With +8 padding, row stride
-    // becomes (BN+8)*2 = 528 bytes → 132 bank-words → rows shift by 4 banks each.
-    constexpr int BN_PAD = BN + 8;
-    auto C_sh = reinterpret_cast<__nv_bfloat16 (*)[BN_PAD]>(smem_raw);
-
-    // Step 1: write acc[] to SMEM at wgmma-native positions
-    {
-        const int base_col = (lane % 4) * 2;
-        const int base_row = lane / 4;
-        #pragma unroll
-        for (int m = 0; m < M_ITERS; m++) {
-            const int row0 = wg_id * M_PER_WG + m * 64 + local_warp * 16 + base_row;
-            const int row8 = row0 + 8;
-            #pragma unroll
-            for (int j = 0; j < BN / 8; j++) {
-                const int col = j * 8 + base_col;
-                *reinterpret_cast<__nv_bfloat162*>(&C_sh[row0][col]) =
-                    __floats2bfloat162_rn(acc[m][j*4+0], acc[m][j*4+1]);
-                *reinterpret_cast<__nv_bfloat162*>(&C_sh[row8][col]) =
-                    __floats2bfloat162_rn(acc[m][j*4+2], acc[m][j*4+3]);
-            }
-        }
-    }
-    __syncthreads();
-
-    // Step 2: coalesced 16-byte stores from SMEM to global
-    //   BF_PER_STORE = 8 (16 bytes per store)
-    //   Per-thread stores = BM*BN / (THREADS * 8)
-    constexpr int BF_PER_STORE      = 8;
-    constexpr int STORES_PER_THREAD = (BM * BN) / (BF_PER_STORE * THREADS);
-    static_assert(STORES_PER_THREAD > 0 && (BM * BN) % (BF_PER_STORE * THREADS) == 0,
-                  "BM*BN must be a multiple of BF_PER_STORE*THREADS");
-
+    // ── Epilogue: write C ─────────────────────────────────────────────────────
+    const int base_col = (lane % 4) * 2;
+    const int base_row = lane / 4;
     #pragma unroll
-    for (int s = 0; s < STORES_PER_THREAD; s++) {
-        const int flat = tid + s * THREADS;
-        const int local_bf16 = flat * BF_PER_STORE;
-        const int row = local_bf16 / BN;
-        const int col = local_bf16 % BN;
-        const int gr  = block_row + row;
-        const int gc  = block_col + col;
-        if (gr < M && gc < N) {
-            uint4 data = *reinterpret_cast<const uint4*>(&C_sh[row][col]);
-            *reinterpret_cast<uint4*>(&C[gr * N + gc]) = data;
+    for (int m = 0; m < M_ITERS; m++) {
+        #pragma unroll
+        for (int j = 0; j < BN / 8; j++) {
+            const int gc  = block_col + j * 8 + base_col;
+            const int gr0 = block_row + wg_id * M_PER_WG + m * 64
+                            + local_warp * 16 + base_row;
+            const int gr8 = gr0 + 8;
+            if (gr0 < M && gc < N)
+                *reinterpret_cast<__nv_bfloat162*>(&C[gr0 * N + gc]) =
+                    __floats2bfloat162_rn(acc[m][j*4+0], acc[m][j*4+1]);
+            if (gr8 < M && gc < N)
+                *reinterpret_cast<__nv_bfloat162*>(&C[gr8 * N + gc]) =
+                    __floats2bfloat162_rn(acc[m][j*4+2], acc[m][j*4+3]);
         }
     }
 }
@@ -375,13 +339,13 @@ __device__ __forceinline__ void h6_impl(
 
 #define MAKE_LAUNCHER(BM_, BN_, BK_, NG_, NS_)                                   \
 extern "C" __global__ __launch_bounds__(NG_ * 128, LB_MIN_BLOCKS)               \
-void matmul_h6_bm##BM_##_bn##BN_##_bk##BK_##_wg##NG_##_ns##NS_(                \
+void matmul_h2_s7_desc_bm##BM_##_bn##BN_##_bk##BK_##_wg##NG_##_ns##NS_(                \
     const __nv_bfloat16* __restrict__ A,                                         \
     const __nv_bfloat16* __restrict__ B,                                         \
     __nv_bfloat16* __restrict__ C,                                               \
     int M, int K, int N)                                                         \
 {                                                                                \
-    h6_impl<BM_, BN_, BK_, NG_, NS_>(A, B, C, M, K, N);                        \
+    h2_s7_desc_impl<BM_, BN_, BK_, NG_, NS_>(A, B, C, M, K, N);                        \
 }
 
 #define MAKE3(BM_, BN_, BK_, NG_) \

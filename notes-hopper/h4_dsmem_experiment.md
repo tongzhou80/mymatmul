@@ -1,4 +1,4 @@
-# h2c — Cluster (2-CTA) experiment: didn't pay off
+# h4_dsmem — Cluster (2-CTA) experiment: didn't pay off
 
 **Status:** dead-end. Kept in tree as a functional reference, but slower than s7.
 
@@ -49,8 +49,8 @@ LOAD_ISSUE(nxt, ...)       # cp.async A + (rank 0) TMA-multicast B
 | Variant | TFLOPS | ms | speedup vs s7 |
 |---------|--------|----|----|
 | h2_s7 (baseline) | 604 | 0.227 | 1.00× |
-| h2c — Design A (DSMEM copy) | 305 | 0.451 | 0.50× |
-| h2c — Design B (TMA multicast, overlap pipeline) | 318 | 0.432 | 0.53× |
+| h4_dsmem — Design A (DSMEM copy) | 305 | 0.451 | 0.50× |
+| h4_dsmem — Design B (TMA multicast, overlap pipeline) | 318 | 0.432 | 0.53× |
 
 Both cluster designs are roughly half the speed of s7. Correctness checks pass at all sizes.
 
@@ -59,7 +59,7 @@ Both cluster designs are roughly half the speed of s7. Correctness checks pass a
 Both designs need a **cross-CTA barrier every iteration** (`cluster.sync()` or its equivalent). That barrier dominates the iter time:
 
 - s7 per-iter cost: ~7100 cycles (measured)
-- h2c per-iter cost: ~13500 cycles
+- h4_dsmem per-iter cost: ~13500 cycles
 - Extra cost: ~6400 cycles/iter
 
 The cluster.sync on Hopper appears to be on the order of 1000+ cycles, not the 50–100 a back-of-envelope suggests. Multiplied by ~64 K-iters, it overwhelms the AI gain.
@@ -81,4 +81,4 @@ Our s7-style design has all warps as consumers, so the cluster barrier becomes a
 - To raise the ceiling further, we'd need warp specialization or TMA + persistent kernels — a substantially larger rewrite.
 - The complicated optimization that only conditionally helps did not help here. Pattern matches earlier "advanced feature" experiments: the only optimizations that consistently pay off are the simple, must-win ones.
 
-Files kept in tree: `mymatmul/gpu/hopper/_matmul_h2c.cu`, `matmul_h2c.py`. Will not be used by default.
+Files kept in tree: `mymatmul/gpu/hopper/_matmul_h4_dsmem.cu`, `matmul_h2c.py`. Will not be used by default.

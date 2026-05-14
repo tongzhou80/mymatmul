@@ -10,13 +10,13 @@ re-run the same experiments.
 | Variant | Idea | Result | Files |
 |---|---|---|---|
 | h4 | `__cluster_dims__(1,2,1)` only | ~1% (within noise) | `_matmul_h4.cu` |
-| h4_s2 | Sweep cluster shapes | (1,1)/(1,2) ≈ s7; ≥(2,2) is −5–10% | `_matmul_h4_s2.cu` |
-| h5 | Descriptor advance (no rebuild) | −1–2% (slightly worse) | `_matmul_h5.cu` |
-| h6 | SMEM-staged 16-byte global stores | −10% (after fixing bank conflicts) | `_matmul_h6.cu` |
-| h7 | Split cp.async into 2 commits (A+B) | +3% at BK=32, −4% at BK=64 | `_matmul_h7.cu` |
-| h8 | Counter-based slot tracking (no `k%NS`) | −4% (slightly worse) | `_matmul_h8.cu` |
-| h9 | Triton's `wait for regs:` register-hint pattern on wait_group | −5% (slightly worse) | `_matmul_h9.cu` |
-| h2c | 2-CTA cluster + DSMEM/TMA-multicast | −50% (h2c_cluster_experiment.md) | `_matmul_h2c.cu` |
+| h4_shapes | Sweep cluster shapes | (1,1)/(1,2) ≈ s7; ≥(2,2) is −5–10% | `_matmul_h4_shapes.cu` |
+| h2_s7_desc | Descriptor advance (no rebuild) | −1–2% (slightly worse) | `_matmul_h2_s7_desc.cu` |
+| h2_s7_smem_epi | SMEM-staged 16-byte global stores | −10% (after fixing bank conflicts) | `_matmul_h2_s7_smem_epi.cu` |
+| h2_s7_split | Split cp.async into 2 commits (A+B) | +3% at BK=32, −4% at BK=64 | `_matmul_h2_s7_split.cu` |
+| h2_s7_counter | Counter-based slot tracking (no `k%NS`) | −4% (slightly worse) | `_matmul_h2_s7_counter.cu` |
+| h2_s7_wait_hint | Triton's `wait for regs:` register-hint pattern on wait_group | −5% (slightly worse) | `_matmul_h2_s7_wait_hint.cu` |
+| h4_dsmem | 2-CTA cluster + DSMEM/TMA-multicast | −50% (h4_dsmem_experiment.md) | `_matmul_h4_dsmem.cu` |
 
 ### Same-config head-to-head with Triton (the real puzzle)
 
@@ -54,7 +54,7 @@ This is the same lesson as h5: micro-optimizing instruction counts around wgmma 
 
 ### Where the remaining gap actually lives
 
-After h4, h4_s2, h5, h6, h7, h8, the structural rules we've derived:
+After h4, h4_shapes, h5, h6, h7, h8, the structural rules we've derived:
 - Almost any PTX-visible micro-optimization is a wash or slight regression
 - Larger structural changes (clusters, SMEM-staged epilogue, descriptor schemes) are net-negative
 - Triton's ~22% advantage at same config is in things the PTX surface does not show
@@ -65,7 +65,7 @@ The remaining lead would require either:
 
 We have stopped pursuing PTX-level optimizations. s7 at ~600 TFLOPS is the design's ceiling.
 
-### h9 — the "wait for regs" hint that turned out to be nothing
+### h2_s7_wait_hint — the "wait for regs" hint that turned out to be nothing
 
 Triton's PTX shows:
 ```
@@ -125,10 +125,10 @@ nothing but wgmma), which is a substantially different kernel design.
 ### h4 — `__cluster_dims__(1,2,1)` is essentially free
 Adding the cluster attribute with no DSMEM, no cluster.sync, no anything else
 gave ~1% performance change. **Launching CTAs in clusters by itself has no
-overhead.** This proves the slowdown in h2c came from the *sync + DSMEM
+overhead.** This proves the slowdown in h4_dsmem came from the *sync + DSMEM
 operations*, not from cluster scheduling.
 
-### h4_s2 — Cluster shape doesn't matter (in the right direction)
+### h4_shapes — Cluster shape doesn't matter (in the right direction)
 Swept (1,1), (1,2), (2,1), (2,2), (1,4), (4,1), (2,4), (4,2):
 
 ```
@@ -141,7 +141,7 @@ size     (1,1)   (1,2)   (2,1)   (2,2)   (1,4)   (4,1)   (2,4)   (4,2)
 (1,1) and (1,2) tied at the top, anything bigger hurts ≥5%. Likely a side
 effect of SM-placement constraints when clusters span GPCs unfavourably.
 
-### h5 — Descriptor advance optimization is irrelevant
+### h2_s7_desc — Descriptor advance optimization is irrelevant
 s7's `COMPUTE_TILE` rebuilds the wgmma descriptor on each kk step (8 int ops
 between wgmma issues: `shr → and → cvt → or`). Triton's PTX uses `add.s64` to
 advance the descriptor (2 int ops). We applied the same pattern.
@@ -167,7 +167,7 @@ could use to hide other latencies. Removing them just exposed the underlying
 wgmma serialization. The descriptor rebuild wasn't actually costing us
 anything.
 
-### h6 — SMEM-staged 16-byte stores
+### h2_s7_smem_epi — SMEM-staged 16-byte stores
 s7 emits 4-byte global stores direct from wgmma accumulator. h6 stages
 through SMEM, then emits 16-byte coalesced `st.global.v4.b32` (mirroring
 Triton's epilogue). The idea: 4× fewer global store transactions.
@@ -198,7 +198,7 @@ Also: the H800 LSU has **store-combining logic** that recovers a lot of the
 "scattered 4-byte" cost in s7. The naive cost model ("4-byte stores are 4×
 slower than 16-byte stores") overestimates the upside.
 
-### h2c — 2-CTA cluster + DSMEM / TMA-multicast (see h2c_cluster_experiment.md)
+### h4_dsmem — 2-CTA cluster + DSMEM / TMA-multicast (see h4_dsmem_experiment.md)
 The headline experiment of this series. Both DSMEM-copy and TMA-multicast
 designs ran at ~50% of s7's speed, because each iter needs a `cluster.sync`
 that drifts as much as ~3000+ cycles per iter due to inter-SM scheduling
@@ -210,7 +210,7 @@ realised cost in a memory-bound steady state.
 Every "advanced" optimization we tried either:
 - Did nothing (h4, h5)
 - Made things slightly worse (h5 stall metrics, h6 perf)
-- Made things much worse (h2c, h4_s2 large shapes)
+- Made things much worse (h4_dsmem, h4_shapes large shapes)
 
 The s7 design is already **structurally at its ceiling**. The remaining
 ~15% gap to Triton/cuBLAS lives in design choices we can't bolt on:

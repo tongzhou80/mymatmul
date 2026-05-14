@@ -4,21 +4,14 @@
 #include <cuda_bf16.h>
 
 /*
- * H5: h2_s7 with descriptor-advance optimization in COMPUTE_TILE.
+ * H7: h2_s7 with cp.async loads split into 2 commit groups (A and B separately).
  *
- * Single change from h2_s7: instead of rebuilding each wgmma's A/B descriptor
- * from scratch via shr/and/cvt/or, precompute the kk=0 descriptors outside
- * the inner kk loop and just `+=` constant offsets to advance per kk step.
+ * Triton's PTX issues 8 cp.async.commit_group total (2 per stage × 4 stages);
+ * s7 issues 3 (1 per stage × 3 stages). Splitting into 2 commits per iter gives
+ * a deeper cp.async pipeline: with NS stages, 2*(NS-1) commits in flight at peak.
+ * More outstanding L2/HBM transactions = more latency hiding.
  *
- * This mirrors what Triton's autotuned PTX does. In s7's PTX, ~8 integer
- * instructions appear between each wgmma issue (descriptor rebuild). Triton
- * has 2 (just `add.s64`). Fewer int ops between wgmma → higher warp-issue
- * rate of wgmma → tensor pipe stays fed.
- *
- * Encoded-form offsets per kk step:
- *   B descriptor:  smem_addr advances by K_STEP_BYTES (= 2048 bytes)
- *                  → descriptor's start field advances by K_STEP_BYTES/16 = 128
- *   A descriptor:  start += 2 per kk step (already encoded in make_wgmma_a_desc)
+ * Wait counts switch from "stages" to "half-stages" (2 commits per stage).
  */
 
 #ifndef LB_MIN_BLOCKS
@@ -136,7 +129,7 @@ void wgmma_ss_call(float* acc, uint64_t desc_a, uint64_t desc_b) {
 // ── Kernel ────────────────────────────────────────────────────────────────────
 
 template<int BM, int BN, int BK, int NUM_WG, int NUM_STAGES>
-__device__ __forceinline__ void h5_impl(
+__device__ __forceinline__ void h2_s7_split_impl(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
     __nv_bfloat16* __restrict__ C,
@@ -210,9 +203,14 @@ __device__ __forceinline__ void h5_impl(
     //
     //   WAIT_MMA(0)             ← drain final group before epilogue
 
-    // cp.async backend: LOAD_TILE = per-thread memcpy_async + pipeline_commit
+    // h7: split A and B into 2 separate cp.async commit groups per iter.
+    //     Each iter issues 2 commits; with NS stages, peak = 2*(NS-1) commits.
+    //     Wait count is doubled vs s7 (we count in half-stages now).
+    //     Why split? Triton does this (8 commits vs our 3) for deeper cp.async
+    //     pipeline → more outstanding L2/HBM transactions → better latency hiding.
 #define LOAD_TILE(slot_, k0_)                                                       \
     do {                                                                            \
+        /* Commit 1: A only */                                                      \
         _Pragma("unroll")                                                           \
         for (int _i = 0; _i < A_GROUPS; _i++) {                                    \
             const int _g  = tid + _i * THREADS;                                    \
@@ -224,6 +222,8 @@ __device__ __forceinline__ void h5_impl(
                 &A[(block_row + _r) * K + (k0_) + _c],                             \
                 A_ELEM * (int)sizeof(__nv_bfloat16));                               \
         }                                                                           \
+        __pipeline_commit();                                                         \
+        /* Commit 2: B only */                                                      \
         _Pragma("unroll")                                                           \
         for (int _i = 0; _i < B_GROUPS; _i++) {                                    \
             const int _g    = tid + _i * THREADS;                                  \
@@ -240,38 +240,29 @@ __device__ __forceinline__ void h5_impl(
         __pipeline_commit();                                                         \
     } while (0)
 
-    // cp.async backend: WAIT_SMEM(n) = pipeline_wait_prior(n)
-    // "keep n commits in flight; guarantee the (n+1)th-oldest tile is in SMEM"
-#define WAIT_SMEM(n_) __pipeline_wait_prior(n_)
+    // h7: WAIT_SMEM counts in *half-stages* now (2 commits per stage).
+#define WAIT_SMEM(n_) __pipeline_wait_prior(2 * (n_))
 
-    // COMPUTE_TILE: precompute descriptors at kk=0; advance via += per kk step
-    //   B desc:    += K_STEP_BYTES >> 4 = 128  (smem_addr advances 2048 bytes)
-    //   A desc:    += 2                        (encoded form of kk*2 advance)
+    // COMPUTE_TILE: wgmma.fence + wgmma calls + commit (no drain)
 #define COMPUTE_TILE(slot_)                                                         \
     do {                                                                            \
         wgmma_fence();                                                              \
-        const uint32_t _bb = (uint32_t)__cvta_generic_to_shared(                   \
-                                 &B_sh[(slot_)][0][0][0]);                         \
-        uint64_t _db = make_wgmma_b_desc<BN, BK>(_bb);                            \
-        uint64_t _da[M_ITERS];                                                     \
-        _Pragma("unroll")                                                          \
-        for (int _m = 0; _m < M_ITERS; _m++) {                                    \
-            const int _mrow = wg_id * M_PER_WG + _m * 64;                         \
-            const uint32_t _aa = (uint32_t)__cvta_generic_to_shared(              \
-                                     &A_sh[(slot_)][_mrow][0]);                    \
-            _da[_m] = make_wgmma_a_desc<BK>(_aa, 0);                              \
-        }                                                                          \
-        _Pragma("unroll")                                                          \
+        _Pragma("unroll")                                                           \
         for (int _kk = 0; _kk < BK / 16; _kk++) {                                 \
-            _Pragma("unroll")                                                      \
-            for (int _m = 0; _m < M_ITERS; _m++) {                                \
-                wgmma_ss_call<BN>((float*)acc[_m], _da[_m], _db);                 \
-            }                                                                      \
-            _db += (uint64_t)(K_STEP_BYTES >> 4);                                  \
-            _Pragma("unroll")                                                      \
-            for (int _m = 0; _m < M_ITERS; _m++) _da[_m] += 2;                    \
-        }                                                                          \
-        wgmma_commit();                                                            \
+            const uint32_t _bb = (uint32_t)__cvta_generic_to_shared(               \
+                                     &B_sh[(slot_)][0][0][0]);                     \
+            const uint64_t _db = make_wgmma_b_desc<BN, BK>(                       \
+                                     (uint32_t)(_bb + _kk * K_STEP_BYTES));        \
+            _Pragma("unroll")                                                       \
+            for (int _m = 0; _m < M_ITERS; _m++) {                                 \
+                const int _mrow = wg_id * M_PER_WG + _m * 64;                     \
+                const uint32_t _aa = (uint32_t)__cvta_generic_to_shared(           \
+                                         &A_sh[(slot_)][_mrow][0]);                \
+                const uint64_t _da = make_wgmma_a_desc<BK>(_aa, _kk);             \
+                wgmma_ss_call<BN>((float*)acc[_m], _da, _db);                      \
+            }                                                                       \
+        }                                                                           \
+        wgmma_commit();                                                             \
     } while (0)
 
     // WAIT_MMA(n): wgmma.wait_group n (compile-time constant via stringification)
@@ -339,13 +330,13 @@ __device__ __forceinline__ void h5_impl(
 
 #define MAKE_LAUNCHER(BM_, BN_, BK_, NG_, NS_)                                   \
 extern "C" __global__ __launch_bounds__(NG_ * 128, LB_MIN_BLOCKS)               \
-void matmul_h5_bm##BM_##_bn##BN_##_bk##BK_##_wg##NG_##_ns##NS_(                \
+void matmul_h2_s7_split_bm##BM_##_bn##BN_##_bk##BK_##_wg##NG_##_ns##NS_(              \
     const __nv_bfloat16* __restrict__ A,                                         \
     const __nv_bfloat16* __restrict__ B,                                         \
     __nv_bfloat16* __restrict__ C,                                               \
     int M, int K, int N)                                                         \
 {                                                                                \
-    h5_impl<BM_, BN_, BK_, NG_, NS_>(A, B, C, M, K, N);                        \
+    h2_s7_split_impl<BM_, BN_, BK_, NG_, NS_>(A, B, C, M, K, N);                      \
 }
 
 #define MAKE3(BM_, BN_, BK_, NG_) \
@@ -353,7 +344,24 @@ void matmul_h5_bm##BM_##_bn##BN_##_bk##BK_##_wg##NG_##_ns##NS_(                \
     MAKE_LAUNCHER(BM_, BN_, BK_, NG_, 3) \
     MAKE_LAUNCHER(BM_, BN_, BK_, NG_, 4) \
     MAKE_LAUNCHER(BM_, BN_, BK_, NG_, 5)
-// Single launcher: best config (BM=128, BN=256, BK=64, WG=2, NS=3)
-MAKE_LAUNCHER(128, 256, 64, 2, 3)
+
+// NW=1 warpgroup
+MAKE3( 64,  64, 16, 1) MAKE3( 64,  64, 32, 1) MAKE3( 64,  64, 64, 1)
+MAKE3( 64, 128, 16, 1) MAKE3( 64, 128, 32, 1) MAKE3( 64, 128, 64, 1)
+MAKE3( 64, 256, 16, 1) MAKE3( 64, 256, 32, 1) MAKE3( 64, 256, 64, 1)
+MAKE3(128,  64, 16, 1) MAKE3(128,  64, 32, 1) MAKE3(128,  64, 64, 1)
+MAKE3(128, 128, 16, 1) MAKE3(128, 128, 32, 1) MAKE3(128, 128, 64, 1)
+MAKE3(128, 256, 16, 1) MAKE3(128, 256, 32, 1) MAKE3(128, 256, 64, 1)
+MAKE3(256,  64, 16, 1) MAKE3(256,  64, 32, 1) MAKE3(256,  64, 64, 1)
+MAKE3(256, 128, 16, 1) MAKE3(256, 128, 32, 1) MAKE3(256, 128, 64, 1)
+
+// NW=2 warpgroups
+MAKE3(128,  64, 16, 2) MAKE3(128,  64, 32, 2) MAKE3(128,  64, 64, 2)
+MAKE3(128, 128, 16, 2) MAKE3(128, 128, 32, 2) MAKE3(128, 128, 64, 2)
+MAKE3(128, 256, 16, 2) MAKE3(128, 256, 32, 2) MAKE3(128, 256, 64, 2)
+MAKE3(256,  64, 16, 2) MAKE3(256,  64, 32, 2) MAKE3(256,  64, 64, 2)
+MAKE3(256, 128, 16, 2) MAKE3(256, 128, 32, 2) MAKE3(256, 128, 64, 2)
+MAKE3(256, 256, 16, 2) MAKE3(256, 256, 32, 2) MAKE3(256, 256, 64, 2)
+
 #undef MAKE3
 #undef MAKE_LAUNCHER

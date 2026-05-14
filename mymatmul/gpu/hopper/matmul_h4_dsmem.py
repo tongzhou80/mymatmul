@@ -1,8 +1,11 @@
-"""H6: h2_s7 with Triton-style SMEM-staged epilogue.
+"""H2 Cluster (h2c): s7 + 2-CTA cluster + TMA multicast for B.
 
-Only difference from h2_s7: the C write-back. h2_s7 emits 4-byte global stores
-direct from the wgmma accumulator; h6 stages through SMEM and emits 16-byte
-coalesced stores (st.global.v4.b32). 4× fewer global store transactions.
+Same as h2_s7 except:
+  * Kernel is launched with __cluster_dims__(1, 2, 1) — 2 CTAs along M.
+  * B is loaded via TMA multicast (one DRAM round-trip, delivered to both CTAs).
+  * A still uses cp.async (s7-style).
+
+AI: 85.3 → 128 F/B.  BK config space: {32, 64} (matches s7 BK ≥ 32 viable set).
 """
 
 import ctypes, os, subprocess, threading, atexit
@@ -35,10 +38,10 @@ def _chk(err, op=""):
 # ── Compilation ───────────────────────────────────────────────────────────────
 
 _HOPPER_DIR = os.path.dirname(os.path.abspath(__file__))
-_CU_PATH    = os.path.join(_HOPPER_DIR, "_matmul_h6.cu")
+_CU_PATH    = os.path.join(_HOPPER_DIR, "_matmul_h4_dsmem.cu")
 _NVCC       = "/usr/local/cuda/bin/nvcc"
 _ARCH       = "sm_90a"
-_CUBIN      = os.path.join(_HOPPER_DIR, f"_matmul_h6_{_ARCH}.cubin")
+_CUBIN      = os.path.join(_HOPPER_DIR, f"_matmul_h4_dsmem_{_ARCH}.cubin")
 
 _mod_lock = threading.Lock()
 _module   = None
@@ -49,7 +52,7 @@ def _get_mod():
         if _module is not None: return _module
         _ensure_ctx()
         if not os.path.exists(_CUBIN) or os.path.getmtime(_CU_PATH) > os.path.getmtime(_CUBIN):
-            print(f"[h6] compiling for {_ARCH} ...", end=" ", flush=True)
+            print(f"[h4_dsmem] compiling for {_ARCH} ...", end=" ", flush=True)
             cmd = [_NVCC, f"-arch={_ARCH}", "-O3", "--std=c++17", "--cubin",
                    "-DLB_MIN_BLOCKS=1", _CU_PATH, "-o", _CUBIN]
             r = subprocess.run(cmd, capture_output=True, text=True)
@@ -59,13 +62,31 @@ def _get_mod():
         _module = mod
     return _module
 
+# ── TMA descriptor helpers (B uses 128B swizzle, 64-col boxDim) ──────────────
+
+_DTYPE_BF16      = cudrvr.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
+_SWIZZLE_128B    = cudrvr.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B
+_INTERLEAVE_NONE = cudrvr.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE
+_L2_PROMO_NONE   = cudrvr.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE
+_OOB_FILL_NONE   = cudrvr.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+
+def _make_tma_desc(ptr_int, nrows, ncols, box_rows, box_cols):
+    u32, u64 = cudrvr.cuuint32_t, cudrvr.cuuint64_t
+    err, tmap = cudrvr.cuTensorMapEncodeTiled(
+        _DTYPE_BF16, 2, ptr_int,
+        [u64(ncols), u64(nrows)], [u64(ncols * 2)],
+        [u32(box_cols), u32(box_rows)], [u32(1), u32(1)],
+        _INTERLEAVE_NONE, _SWIZZLE_128B, _L2_PROMO_NONE, _OOB_FILL_NONE)
+    _chk(err, "cuTensorMapEncodeTiled")
+    return np.array([int(v) for v in tmap.opaque], dtype=np.uint64).tobytes()
+
 # ── Config space ──────────────────────────────────────────────────────────────
 
-_BMS = [64, 128, 256]
-_BNS = [64, 128, 256]
-_BKS = [16, 32, 64]
-_NWS = [1, 2]
-_NSS = [2, 3, 4, 5]
+_BMS  = [64, 128, 256]
+_BNS  = [64, 128, 256]
+_BKS  = [32, 64]                  # TMA 128B swizzle requires BK ≥ 32 (sane)
+_NWS  = [1, 2]
+_NSS  = [2, 3, 4, 5]
 _MAX_SMEM = 200 * 1024
 
 DTYPE = torch.bfloat16
@@ -74,12 +95,8 @@ DTYPE = torch.bfloat16
 def _m_iters(bm, nwg): return bm // (nwg * 64)
 
 def _smem(bm, bn, bk, ns):
-    # SMEM must hold the K-loop staging (A+B over NS slots) OR the epilogue
-    # staging (BM × (BN+8) BF16, padded to break bank-stride conflicts),
-    # whichever is larger. Regions overlap at smem_raw[0], disjoint in time.
-    ab = (ns * bm * bk + ns * bk * bn) * 2
-    c  = bm * (bn + 8) * 2
-    return max(ab, c)
+    # A: NS×BM×BK, B: NS×BK×BN, plus NS mbarriers (8B each, 8B-aligned)
+    return (ns * bm * bk + ns * bk * bn) * 2 + ns * 8
 
 def _reg_estimate(bm, bn, bk, nwg):
     return _m_iters(bm, nwg) * (bn // 2) + 20
@@ -96,7 +113,7 @@ _CONFIGS = [
 
 
 def _kname(bm, bn, bk, nwg, ns):
-    return f"matmul_h6_bm{bm}_bn{bn}_bk{bk}_wg{nwg}_ns{ns}"
+    return f"matmul_h4_dsmem_bm{bm}_bn{bn}_bk{bk}_wg{nwg}_ns{ns}"
 
 # ── Launch ────────────────────────────────────────────────────────────────────
 
@@ -113,16 +130,20 @@ def _set_max_smem(fn, sb):
 
 def _launch(mod, kname, A, B, bm, bn, bk, nwg, ns):
     M, K = A.shape;  _, N = B.shape
+    # cluster_dims y=2: gridDim.y (= M/BM) must be even
+    assert (M // bm) % 2 == 0, f"M/BM = {M//bm} must be even (cluster y=2)"
     C = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
     fn = _get_fn(mod, kname)
     sb = _smem(bm, bn, bk, ns)
     _set_max_smem(fn, sb)
+    # B: TMA descriptor — 128B swizzle, box = [64 cols, bk rows]
+    buf_b = ctypes.create_string_buffer(
+        _make_tma_desc(B.data_ptr(), K, N, bk, 64), 128)
     c_A = ctypes.c_void_p(A.data_ptr())
-    c_B = ctypes.c_void_p(B.data_ptr())
     c_C = ctypes.c_void_p(C.data_ptr())
     c_M, c_K, c_N = ctypes.c_int(M), ctypes.c_int(K), ctypes.c_int(N)
     params = np.array([ctypes.addressof(x) for x in
-                       [c_A, c_B, c_C, c_M, c_K, c_N]], dtype=np.intp)
+                       [c_A, buf_b, c_C, c_M, c_K, c_N]], dtype=np.intp)
     grid = ((N + bn - 1) // bn, (M + bm - 1) // bm, 1)
     (err,) = cudrvr.cuLaunchKernel(fn, *grid, nwg * 128, 1, 1, sb, 0, params, 0)
     _chk(err, f"cuLaunchKernel({kname})")
@@ -149,8 +170,9 @@ def _tune(M, N, K):
     mod = _get_mod()
     cfgs = [(bm, bn, bk, nwg, ns) for bm, bn, bk, nwg, ns in _CONFIGS
             if M % bm == 0 and N % bn == 0 and K % bk == 0
-            and K // bk >= ns]
-    best_t, best = float("inf"), cfgs[0]
+            and K // bk >= ns
+            and (M // bm) % 2 == 0]
+    best_t, best = float("inf"), cfgs[0] if cfgs else None
     for i, (bm, bn, bk, nwg, ns) in enumerate(cfgs):
         kn = _kname(bm, bn, bk, nwg, ns)
         try:
@@ -169,17 +191,18 @@ def _tune(M, N, K):
     return best
 
 
-def matmul_h6(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+def matmul_h4_dsmem(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     M, K = A.shape;  _, N = B.shape
     key = (M, N, K)
     if key not in _best:
         cfgs = [(bm, bn, bk, nwg, ns) for bm, bn, bk, nwg, ns in _CONFIGS
                 if M % bm == 0 and N % bn == 0 and K % bk == 0
-                and K // bk >= ns]
-        print(f"[h6] autotuning {M}×{N}×{K} over {len(cfgs)} configs ...")
+                and K // bk >= ns
+                and (M // bm) % 2 == 0]
+        print(f"[h4_dsmem] autotuning {M}×{N}×{K} over {len(cfgs)} configs ...")
         _best[key] = _tune(M, N, K)
         bm, bn, bk, nwg, ns = _best[key]
         mi = _m_iters(bm, nwg)
-        print(f"[h6] best: BM={bm} BN={bn} BK={bk} WG={nwg} NS={ns} M_ITERS={mi}")
+        print(f"[h4_dsmem] best: BM={bm} BN={bn} BK={bk} WG={nwg} NS={ns} M_ITERS={mi}")
     bm, bn, bk, nwg, ns = _best[key]
     return _launch(_get_mod(), _kname(bm, bn, bk, nwg, ns), A, B, bm, bn, bk, nwg, ns)

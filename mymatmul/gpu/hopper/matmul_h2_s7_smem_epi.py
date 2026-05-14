@@ -1,11 +1,8 @@
-"""H2 Stage 7: h2_s6 + wgmma.wait_group 1 (overlap wgmma with next tile load).
+"""H6: h2_s7 with Triton-style SMEM-staged epilogue.
 
-Key change vs h2_s6:
-  Instead of draining wgmma fully (wait_group 0) after every tile, use
-  wait_group 1: keep 1 wgmma group in flight while loading the next tile.
-  Hardware serialises acc[] writes across groups automatically.
-  ISSUE placed after wait_group 1 (not before compute) for SMEM slot safety.
-  Derived from Triton PTX analysis (notes-hopper/triton_ptx_analysis.md).
+Only difference from h2_s7: the C write-back. h2_s7 emits 4-byte global stores
+direct from the wgmma accumulator; h6 stages through SMEM and emits 16-byte
+coalesced stores (st.global.v4.b32). 4× fewer global store transactions.
 """
 
 import ctypes, os, subprocess, threading, atexit
@@ -38,10 +35,10 @@ def _chk(err, op=""):
 # ── Compilation ───────────────────────────────────────────────────────────────
 
 _HOPPER_DIR = os.path.dirname(os.path.abspath(__file__))
-_CU_PATH    = os.path.join(_HOPPER_DIR, "_matmul_h8.cu")
+_CU_PATH    = os.path.join(_HOPPER_DIR, "_matmul_h2_s7_smem_epi.cu")
 _NVCC       = "/usr/local/cuda/bin/nvcc"
 _ARCH       = "sm_90a"
-_CUBIN      = os.path.join(_HOPPER_DIR, f"_matmul_h8_{_ARCH}.cubin")
+_CUBIN      = os.path.join(_HOPPER_DIR, f"_matmul_h2_s7_smem_epi_{_ARCH}.cubin")
 
 _mod_lock = threading.Lock()
 _module   = None
@@ -52,7 +49,7 @@ def _get_mod():
         if _module is not None: return _module
         _ensure_ctx()
         if not os.path.exists(_CUBIN) or os.path.getmtime(_CU_PATH) > os.path.getmtime(_CUBIN):
-            print(f"[h8] compiling for {_ARCH} ...", end=" ", flush=True)
+            print(f"[h2_s7_smem_epi] compiling for {_ARCH} ...", end=" ", flush=True)
             cmd = [_NVCC, f"-arch={_ARCH}", "-O3", "--std=c++17", "--cubin",
                    "-DLB_MIN_BLOCKS=1", _CU_PATH, "-o", _CUBIN]
             r = subprocess.run(cmd, capture_output=True, text=True)
@@ -77,7 +74,12 @@ DTYPE = torch.bfloat16
 def _m_iters(bm, nwg): return bm // (nwg * 64)
 
 def _smem(bm, bn, bk, ns):
-    return (ns * bm * bk + ns * bk * bn) * 2
+    # SMEM must hold the K-loop staging (A+B over NS slots) OR the epilogue
+    # staging (BM × (BN+8) BF16, padded to break bank-stride conflicts),
+    # whichever is larger. Regions overlap at smem_raw[0], disjoint in time.
+    ab = (ns * bm * bk + ns * bk * bn) * 2
+    c  = bm * (bn + 8) * 2
+    return max(ab, c)
 
 def _reg_estimate(bm, bn, bk, nwg):
     return _m_iters(bm, nwg) * (bn // 2) + 20
@@ -94,7 +96,7 @@ _CONFIGS = [
 
 
 def _kname(bm, bn, bk, nwg, ns):
-    return f"matmul_h8_bm{bm}_bn{bn}_bk{bk}_wg{nwg}_ns{ns}"
+    return f"matmul_h2_s7_smem_epi_bm{bm}_bn{bn}_bk{bk}_wg{nwg}_ns{ns}"
 
 # ── Launch ────────────────────────────────────────────────────────────────────
 
@@ -167,17 +169,17 @@ def _tune(M, N, K):
     return best
 
 
-def matmul_h8(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+def matmul_h2_s7_smem_epi(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     M, K = A.shape;  _, N = B.shape
     key = (M, N, K)
     if key not in _best:
         cfgs = [(bm, bn, bk, nwg, ns) for bm, bn, bk, nwg, ns in _CONFIGS
                 if M % bm == 0 and N % bn == 0 and K % bk == 0
                 and K // bk >= ns]
-        print(f"[h8] autotuning {M}×{N}×{K} over {len(cfgs)} configs ...")
+        print(f"[h2_s7_smem_epi] autotuning {M}×{N}×{K} over {len(cfgs)} configs ...")
         _best[key] = _tune(M, N, K)
         bm, bn, bk, nwg, ns = _best[key]
         mi = _m_iters(bm, nwg)
-        print(f"[h8] best: BM={bm} BN={bn} BK={bk} WG={nwg} NS={ns} M_ITERS={mi}")
+        print(f"[h2_s7_smem_epi] best: BM={bm} BN={bn} BK={bk} WG={nwg} NS={ns} M_ITERS={mi}")
     bm, bn, bk, nwg, ns = _best[key]
     return _launch(_get_mod(), _kname(bm, bn, bk, nwg, ns), A, B, bm, bn, bk, nwg, ns)

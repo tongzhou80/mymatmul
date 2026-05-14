@@ -4,28 +4,23 @@
 #include <cuda_bf16.h>
 
 /*
- * H2 Stage 7: h2_s6 + wgmma.wait_group 1 (allow 1 wgmma group in flight).
+ * H6: h2_s7 with Triton-style epilogue (SMEM-staged, 16-byte coalesced stores).
  *
- * Key insight from Triton PTX analysis:
- *   h2_s6 used wgmma.wait_group 0 after every tile — fully draining the tensor
- *   core pipeline before proceeding. This caused ~40% membar stalls.
+ * Single change vs h2_s7: the epilogue.
  *
- *   Triton uses wgmma.wait_group 1: commit group k, then only wait for group
- *   k-1. Group k stays in the tensor core pipeline while we load the next tile.
- *   The hardware serialises acc[] writes automatically, so group k+1's wgmma
- *   reads the correct accumulated values. Only at the epilogue do we wait_group 0.
+ *   h2_s7: each thread writes 2× bfloat162 (4 bytes each) directly to global C.
+ *          → 64 store transactions per thread, each 4 bytes.
  *
- *   Also from PTX: ISSUE must come AFTER wait_group 1 (not before compute).
- *   wait_group 1 at iter k proves wgmma[k-1] has released its SMEM slot;
- *   only then is it safe to overwrite that slot with the next tile's cp.async.
+ *   h6:    each thread first writes its acc[] values to SMEM at the wgmma-native
+ *          positions, __syncthreads, then *all* threads cooperatively re-divide
+ *          to read 16 contiguous bytes from SMEM and store 16 bytes to global.
+ *          → 16 store transactions per thread, each 16 bytes (st.global.v4.b32).
+ *          4× fewer global transactions = much better epilogue throughput.
  *
- * Loop structure (adapted from Triton PTX lines 569–666):
- *   for k = 0..num_tiles-1:
- *     pipeline_wait_prior(NS-1);  __syncthreads()       // oldest tile ready
- *     wgmma.fence; wgmma × BK/16; wgmma.commit_group   // compute tile k
- *     wgmma.wait_group 1                                // wait for k-1
- *     if k+NS-1 < num_tiles: __syncthreads(); ISSUE     // issue next tile
- *   wgmma.wait_group 0                                  // drain last group
+ *          SMEM cost: BM*BN*2 bytes of staging, reused from the (now-idle) A/B
+ *          slot region after WAIT_MMA(0).
+ *
+ * Everything else (pipeline, wgmma, K loop) is identical to h2_s7.
  */
 
 #ifndef LB_MIN_BLOCKS
@@ -43,275 +38,6 @@ __device__ __forceinline__ void wgmma_commit() {
 __device__ __forceinline__ void wgmma_wait_0() {
     asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
 }
-
-// h9: wgmma.wait_group with all 128 accumulator regs as input constraints
-//     (mirrors Triton's "wait for regs:" pattern, forcing the compiler to
-//     treat the wait as a register-aware sync point for the entire accumulator).
-__device__ __forceinline__ void wgmma_wait_1_with_acc_hint(float d[128]) {
-    asm volatile("wgmma.wait_group.sync.aligned 1;\n"
-        : "+f"(d[0]),
-         "+f"(d[1]),
-         "+f"(d[2]),
-         "+f"(d[3]),
-         "+f"(d[4]),
-         "+f"(d[5]),
-         "+f"(d[6]),
-         "+f"(d[7]),
-         "+f"(d[8]),
-         "+f"(d[9]),
-         "+f"(d[10]),
-         "+f"(d[11]),
-         "+f"(d[12]),
-         "+f"(d[13]),
-         "+f"(d[14]),
-         "+f"(d[15]),
-         "+f"(d[16]),
-         "+f"(d[17]),
-         "+f"(d[18]),
-         "+f"(d[19]),
-         "+f"(d[20]),
-         "+f"(d[21]),
-         "+f"(d[22]),
-         "+f"(d[23]),
-         "+f"(d[24]),
-         "+f"(d[25]),
-         "+f"(d[26]),
-         "+f"(d[27]),
-         "+f"(d[28]),
-         "+f"(d[29]),
-         "+f"(d[30]),
-         "+f"(d[31]),
-         "+f"(d[32]),
-         "+f"(d[33]),
-         "+f"(d[34]),
-         "+f"(d[35]),
-         "+f"(d[36]),
-         "+f"(d[37]),
-         "+f"(d[38]),
-         "+f"(d[39]),
-         "+f"(d[40]),
-         "+f"(d[41]),
-         "+f"(d[42]),
-         "+f"(d[43]),
-         "+f"(d[44]),
-         "+f"(d[45]),
-         "+f"(d[46]),
-         "+f"(d[47]),
-         "+f"(d[48]),
-         "+f"(d[49]),
-         "+f"(d[50]),
-         "+f"(d[51]),
-         "+f"(d[52]),
-         "+f"(d[53]),
-         "+f"(d[54]),
-         "+f"(d[55]),
-         "+f"(d[56]),
-         "+f"(d[57]),
-         "+f"(d[58]),
-         "+f"(d[59]),
-         "+f"(d[60]),
-         "+f"(d[61]),
-         "+f"(d[62]),
-         "+f"(d[63]),
-         "+f"(d[64]),
-         "+f"(d[65]),
-         "+f"(d[66]),
-         "+f"(d[67]),
-         "+f"(d[68]),
-         "+f"(d[69]),
-         "+f"(d[70]),
-         "+f"(d[71]),
-         "+f"(d[72]),
-         "+f"(d[73]),
-         "+f"(d[74]),
-         "+f"(d[75]),
-         "+f"(d[76]),
-         "+f"(d[77]),
-         "+f"(d[78]),
-         "+f"(d[79]),
-         "+f"(d[80]),
-         "+f"(d[81]),
-         "+f"(d[82]),
-         "+f"(d[83]),
-         "+f"(d[84]),
-         "+f"(d[85]),
-         "+f"(d[86]),
-         "+f"(d[87]),
-         "+f"(d[88]),
-         "+f"(d[89]),
-         "+f"(d[90]),
-         "+f"(d[91]),
-         "+f"(d[92]),
-         "+f"(d[93]),
-         "+f"(d[94]),
-         "+f"(d[95]),
-         "+f"(d[96]),
-         "+f"(d[97]),
-         "+f"(d[98]),
-         "+f"(d[99]),
-         "+f"(d[100]),
-         "+f"(d[101]),
-         "+f"(d[102]),
-         "+f"(d[103]),
-         "+f"(d[104]),
-         "+f"(d[105]),
-         "+f"(d[106]),
-         "+f"(d[107]),
-         "+f"(d[108]),
-         "+f"(d[109]),
-         "+f"(d[110]),
-         "+f"(d[111]),
-         "+f"(d[112]),
-         "+f"(d[113]),
-         "+f"(d[114]),
-         "+f"(d[115]),
-         "+f"(d[116]),
-         "+f"(d[117]),
-         "+f"(d[118]),
-         "+f"(d[119]),
-         "+f"(d[120]),
-         "+f"(d[121]),
-         "+f"(d[122]),
-         "+f"(d[123]),
-         "+f"(d[124]),
-         "+f"(d[125]),
-         "+f"(d[126]),
-         "+f"(d[127])
-        :: "memory");
-}
-__device__ __forceinline__ void wgmma_wait_0_with_acc_hint(float d[128]) {
-    asm volatile("wgmma.wait_group.sync.aligned 0;\n"
-        : "+f"(d[0]),
-         "+f"(d[1]),
-         "+f"(d[2]),
-         "+f"(d[3]),
-         "+f"(d[4]),
-         "+f"(d[5]),
-         "+f"(d[6]),
-         "+f"(d[7]),
-         "+f"(d[8]),
-         "+f"(d[9]),
-         "+f"(d[10]),
-         "+f"(d[11]),
-         "+f"(d[12]),
-         "+f"(d[13]),
-         "+f"(d[14]),
-         "+f"(d[15]),
-         "+f"(d[16]),
-         "+f"(d[17]),
-         "+f"(d[18]),
-         "+f"(d[19]),
-         "+f"(d[20]),
-         "+f"(d[21]),
-         "+f"(d[22]),
-         "+f"(d[23]),
-         "+f"(d[24]),
-         "+f"(d[25]),
-         "+f"(d[26]),
-         "+f"(d[27]),
-         "+f"(d[28]),
-         "+f"(d[29]),
-         "+f"(d[30]),
-         "+f"(d[31]),
-         "+f"(d[32]),
-         "+f"(d[33]),
-         "+f"(d[34]),
-         "+f"(d[35]),
-         "+f"(d[36]),
-         "+f"(d[37]),
-         "+f"(d[38]),
-         "+f"(d[39]),
-         "+f"(d[40]),
-         "+f"(d[41]),
-         "+f"(d[42]),
-         "+f"(d[43]),
-         "+f"(d[44]),
-         "+f"(d[45]),
-         "+f"(d[46]),
-         "+f"(d[47]),
-         "+f"(d[48]),
-         "+f"(d[49]),
-         "+f"(d[50]),
-         "+f"(d[51]),
-         "+f"(d[52]),
-         "+f"(d[53]),
-         "+f"(d[54]),
-         "+f"(d[55]),
-         "+f"(d[56]),
-         "+f"(d[57]),
-         "+f"(d[58]),
-         "+f"(d[59]),
-         "+f"(d[60]),
-         "+f"(d[61]),
-         "+f"(d[62]),
-         "+f"(d[63]),
-         "+f"(d[64]),
-         "+f"(d[65]),
-         "+f"(d[66]),
-         "+f"(d[67]),
-         "+f"(d[68]),
-         "+f"(d[69]),
-         "+f"(d[70]),
-         "+f"(d[71]),
-         "+f"(d[72]),
-         "+f"(d[73]),
-         "+f"(d[74]),
-         "+f"(d[75]),
-         "+f"(d[76]),
-         "+f"(d[77]),
-         "+f"(d[78]),
-         "+f"(d[79]),
-         "+f"(d[80]),
-         "+f"(d[81]),
-         "+f"(d[82]),
-         "+f"(d[83]),
-         "+f"(d[84]),
-         "+f"(d[85]),
-         "+f"(d[86]),
-         "+f"(d[87]),
-         "+f"(d[88]),
-         "+f"(d[89]),
-         "+f"(d[90]),
-         "+f"(d[91]),
-         "+f"(d[92]),
-         "+f"(d[93]),
-         "+f"(d[94]),
-         "+f"(d[95]),
-         "+f"(d[96]),
-         "+f"(d[97]),
-         "+f"(d[98]),
-         "+f"(d[99]),
-         "+f"(d[100]),
-         "+f"(d[101]),
-         "+f"(d[102]),
-         "+f"(d[103]),
-         "+f"(d[104]),
-         "+f"(d[105]),
-         "+f"(d[106]),
-         "+f"(d[107]),
-         "+f"(d[108]),
-         "+f"(d[109]),
-         "+f"(d[110]),
-         "+f"(d[111]),
-         "+f"(d[112]),
-         "+f"(d[113]),
-         "+f"(d[114]),
-         "+f"(d[115]),
-         "+f"(d[116]),
-         "+f"(d[117]),
-         "+f"(d[118]),
-         "+f"(d[119]),
-         "+f"(d[120]),
-         "+f"(d[121]),
-         "+f"(d[122]),
-         "+f"(d[123]),
-         "+f"(d[124]),
-         "+f"(d[125]),
-         "+f"(d[126]),
-         "+f"(d[127])
-        :: "memory");
-}
-
 
 // ── GmmaDescriptors (unchanged from h2_s6) ───────────────────────────────────
 
@@ -412,7 +138,7 @@ void wgmma_ss_call(float* acc, uint64_t desc_a, uint64_t desc_b) {
 // ── Kernel ────────────────────────────────────────────────────────────────────
 
 template<int BM, int BN, int BK, int NUM_WG, int NUM_STAGES>
-__device__ __forceinline__ void h9_impl(
+__device__ __forceinline__ void h2_s7_smem_epi_impl(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
     __nv_bfloat16* __restrict__ C,
@@ -546,19 +272,6 @@ __device__ __forceinline__ void h9_impl(
 #define WAIT_MMA(n_) \
     asm volatile("wgmma.wait_group.sync.aligned " #n_ ";\n" ::: "memory")
 
-    // h9: For the s7-best config (BN=256, M_ITERS=1, D=128), use the
-    // accumulator-hint version of wait_group — replicates Triton's pattern of
-    // listing all 128 accumulator registers as input constraints to wait_group.
-    // Other configs fall back to the plain WAIT_MMA(n) macro.
-#define WAIT_MMA_HINT(n_) do { \
-    if constexpr (M_ITERS == 1 && D == 128) { \
-        if constexpr ((n_) == 1) wgmma_wait_1_with_acc_hint(acc[0]); \
-        else                     wgmma_wait_0_with_acc_hint(acc[0]); \
-    } else { \
-        WAIT_MMA(n_); \
-    } \
-} while (0)
-
     // ── Prologue ──────────────────────────────────────────────────────────────
     #pragma unroll
     for (int s = 0; s < NS - 1; s++) {
@@ -573,7 +286,7 @@ __device__ __forceinline__ void h9_impl(
         WAIT_SMEM(NS - 2);
         __syncthreads();
         COMPUTE_TILE(cur);
-        WAIT_MMA_HINT(1);
+        WAIT_MMA(1);
         __syncthreads();
         LOAD_TILE(nxt, (k + NS - 1) * BK);
     }
@@ -585,33 +298,75 @@ __device__ __forceinline__ void h9_impl(
         WAIT_SMEM(d);
         __syncthreads();
         COMPUTE_TILE(slot);
-        WAIT_MMA_HINT(1);
+        WAIT_MMA(1);
     }
 
-    WAIT_MMA_HINT(0);
+    WAIT_MMA(0);
 
 #undef LOAD_TILE
 #undef WAIT_SMEM
 #undef COMPUTE_TILE
 #undef WAIT_MMA
 
-    // ── Epilogue: write C ─────────────────────────────────────────────────────
-    const int base_col = (lane % 4) * 2;
-    const int base_row = lane / 4;
-    #pragma unroll
-    for (int m = 0; m < M_ITERS; m++) {
+    // ── Epilogue: SMEM-staged 16-byte coalesced stores ─────────────────────
+    //
+    // Step 1: each thread writes its acc[m][j*4..j*4+3] (4 fp32) to SMEM at the
+    //         wgmma-native position. Uses 4-byte (bfloat162) SMEM stores; SMEM
+    //         bandwidth is plenty.
+    // Step 2: __syncthreads.
+    // Step 3: re-divide work — all THREADS cooperatively write the BM*BN tile
+    //         to global C in 16-byte vector stores (uint4 = 8 BF16 per thread
+    //         per store). Total BM*BN/8 stores spread evenly across THREADS.
+    //
+    // SMEM region (BM*BN*2 bytes) reuses the A/B slot region from the K loop,
+    // which is no longer needed after WAIT_MMA(0).
+    __syncthreads();
+    // Pad row stride by 8 BF16 to break the power-of-2 bank-stride pattern.
+    // Without padding, row stride = BN*2 = 512 bytes → every row aligns to the
+    // same bank set → 4-way conflicts on stores. With +8 padding, row stride
+    // becomes (BN+8)*2 = 528 bytes → 132 bank-words → rows shift by 4 banks each.
+    constexpr int BN_PAD = BN + 8;
+    auto C_sh = reinterpret_cast<__nv_bfloat16 (*)[BN_PAD]>(smem_raw);
+
+    // Step 1: write acc[] to SMEM at wgmma-native positions
+    {
+        const int base_col = (lane % 4) * 2;
+        const int base_row = lane / 4;
         #pragma unroll
-        for (int j = 0; j < BN / 8; j++) {
-            const int gc  = block_col + j * 8 + base_col;
-            const int gr0 = block_row + wg_id * M_PER_WG + m * 64
-                            + local_warp * 16 + base_row;
-            const int gr8 = gr0 + 8;
-            if (gr0 < M && gc < N)
-                *reinterpret_cast<__nv_bfloat162*>(&C[gr0 * N + gc]) =
+        for (int m = 0; m < M_ITERS; m++) {
+            const int row0 = wg_id * M_PER_WG + m * 64 + local_warp * 16 + base_row;
+            const int row8 = row0 + 8;
+            #pragma unroll
+            for (int j = 0; j < BN / 8; j++) {
+                const int col = j * 8 + base_col;
+                *reinterpret_cast<__nv_bfloat162*>(&C_sh[row0][col]) =
                     __floats2bfloat162_rn(acc[m][j*4+0], acc[m][j*4+1]);
-            if (gr8 < M && gc < N)
-                *reinterpret_cast<__nv_bfloat162*>(&C[gr8 * N + gc]) =
+                *reinterpret_cast<__nv_bfloat162*>(&C_sh[row8][col]) =
                     __floats2bfloat162_rn(acc[m][j*4+2], acc[m][j*4+3]);
+            }
+        }
+    }
+    __syncthreads();
+
+    // Step 2: coalesced 16-byte stores from SMEM to global
+    //   BF_PER_STORE = 8 (16 bytes per store)
+    //   Per-thread stores = BM*BN / (THREADS * 8)
+    constexpr int BF_PER_STORE      = 8;
+    constexpr int STORES_PER_THREAD = (BM * BN) / (BF_PER_STORE * THREADS);
+    static_assert(STORES_PER_THREAD > 0 && (BM * BN) % (BF_PER_STORE * THREADS) == 0,
+                  "BM*BN must be a multiple of BF_PER_STORE*THREADS");
+
+    #pragma unroll
+    for (int s = 0; s < STORES_PER_THREAD; s++) {
+        const int flat = tid + s * THREADS;
+        const int local_bf16 = flat * BF_PER_STORE;
+        const int row = local_bf16 / BN;
+        const int col = local_bf16 % BN;
+        const int gr  = block_row + row;
+        const int gc  = block_col + col;
+        if (gr < M && gc < N) {
+            uint4 data = *reinterpret_cast<const uint4*>(&C_sh[row][col]);
+            *reinterpret_cast<uint4*>(&C[gr * N + gc]) = data;
         }
     }
 }
@@ -620,13 +375,13 @@ __device__ __forceinline__ void h9_impl(
 
 #define MAKE_LAUNCHER(BM_, BN_, BK_, NG_, NS_)                                   \
 extern "C" __global__ __launch_bounds__(NG_ * 128, LB_MIN_BLOCKS)               \
-void matmul_h9_bm##BM_##_bn##BN_##_bk##BK_##_wg##NG_##_ns##NS_(              \
+void matmul_h2_s7_smem_epi_bm##BM_##_bn##BN_##_bk##BK_##_wg##NG_##_ns##NS_(                \
     const __nv_bfloat16* __restrict__ A,                                         \
     const __nv_bfloat16* __restrict__ B,                                         \
     __nv_bfloat16* __restrict__ C,                                               \
     int M, int K, int N)                                                         \
 {                                                                                \
-    h9_impl<BM_, BN_, BK_, NG_, NS_>(A, B, C, M, K, N);                      \
+    h2_s7_smem_epi_impl<BM_, BN_, BK_, NG_, NS_>(A, B, C, M, K, N);                        \
 }
 
 #define MAKE3(BM_, BN_, BK_, NG_) \

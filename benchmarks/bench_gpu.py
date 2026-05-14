@@ -181,22 +181,17 @@ IMPLEMENTATIONS = {
     "h2_s6": ("mymatmul.gpu.hopper.matmul_h2_s6.matmul_h2_s6", None, torch.bfloat16),
     # Hopper H2-S7: h2_s6 + wgmma.wait_group 1 (overlap wgmma with next tile load)
     "h2_s7": ("mymatmul.gpu.hopper.matmul_h2_s7.matmul_h2_s7", None, torch.bfloat16),
-    # Hopper H2-S8: h2_s7 with cp.async swapped for TMA tile fetch (no other changes)
-    "h2_s8": ("mymatmul.gpu.hopper.matmul_h2_s8.matmul_h2_s8", None, torch.bfloat16),
-    # Hopper H4: h2_s7 + __cluster_dims__(1, 2, 1) — pure cluster skeleton, no sharing
-    "h4":    ("mymatmul.gpu.hopper.matmul_h4.matmul_h4", None, torch.bfloat16),
-    # Hopper H5: h2_s7 with descriptor-advance optimization (no rebuild per wgmma)
-    "h5":    ("mymatmul.gpu.hopper.matmul_h5.matmul_h5", None, torch.bfloat16),
-    # Hopper H6: h2_s7 with SMEM-staged 16-byte coalesced epilogue
-    "h6":    ("mymatmul.gpu.hopper.matmul_h6.matmul_h6", None, torch.bfloat16),
-    # Hopper H7: h2_s7 with cp.async split into 2 commit groups per iter
-    "h7":    ("mymatmul.gpu.hopper.matmul_h7.matmul_h7", None, torch.bfloat16),
-    # Hopper H8: h2_s7 with counter-based slot tracking (avoid k%NS mod-by-reciprocal)
-    "h8":    ("mymatmul.gpu.hopper.matmul_h8.matmul_h8", None, torch.bfloat16),
-    # Hopper H9: h2_s7 with all 128 acc regs as wgmma.wait_group input constraints
-    "h9":    ("mymatmul.gpu.hopper.matmul_h9.matmul_h9", None, torch.bfloat16),
-    # Hopper H4 Stage 2: sweep over cluster shapes (CX, CY)
-    "h4_s2": ("mymatmul.gpu.hopper.matmul_h4_s2.matmul_h4_s2", None, torch.bfloat16),
+    # h2_s7 explorations (each tweaks a single aspect of h2_s7):
+    "h2_s7_tma":       ("mymatmul.gpu.hopper.matmul_h2_s7_tma.matmul_h2_s7_tma",             None, torch.bfloat16),
+    "h2_s7_desc":      ("mymatmul.gpu.hopper.matmul_h2_s7_desc.matmul_h2_s7_desc",           None, torch.bfloat16),
+    "h2_s7_smem_epi":  ("mymatmul.gpu.hopper.matmul_h2_s7_smem_epi.matmul_h2_s7_smem_epi",   None, torch.bfloat16),
+    "h2_s7_split":     ("mymatmul.gpu.hopper.matmul_h2_s7_split.matmul_h2_s7_split",         None, torch.bfloat16),
+    "h2_s7_counter":   ("mymatmul.gpu.hopper.matmul_h2_s7_counter.matmul_h2_s7_counter",     None, torch.bfloat16),
+    "h2_s7_wait_hint": ("mymatmul.gpu.hopper.matmul_h2_s7_wait_hint.matmul_h2_s7_wait_hint", None, torch.bfloat16),
+    # Hopper H4: __cluster_dims__ explorations
+    "h4":          ("mymatmul.gpu.hopper.matmul_h4.matmul_h4",                   None, torch.bfloat16),
+    "h4_shapes":   ("mymatmul.gpu.hopper.matmul_h4_shapes.matmul_h4_shapes",     None, torch.bfloat16),
+    "h4_dsmem":    ("mymatmul.gpu.hopper.matmul_h4_dsmem.matmul_h4_dsmem",       None, torch.bfloat16),
     # Triton PTX: pre-compiled BM=128,BN=256,BK=32,NS=4 cp.async+wgmma-SS kernel
     "triton_ptx": ("mymatmul.gpu.hopper.matmul_triton_ptx.matmul_triton_ptx", None, torch.bfloat16),
     "tc6_x4b":       ("mymatmul.gpu.tensor_core.matmul_cuda_tc6_x4b.matmul_tc6_x4b",             None, torch.bfloat16),

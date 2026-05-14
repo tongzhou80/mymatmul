@@ -2,43 +2,93 @@
 #include <cuda_runtime.h>
 #include <cuda_pipeline_primitives.h>
 #include <cuda_bf16.h>
+#include <cooperative_groups.h>
+
+namespace cg = cooperative_groups;
 
 /*
- * H5: h2_s7 with descriptor-advance optimization in COMPUTE_TILE.
+ * H2 Cluster (h2c): 2-CTA cluster version of h2_s7.
  *
- * Single change from h2_s7: instead of rebuilding each wgmma's A/B descriptor
- * from scratch via shr/and/cvt/or, precompute the kk=0 descriptors outside
- * the inner kk loop and just `+=` constant offsets to advance per kk step.
+ * Cluster geometry: __cluster_dims__(1, 2, 1) — 2 CTAs along M direction.
+ * Both CTAs in a cluster share the same B column → same B tile.
  *
- * This mirrors what Triton's autotuned PTX does. In s7's PTX, ~8 integer
- * instructions appear between each wgmma issue (descriptor rebuild). Triton
- * has 2 (just `add.s64`). Fewer int ops between wgmma → higher warp-issue
- * rate of wgmma → tensor pipe stays fed.
+ * Key change vs h2_s7:
+ *   - A is still loaded per-CTA via cp.async (each CTA loads its own M strip).
+ *   - B is loaded ONCE per cluster via TMA multicast — the TMA engine fetches
+ *     the B tile from DRAM and delivers it into BOTH CTAs' local SMEM in one
+ *     round-trip.  After delivery, each CTA's wgmma reads its local SMEM
+ *     (identical wgmma path to s7).
  *
- * Encoded-form offsets per kk step:
- *   B descriptor:  smem_addr advances by K_STEP_BYTES (= 2048 bytes)
- *                  → descriptor's start field advances by K_STEP_BYTES/16 = 128
- *   A descriptor:  start += 2 per kk step (already encoded in make_wgmma_a_desc)
+ *   AI: 85.3 → 128 F/B  (B DRAM bandwidth halved across the cluster).
+ *
+ * Pipeline (preserves s7's structure):
+ *   LOAD_TILE  : cp.async A  +  TMA-multicast B  (arm mbarrier first)
+ *   WAIT_SMEM  : __pipeline_wait_prior(A)  +  mbarrier_wait(B)
+ *   COMPUTE_TILE / WAIT_MMA : identical to s7
+ *
+ * Per-iter cluster sync: needed once before TMA issue so that BOTH CTAs have
+ * armed their mbarrier with expected_tx before the multicast TMA delivers.
  */
 
 #ifndef LB_MIN_BLOCKS
 #define LB_MIN_BLOCKS 1
 #endif
 
-// ── wgmma helpers ─────────────────────────────────────────────────────────────
+struct alignas(64) TmaDesc { uint64_t opaque[16]; };
+
+// ── wgmma helpers (identical to h2_s7) ────────────────────────────────────────
 __device__ __forceinline__ void wgmma_fence() {
     asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 }
 __device__ __forceinline__ void wgmma_commit() {
     asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
 }
-// wgmma drain helpers kept for reference; pipeline uses WAIT_MMA(n) macro instead
-__device__ __forceinline__ void wgmma_wait_0() {
-    asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+
+// fence.proxy.async needed once after TMA so its async-proxy writes are
+// visible to wgmma's async-proxy reads of the same SMEM.
+__device__ __forceinline__ void fence_proxy_async() {
+    asm volatile("fence.proxy.async;\n" ::: "memory");
 }
 
-// ── GmmaDescriptors (unchanged from h2_s6) ───────────────────────────────────
+// ── mbarrier helpers (one per pipeline slot, tracks B's TMA delivery) ────────
+__device__ __forceinline__ void mbar_init(uint64_t* mb) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n"
+                 :: "r"((uint32_t)__cvta_generic_to_shared(mb)) : "memory");
+}
 
+__device__ __forceinline__ void mbar_arm_tma(uint64_t* mb, uint32_t bytes_expected) {
+    uint32_t addr = (uint32_t)__cvta_generic_to_shared(mb);
+    uint64_t token;
+    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 %0, [%1], %2;\n"
+                 : "=l"(token) : "r"(addr), "r"(bytes_expected) : "memory");
+}
+
+__device__ __forceinline__ void mbar_wait(uint64_t* mb) {
+    uint32_t done = 0, addr = (uint32_t)__cvta_generic_to_shared(mb);
+    while (!done) {
+        asm volatile("{\n.reg .pred P;\n"
+                     "mbarrier.test_wait.parity.acquire.cta.shared::cta.b64 P, [%1], 0;\n"
+                     "selp.u32 %0, 1, 0, P;\n}\n"
+                     : "=r"(done) : "r"(addr) : "memory");
+    }
+}
+
+// ── TMA multicast load: hardware fetches B once, writes to all CTAs in mask ──
+__device__ __forceinline__ void tma_load_b_multicast(
+    const TmaDesc* desc, void* smem_ptr, uint64_t* mbar,
+    int32_t coord0, int32_t coord1, uint16_t cluster_mask)
+{
+    uint32_t dst       = (uint32_t)__cvta_generic_to_shared(smem_ptr);
+    uint32_t mbar_addr = (uint32_t)__cvta_generic_to_shared(mbar);
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cluster.global"
+        ".tile.mbarrier::complete_tx::bytes.multicast::cluster"
+        " [%0], [%1, {%3, %4}], [%2], %5;\n"
+        :: "r"(dst), "l"((unsigned long long)desc), "r"(mbar_addr),
+           "r"(coord0), "r"(coord1), "h"(cluster_mask) : "memory");
+}
+
+// ── A descriptor (identical to h2_s7) ─────────────────────────────────────────
 template<int BK>
 __device__ __forceinline__ uint64_t make_wgmma_a_desc(uint32_t smem_addr, int kk) {
     constexpr uint64_t layout = (BK == 64) ? 1ULL : (BK == 32) ? 2ULL : 3ULL;
@@ -47,18 +97,18 @@ __device__ __forceinline__ uint64_t make_wgmma_a_desc(uint32_t smem_addr, int kk
     return start | (sbo << 32) | (layout << 62);
 }
 
+// ── B descriptor (TMA-laid layout: [BK][BN] 128B-swizzled subtiles of 64) ────
 template<int BN, int BK>
 __device__ __forceinline__ uint64_t make_wgmma_b_desc(uint32_t smem_addr) {
     constexpr uint64_t LAYOUT_B128 = 1ULL << 62;
     constexpr int n_atoms = BN / 64;
     constexpr uint64_t lbo = (n_atoms <= 1) ? 0ULL : (uint64_t)(8 * BK);
-    constexpr uint64_t sbo = 64ULL;
+    constexpr uint64_t sbo = (n_atoms <= 1) ? (uint64_t)BN : 64ULL;
     uint64_t start = (uint64_t)(smem_addr >> 4) & 0x3FFFULL;
     return start | (lbo << 16) | (sbo << 32) | LAYOUT_B128;
 }
 
-// ── wgmma SS wrappers (identical to h2_s6) ────────────────────────────────────
-
+// ── wgmma SS wrappers (identical to h2_s7) ────────────────────────────────────
 __device__ __forceinline__
 void wgmma_ss_m64n64k16(float d[32], uint64_t a, uint64_t b) {
     asm volatile(
@@ -134,14 +184,13 @@ void wgmma_ss_call(float* acc, uint64_t desc_a, uint64_t desc_b) {
 }
 
 // ── Kernel ────────────────────────────────────────────────────────────────────
-
 template<int BM, int BN, int BK, int NUM_WG, int NUM_STAGES>
-__device__ __forceinline__ void h5_impl(
+__device__ __forceinline__ void h4_dsmem_impl(
     const __nv_bfloat16* __restrict__ A,
-    const __nv_bfloat16* __restrict__ B,
-    __nv_bfloat16* __restrict__ C,
-    int M, int K, int N
-) {
+    const TmaDesc&                    tma_B,
+    __nv_bfloat16* __restrict__       C,
+    int M, int K, int N)
+{
     static_assert(BM % (NUM_WG * 64) == 0, "BM must be multiple of NUM_WG*64");
     static_assert(BN % 64 == 0, "BN must be multiple of 64");
 
@@ -150,6 +199,9 @@ __device__ __forceinline__ void h5_impl(
     constexpr int M_PER_WG   = BM / NUM_WG;
     constexpr int D          = BN / 2;
     constexpr int N_SUBTILES = BN / 64;
+    constexpr int SUBTILE_COL  = 64;
+    constexpr int K_STEP_BYTES = 16 * SUBTILE_COL * 2;
+    constexpr uint32_t B_BYTES_PER_TILE = BK * BN * 2;
 
     constexpr int A_SWZ   = BK / 8;
     constexpr int A_SHIFT = 64 / BK;
@@ -157,10 +209,6 @@ __device__ __forceinline__ void h5_impl(
     constexpr int THREADS  = NUM_WG * 128;
     constexpr int A_ELEM   = (BM * BK / THREADS >= 8) ? 8 : 4;
     constexpr int A_GROUPS = BM * BK / A_ELEM / THREADS;
-    constexpr int B_ELEM   = (BK * BN / THREADS >= 8) ? 8 : 4;
-    constexpr int B_GROUPS = BK * BN / B_ELEM / THREADS;
-
-    constexpr int K_STEP_BYTES = 16 * 64 * 2;  // B per-kk advance = 2048 bytes
 
     const int tid        = threadIdx.x;
     const int wg_id      = tid / 128;
@@ -170,48 +218,37 @@ __device__ __forceinline__ void h5_impl(
     const int block_row = blockIdx.y * BM;
     const int block_col = blockIdx.x * BN;
 
-    // SMEM: A[NS][BM][BK], B[NS][N_SUBTILES][BK][64]
+    // Cluster identity — for 2-CTA cluster along Y, rank ∈ {0, 1}.
+    auto cluster = cg::this_cluster();
+    const uint32_t my_rank = cluster.block_rank();
+    constexpr uint16_t CLUSTER_MASK = 0b11;   // multicast to both CTAs
+
+    // SMEM: A[NS][BM][BK] (cp.async-swizzled) + B[NS][BK][BN] (TMA 128B-swizzled)
+    //       + mbar[NS] (one mbarrier per slot for B's TMA delivery).
     extern __shared__ char smem_raw[];
-    constexpr int A_BYTES = NS * BM * BK * 2;
+    constexpr int A_BYTES  = NS * BM * BK * 2;
+    constexpr int B_BYTES  = NS * BK * BN * 2;
+    constexpr int MBAR_OFF = (A_BYTES + B_BYTES + 7) & ~7;
 
     auto A_sh = reinterpret_cast<__nv_bfloat16 (*)[BM][BK]>(smem_raw);
-    auto B_sh = reinterpret_cast<__nv_bfloat16 (*)[N_SUBTILES][BK][64]>(smem_raw + A_BYTES);
+    auto B_sh = reinterpret_cast<__nv_bfloat16 (*)[BK][BN]>(smem_raw + A_BYTES);
+    auto mbar = reinterpret_cast<uint64_t*>(smem_raw + MBAR_OFF);
 
     float acc[M_ITERS][D] = {};
-
     const int num_tiles = K / BK;
 
-    // ── Pipeline macros ───────────────────────────────────────────────────────
-    //
-    // Four abstract operations that define the pipeline regardless of backend:
-    //
-    //   LOAD_TILE(slot, k0) — issue async load of A+B tile from DRAM into SMEM slot
-    //   WAIT_SMEM(n)        — stall until SMEM data is ready; keep n loads in flight
-    //   COMPUTE_TILE(slot)  — fence + kick off wgmma for slot + commit (no drain)
-    //   WAIT_MMA(n)         — stall until all but n wgmma groups are done
-    //
-    // Pipeline loop (same structure will be reused for TMA backend in h2_s8):
-    //
-    //   Prologue: for s=0..NS-2: LOAD_TILE(s, s*BK)
-    //
-    //   for k=0..num_tiles-(NS-1):
-    //     WAIT_SMEM(NS-2)       ← tile k is now in SMEM
-    //     __syncthreads()       ← all threads see it (WAIT_SMEM is per-thread)
-    //     COMPUTE_TILE(cur)     ← kick off wgmma group k
-    //     WAIT_MMA(1)           ← groups 0..k-1 done; group k still in TC pipeline
-    //     __syncthreads()       ← all warpgroups agree before cooperative LOAD_TILE
-    //     LOAD_TILE(nxt, ...)   ← safe: slot nxt=(k-1)%NS freed by WAIT_MMA(1)
-    //
-    //   for d=NS-2..0:          ← drain last NS-1 tiles (no new loads)
-    //     WAIT_SMEM(d)
-    //     __syncthreads()
-    //     COMPUTE_TILE(slot)
-    //     WAIT_MMA(1)
-    //
-    //   WAIT_MMA(0)             ← drain final group before epilogue
+    // ── LOAD_ARM: per-CTA mbarrier init + arm (no cross-CTA work) ─────────
+#define LOAD_ARM(slot_)                                                             \
+    do {                                                                            \
+        if (tid == 0) {                                                             \
+            mbar_init(&mbar[(slot_)]);                /* count=1, parity=0 */      \
+            mbar_arm_tma(&mbar[(slot_)], B_BYTES_PER_TILE);                         \
+        }                                                                           \
+    } while (0)
 
-    // cp.async backend: LOAD_TILE = per-thread memcpy_async + pipeline_commit
-#define LOAD_TILE(slot_, k0_)                                                       \
+    // ── LOAD_ISSUE: cp.async A (per-CTA) + TMA-multicast B (rank-0 only) ───
+    //   Caller must ensure peer has armed (cluster.sync done) before this runs.
+#define LOAD_ISSUE(slot_, k0_)                                                      \
     do {                                                                            \
         _Pragma("unroll")                                                           \
         for (int _i = 0; _i < A_GROUPS; _i++) {                                    \
@@ -224,84 +261,88 @@ __device__ __forceinline__ void h5_impl(
                 &A[(block_row + _r) * K + (k0_) + _c],                             \
                 A_ELEM * (int)sizeof(__nv_bfloat16));                               \
         }                                                                           \
-        _Pragma("unroll")                                                           \
-        for (int _i = 0; _i < B_GROUPS; _i++) {                                    \
-            const int _g    = tid + _i * THREADS;                                  \
-            const int _flat = _g * B_ELEM;                                         \
-            const int _st   = _flat / (BK * 64);                                   \
-            const int _kr   = (_flat % (BK * 64)) / 64;                            \
-            const int _sc0  = (_flat % (BK * 64)) % 64;                            \
-            const int _sc   = ((_sc0 / 8) ^ (_kr % 8)) * 8 + (_sc0 % 8);         \
-            __pipeline_memcpy_async(                                                \
-                &B_sh[(slot_)][_st][_kr][_sc],                                     \
-                &B[((k0_) + _kr) * N + block_col + _st * 64 + _sc0],              \
-                B_ELEM * (int)sizeof(__nv_bfloat16));                               \
-        }                                                                           \
         __pipeline_commit();                                                         \
+        if (tid == 0 && my_rank == 0) {                                             \
+            _Pragma("unroll")                                                       \
+            for (int _sub = 0; _sub < N_SUBTILES; _sub++) {                        \
+                void* _bdst = (char*)&B_sh[(slot_)][0][0]                          \
+                              + _sub * BK * SUBTILE_COL * 2;                       \
+                tma_load_b_multicast(&tma_B, _bdst, &mbar[(slot_)],                \
+                                     block_col + _sub * SUBTILE_COL, (k0_),        \
+                                     CLUSTER_MASK);                                 \
+            }                                                                       \
+        }                                                                           \
     } while (0)
 
-    // cp.async backend: WAIT_SMEM(n) = pipeline_wait_prior(n)
-    // "keep n commits in flight; guarantee the (n+1)th-oldest tile is in SMEM"
-#define WAIT_SMEM(n_) __pipeline_wait_prior(n_)
+    // ── WAIT_SMEM: wait for A's cp.async AND B's TMA delivery ───────────────
+#define WAIT_SMEM(n_, slot_)                                                        \
+    do {                                                                            \
+        __pipeline_wait_prior(n_);                                                  \
+        mbar_wait(&mbar[(slot_)]);                                                 \
+    } while (0)
 
-    // COMPUTE_TILE: precompute descriptors at kk=0; advance via += per kk step
-    //   B desc:    += K_STEP_BYTES >> 4 = 128  (smem_addr advances 2048 bytes)
-    //   A desc:    += 2                        (encoded form of kk*2 advance)
+    // ── COMPUTE_TILE: wgmma SS over BK (identical to s7) ────────────────────
 #define COMPUTE_TILE(slot_)                                                         \
     do {                                                                            \
         wgmma_fence();                                                              \
-        const uint32_t _bb = (uint32_t)__cvta_generic_to_shared(                   \
-                                 &B_sh[(slot_)][0][0][0]);                         \
-        uint64_t _db = make_wgmma_b_desc<BN, BK>(_bb);                            \
-        uint64_t _da[M_ITERS];                                                     \
-        _Pragma("unroll")                                                          \
-        for (int _m = 0; _m < M_ITERS; _m++) {                                    \
-            const int _mrow = wg_id * M_PER_WG + _m * 64;                         \
-            const uint32_t _aa = (uint32_t)__cvta_generic_to_shared(              \
-                                     &A_sh[(slot_)][_mrow][0]);                    \
-            _da[_m] = make_wgmma_a_desc<BK>(_aa, 0);                              \
-        }                                                                          \
-        _Pragma("unroll")                                                          \
+        _Pragma("unroll")                                                           \
         for (int _kk = 0; _kk < BK / 16; _kk++) {                                 \
-            _Pragma("unroll")                                                      \
-            for (int _m = 0; _m < M_ITERS; _m++) {                                \
-                wgmma_ss_call<BN>((float*)acc[_m], _da[_m], _db);                 \
-            }                                                                      \
-            _db += (uint64_t)(K_STEP_BYTES >> 4);                                  \
-            _Pragma("unroll")                                                      \
-            for (int _m = 0; _m < M_ITERS; _m++) _da[_m] += 2;                    \
-        }                                                                          \
-        wgmma_commit();                                                            \
+            const uint32_t _bb = (uint32_t)__cvta_generic_to_shared(               \
+                                     &B_sh[(slot_)][0][0]);                        \
+            const uint64_t _db = make_wgmma_b_desc<BN, BK>(                        \
+                                     (uint32_t)(_bb + _kk * K_STEP_BYTES));        \
+            _Pragma("unroll")                                                       \
+            for (int _m = 0; _m < M_ITERS; _m++) {                                 \
+                const int _mrow = wg_id * M_PER_WG + _m * 64;                     \
+                const uint32_t _aa = (uint32_t)__cvta_generic_to_shared(           \
+                                         &A_sh[(slot_)][_mrow][0]);                \
+                const uint64_t _da = make_wgmma_a_desc<BK>(_aa, _kk);             \
+                wgmma_ss_call<BN>((float*)acc[_m], _da, _db);                      \
+            }                                                                       \
+        }                                                                           \
+        wgmma_commit();                                                             \
     } while (0)
 
-    // WAIT_MMA(n): wgmma.wait_group n (compile-time constant via stringification)
 #define WAIT_MMA(n_) \
     asm volatile("wgmma.wait_group.sync.aligned " #n_ ";\n" ::: "memory")
 
-    // ── Prologue ──────────────────────────────────────────────────────────────
+    // ── Prologue: arm + cluster.sync once, then issue all NS-1 loads ───────
     #pragma unroll
-    for (int s = 0; s < NS - 1; s++) {
-        LOAD_TILE(s, s * BK);
-    }
+    for (int s = 0; s < NS - 1; s++) LOAD_ARM(s);
+    cluster.sync();                            // all CTAs armed for slots 0..NS-2
+    #pragma unroll
+    for (int s = 0; s < NS - 1; s++) LOAD_ISSUE(s, s * BK);
 
     // ── Main loop ─────────────────────────────────────────────────────────────
+    //   Pipeline overlap:
+    //     COMPUTE_TILE issues wgmma (async). While wgmma runs in flight, we
+    //     do the prep work for the NEXT tile: LOAD_ARM + cluster.sync. The
+    //     cluster barrier overlaps with wgmma execution rather than blocking
+    //     the critical path. After WAIT_MMA(1) drains the previous wgmma,
+    //     LOAD_ISSUE kicks off the next async loads.
     for (int k = 0; k < num_tiles - (NS - 1); k++) {
         const int cur = k % NS;
         const int nxt = (k + NS - 1) % NS;
 
-        WAIT_SMEM(NS - 2);
+        WAIT_SMEM(NS - 2, cur);
+        fence_proxy_async();
         __syncthreads();
-        COMPUTE_TILE(cur);
+        COMPUTE_TILE(cur);                     // async wgmma starts
+
+        LOAD_ARM(nxt);                         // prep nxt slot (per-CTA, no sync)
+        cluster.sync();                        // overlaps with wgmma in flight
+
         WAIT_MMA(1);
         __syncthreads();
-        LOAD_TILE(nxt, (k + NS - 1) * BK);
+        LOAD_ISSUE(nxt, (k + NS - 1) * BK);    // issue async loads for nxt
     }
 
     // ── Drain ─────────────────────────────────────────────────────────────────
     #pragma unroll
     for (int d = NS - 2; d >= 0; d--) {
         const int slot = (num_tiles - d - 1) % NS;
-        WAIT_SMEM(d);
+        WAIT_SMEM(d, slot);
+        fence_proxy_async();
         __syncthreads();
         COMPUTE_TILE(slot);
         WAIT_MMA(1);
@@ -309,12 +350,13 @@ __device__ __forceinline__ void h5_impl(
 
     WAIT_MMA(0);
 
-#undef LOAD_TILE
+#undef LOAD_ARM
+#undef LOAD_ISSUE
 #undef WAIT_SMEM
 #undef COMPUTE_TILE
 #undef WAIT_MMA
 
-    // ── Epilogue: write C ─────────────────────────────────────────────────────
+    // ── Epilogue: write C (identical to s7) ─────────────────────────────────
     const int base_col = (lane % 4) * 2;
     const int base_row = lane / 4;
     #pragma unroll
@@ -338,16 +380,18 @@ __device__ __forceinline__ void h5_impl(
 // ── Kernel entry points ───────────────────────────────────────────────────────
 
 #define MAKE_LAUNCHER(BM_, BN_, BK_, NG_, NS_)                                   \
-extern "C" __global__ __launch_bounds__(NG_ * 128, LB_MIN_BLOCKS)               \
-void matmul_h5_bm##BM_##_bn##BN_##_bk##BK_##_wg##NG_##_ns##NS_(                \
-    const __nv_bfloat16* __restrict__ A,                                         \
-    const __nv_bfloat16* __restrict__ B,                                         \
-    __nv_bfloat16* __restrict__ C,                                               \
+extern "C" __global__ __cluster_dims__(1, 2, 1)                                  \
+__launch_bounds__(NG_ * 128, LB_MIN_BLOCKS)                                      \
+void matmul_h4_dsmem_bm##BM_##_bn##BN_##_bk##BK_##_wg##NG_##_ns##NS_(                \
+    const __nv_bfloat16* __restrict__   A,                                       \
+    const __grid_constant__ TmaDesc     tma_B,                                   \
+    __nv_bfloat16* __restrict__         C,                                       \
     int M, int K, int N)                                                         \
 {                                                                                \
-    h5_impl<BM_, BN_, BK_, NG_, NS_>(A, B, C, M, K, N);                        \
+    h4_dsmem_impl<BM_, BN_, BK_, NG_, NS_>(A, tma_B, C, M, K, N);                    \
 }
 
+// BK ∈ {32, 64} (TMA's 128B swizzle and wgmma both fine with these)
 #define MAKE3(BM_, BN_, BK_, NG_) \
     MAKE_LAUNCHER(BM_, BN_, BK_, NG_, 2) \
     MAKE_LAUNCHER(BM_, BN_, BK_, NG_, 3) \
@@ -355,22 +399,22 @@ void matmul_h5_bm##BM_##_bn##BN_##_bk##BK_##_wg##NG_##_ns##NS_(                \
     MAKE_LAUNCHER(BM_, BN_, BK_, NG_, 5)
 
 // NW=1 warpgroup
-MAKE3( 64,  64, 16, 1) MAKE3( 64,  64, 32, 1) MAKE3( 64,  64, 64, 1)
-MAKE3( 64, 128, 16, 1) MAKE3( 64, 128, 32, 1) MAKE3( 64, 128, 64, 1)
-MAKE3( 64, 256, 16, 1) MAKE3( 64, 256, 32, 1) MAKE3( 64, 256, 64, 1)
-MAKE3(128,  64, 16, 1) MAKE3(128,  64, 32, 1) MAKE3(128,  64, 64, 1)
-MAKE3(128, 128, 16, 1) MAKE3(128, 128, 32, 1) MAKE3(128, 128, 64, 1)
-MAKE3(128, 256, 16, 1) MAKE3(128, 256, 32, 1) MAKE3(128, 256, 64, 1)
-MAKE3(256,  64, 16, 1) MAKE3(256,  64, 32, 1) MAKE3(256,  64, 64, 1)
-MAKE3(256, 128, 16, 1) MAKE3(256, 128, 32, 1) MAKE3(256, 128, 64, 1)
+MAKE3( 64,  64, 32, 1) MAKE3( 64,  64, 64, 1)
+MAKE3( 64, 128, 32, 1) MAKE3( 64, 128, 64, 1)
+MAKE3( 64, 256, 32, 1) MAKE3( 64, 256, 64, 1)
+MAKE3(128,  64, 32, 1) MAKE3(128,  64, 64, 1)
+MAKE3(128, 128, 32, 1) MAKE3(128, 128, 64, 1)
+MAKE3(128, 256, 32, 1) MAKE3(128, 256, 64, 1)
+MAKE3(256,  64, 32, 1) MAKE3(256,  64, 64, 1)
+MAKE3(256, 128, 32, 1) MAKE3(256, 128, 64, 1)
 
 // NW=2 warpgroups
-MAKE3(128,  64, 16, 2) MAKE3(128,  64, 32, 2) MAKE3(128,  64, 64, 2)
-MAKE3(128, 128, 16, 2) MAKE3(128, 128, 32, 2) MAKE3(128, 128, 64, 2)
-MAKE3(128, 256, 16, 2) MAKE3(128, 256, 32, 2) MAKE3(128, 256, 64, 2)
-MAKE3(256,  64, 16, 2) MAKE3(256,  64, 32, 2) MAKE3(256,  64, 64, 2)
-MAKE3(256, 128, 16, 2) MAKE3(256, 128, 32, 2) MAKE3(256, 128, 64, 2)
-MAKE3(256, 256, 16, 2) MAKE3(256, 256, 32, 2) MAKE3(256, 256, 64, 2)
+MAKE3(128,  64, 32, 2) MAKE3(128,  64, 64, 2)
+MAKE3(128, 128, 32, 2) MAKE3(128, 128, 64, 2)
+MAKE3(128, 256, 32, 2) MAKE3(128, 256, 64, 2)
+MAKE3(256,  64, 32, 2) MAKE3(256,  64, 64, 2)
+MAKE3(256, 128, 32, 2) MAKE3(256, 128, 64, 2)
+MAKE3(256, 256, 32, 2) MAKE3(256, 256, 64, 2)
 
 #undef MAKE3
 #undef MAKE_LAUNCHER

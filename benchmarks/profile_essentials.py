@@ -64,23 +64,26 @@ METRICS = {
 # Mapping from CUDA kernel name prefix → bench_gpu impl name, for Hopper kernels
 # that don't use the matmul_cuda_<prefix>_* convention.
 _HOPPER_PREFIX_MAP = {
-    "matmul_h1ms": "h1_ms",
-    "matmul_h2s1": "h2_s1",
-    "matmul_h2s2": "h2_s2",
-    "matmul_h2s3": "h2_s3",
-    "matmul_h2s4": "h2_s4",
-    "matmul_h2s5": "h2_s5",
-    "matmul_h2s6": "h2_s6",
-    "matmul_h2s7": "h2_s7",
-    "matmul_h2s8": "h2_s8",
-    "matmul_h4s2": "h4_s2",
-    "matmul_h4":   "h4",
-    "matmul_h5":   "h5",
-    "matmul_h6":   "h6",
-    "matmul_h7":   "h7",
-    "matmul_h8":   "h8",
-    "matmul_h9":   "h9",
-    "matmul_h3":   "h3",
+    "matmul_h1ms":           "h1_ms",
+    "matmul_h2s1":           "h2_s1",
+    "matmul_h2s2":           "h2_s2",
+    "matmul_h2s3":           "h2_s3",
+    "matmul_h2s4":           "h2_s4",
+    "matmul_h2s5":           "h2_s5",
+    "matmul_h2s6":           "h2_s6",
+    "matmul_h2s7":           "h2_s7",
+    # h2_s7 explorations
+    "matmul_h2_s7_tma":       "h2_s7_tma",
+    "matmul_h2_s7_desc":      "h2_s7_desc",
+    "matmul_h2_s7_smem_epi":  "h2_s7_smem_epi",
+    "matmul_h2_s7_split":     "h2_s7_split",
+    "matmul_h2_s7_counter":   "h2_s7_counter",
+    "matmul_h2_s7_wait_hint": "h2_s7_wait_hint",
+    # H4 cluster family
+    "matmul_h4_shapes":       "h4_shapes",
+    "matmul_h4_dsmem":        "h4_dsmem",
+    "matmul_h4":              "h4",
+    "matmul_h3":              "h3",
     # Exact-match entries (no config suffix in the CUDA kernel name)
     "matmul_kernel": "triton_ptx",
 }

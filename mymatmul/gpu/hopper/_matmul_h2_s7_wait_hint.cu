@@ -4,14 +4,28 @@
 #include <cuda_bf16.h>
 
 /*
- * H4 Stage 2: h2_s7 body, sweep over cluster shapes.
+ * H2 Stage 7: h2_s6 + wgmma.wait_group 1 (allow 1 wgmma group in flight).
  *
- * Identical to h4 except the launcher's __cluster_dims__(CX, CY, 1) is varied
- * across configurations. Goal: find which cluster shape produces the best
- * SM-assignment / L2-locality pattern for our s7 pipeline.
+ * Key insight from Triton PTX analysis:
+ *   h2_s6 used wgmma.wait_group 0 after every tile — fully draining the tensor
+ *   core pipeline before proceeding. This caused ~40% membar stalls.
  *
- * Cluster shapes generated: (1,1), (1,2), (2,1), (2,2), (1,4), (4,1), (4,2), (2,4).
- * Constraint: gridDim.x must be a multiple of CX; gridDim.y must be a multiple of CY.
+ *   Triton uses wgmma.wait_group 1: commit group k, then only wait for group
+ *   k-1. Group k stays in the tensor core pipeline while we load the next tile.
+ *   The hardware serialises acc[] writes automatically, so group k+1's wgmma
+ *   reads the correct accumulated values. Only at the epilogue do we wait_group 0.
+ *
+ *   Also from PTX: ISSUE must come AFTER wait_group 1 (not before compute).
+ *   wait_group 1 at iter k proves wgmma[k-1] has released its SMEM slot;
+ *   only then is it safe to overwrite that slot with the next tile's cp.async.
+ *
+ * Loop structure (adapted from Triton PTX lines 569–666):
+ *   for k = 0..num_tiles-1:
+ *     pipeline_wait_prior(NS-1);  __syncthreads()       // oldest tile ready
+ *     wgmma.fence; wgmma × BK/16; wgmma.commit_group   // compute tile k
+ *     wgmma.wait_group 1                                // wait for k-1
+ *     if k+NS-1 < num_tiles: __syncthreads(); ISSUE     // issue next tile
+ *   wgmma.wait_group 0                                  // drain last group
  */
 
 #ifndef LB_MIN_BLOCKS
@@ -29,6 +43,275 @@ __device__ __forceinline__ void wgmma_commit() {
 __device__ __forceinline__ void wgmma_wait_0() {
     asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
 }
+
+// h9: wgmma.wait_group with all 128 accumulator regs as input constraints
+//     (mirrors Triton's "wait for regs:" pattern, forcing the compiler to
+//     treat the wait as a register-aware sync point for the entire accumulator).
+__device__ __forceinline__ void wgmma_wait_1_with_acc_hint(float d[128]) {
+    asm volatile("wgmma.wait_group.sync.aligned 1;\n"
+        : "+f"(d[0]),
+         "+f"(d[1]),
+         "+f"(d[2]),
+         "+f"(d[3]),
+         "+f"(d[4]),
+         "+f"(d[5]),
+         "+f"(d[6]),
+         "+f"(d[7]),
+         "+f"(d[8]),
+         "+f"(d[9]),
+         "+f"(d[10]),
+         "+f"(d[11]),
+         "+f"(d[12]),
+         "+f"(d[13]),
+         "+f"(d[14]),
+         "+f"(d[15]),
+         "+f"(d[16]),
+         "+f"(d[17]),
+         "+f"(d[18]),
+         "+f"(d[19]),
+         "+f"(d[20]),
+         "+f"(d[21]),
+         "+f"(d[22]),
+         "+f"(d[23]),
+         "+f"(d[24]),
+         "+f"(d[25]),
+         "+f"(d[26]),
+         "+f"(d[27]),
+         "+f"(d[28]),
+         "+f"(d[29]),
+         "+f"(d[30]),
+         "+f"(d[31]),
+         "+f"(d[32]),
+         "+f"(d[33]),
+         "+f"(d[34]),
+         "+f"(d[35]),
+         "+f"(d[36]),
+         "+f"(d[37]),
+         "+f"(d[38]),
+         "+f"(d[39]),
+         "+f"(d[40]),
+         "+f"(d[41]),
+         "+f"(d[42]),
+         "+f"(d[43]),
+         "+f"(d[44]),
+         "+f"(d[45]),
+         "+f"(d[46]),
+         "+f"(d[47]),
+         "+f"(d[48]),
+         "+f"(d[49]),
+         "+f"(d[50]),
+         "+f"(d[51]),
+         "+f"(d[52]),
+         "+f"(d[53]),
+         "+f"(d[54]),
+         "+f"(d[55]),
+         "+f"(d[56]),
+         "+f"(d[57]),
+         "+f"(d[58]),
+         "+f"(d[59]),
+         "+f"(d[60]),
+         "+f"(d[61]),
+         "+f"(d[62]),
+         "+f"(d[63]),
+         "+f"(d[64]),
+         "+f"(d[65]),
+         "+f"(d[66]),
+         "+f"(d[67]),
+         "+f"(d[68]),
+         "+f"(d[69]),
+         "+f"(d[70]),
+         "+f"(d[71]),
+         "+f"(d[72]),
+         "+f"(d[73]),
+         "+f"(d[74]),
+         "+f"(d[75]),
+         "+f"(d[76]),
+         "+f"(d[77]),
+         "+f"(d[78]),
+         "+f"(d[79]),
+         "+f"(d[80]),
+         "+f"(d[81]),
+         "+f"(d[82]),
+         "+f"(d[83]),
+         "+f"(d[84]),
+         "+f"(d[85]),
+         "+f"(d[86]),
+         "+f"(d[87]),
+         "+f"(d[88]),
+         "+f"(d[89]),
+         "+f"(d[90]),
+         "+f"(d[91]),
+         "+f"(d[92]),
+         "+f"(d[93]),
+         "+f"(d[94]),
+         "+f"(d[95]),
+         "+f"(d[96]),
+         "+f"(d[97]),
+         "+f"(d[98]),
+         "+f"(d[99]),
+         "+f"(d[100]),
+         "+f"(d[101]),
+         "+f"(d[102]),
+         "+f"(d[103]),
+         "+f"(d[104]),
+         "+f"(d[105]),
+         "+f"(d[106]),
+         "+f"(d[107]),
+         "+f"(d[108]),
+         "+f"(d[109]),
+         "+f"(d[110]),
+         "+f"(d[111]),
+         "+f"(d[112]),
+         "+f"(d[113]),
+         "+f"(d[114]),
+         "+f"(d[115]),
+         "+f"(d[116]),
+         "+f"(d[117]),
+         "+f"(d[118]),
+         "+f"(d[119]),
+         "+f"(d[120]),
+         "+f"(d[121]),
+         "+f"(d[122]),
+         "+f"(d[123]),
+         "+f"(d[124]),
+         "+f"(d[125]),
+         "+f"(d[126]),
+         "+f"(d[127])
+        :: "memory");
+}
+__device__ __forceinline__ void wgmma_wait_0_with_acc_hint(float d[128]) {
+    asm volatile("wgmma.wait_group.sync.aligned 0;\n"
+        : "+f"(d[0]),
+         "+f"(d[1]),
+         "+f"(d[2]),
+         "+f"(d[3]),
+         "+f"(d[4]),
+         "+f"(d[5]),
+         "+f"(d[6]),
+         "+f"(d[7]),
+         "+f"(d[8]),
+         "+f"(d[9]),
+         "+f"(d[10]),
+         "+f"(d[11]),
+         "+f"(d[12]),
+         "+f"(d[13]),
+         "+f"(d[14]),
+         "+f"(d[15]),
+         "+f"(d[16]),
+         "+f"(d[17]),
+         "+f"(d[18]),
+         "+f"(d[19]),
+         "+f"(d[20]),
+         "+f"(d[21]),
+         "+f"(d[22]),
+         "+f"(d[23]),
+         "+f"(d[24]),
+         "+f"(d[25]),
+         "+f"(d[26]),
+         "+f"(d[27]),
+         "+f"(d[28]),
+         "+f"(d[29]),
+         "+f"(d[30]),
+         "+f"(d[31]),
+         "+f"(d[32]),
+         "+f"(d[33]),
+         "+f"(d[34]),
+         "+f"(d[35]),
+         "+f"(d[36]),
+         "+f"(d[37]),
+         "+f"(d[38]),
+         "+f"(d[39]),
+         "+f"(d[40]),
+         "+f"(d[41]),
+         "+f"(d[42]),
+         "+f"(d[43]),
+         "+f"(d[44]),
+         "+f"(d[45]),
+         "+f"(d[46]),
+         "+f"(d[47]),
+         "+f"(d[48]),
+         "+f"(d[49]),
+         "+f"(d[50]),
+         "+f"(d[51]),
+         "+f"(d[52]),
+         "+f"(d[53]),
+         "+f"(d[54]),
+         "+f"(d[55]),
+         "+f"(d[56]),
+         "+f"(d[57]),
+         "+f"(d[58]),
+         "+f"(d[59]),
+         "+f"(d[60]),
+         "+f"(d[61]),
+         "+f"(d[62]),
+         "+f"(d[63]),
+         "+f"(d[64]),
+         "+f"(d[65]),
+         "+f"(d[66]),
+         "+f"(d[67]),
+         "+f"(d[68]),
+         "+f"(d[69]),
+         "+f"(d[70]),
+         "+f"(d[71]),
+         "+f"(d[72]),
+         "+f"(d[73]),
+         "+f"(d[74]),
+         "+f"(d[75]),
+         "+f"(d[76]),
+         "+f"(d[77]),
+         "+f"(d[78]),
+         "+f"(d[79]),
+         "+f"(d[80]),
+         "+f"(d[81]),
+         "+f"(d[82]),
+         "+f"(d[83]),
+         "+f"(d[84]),
+         "+f"(d[85]),
+         "+f"(d[86]),
+         "+f"(d[87]),
+         "+f"(d[88]),
+         "+f"(d[89]),
+         "+f"(d[90]),
+         "+f"(d[91]),
+         "+f"(d[92]),
+         "+f"(d[93]),
+         "+f"(d[94]),
+         "+f"(d[95]),
+         "+f"(d[96]),
+         "+f"(d[97]),
+         "+f"(d[98]),
+         "+f"(d[99]),
+         "+f"(d[100]),
+         "+f"(d[101]),
+         "+f"(d[102]),
+         "+f"(d[103]),
+         "+f"(d[104]),
+         "+f"(d[105]),
+         "+f"(d[106]),
+         "+f"(d[107]),
+         "+f"(d[108]),
+         "+f"(d[109]),
+         "+f"(d[110]),
+         "+f"(d[111]),
+         "+f"(d[112]),
+         "+f"(d[113]),
+         "+f"(d[114]),
+         "+f"(d[115]),
+         "+f"(d[116]),
+         "+f"(d[117]),
+         "+f"(d[118]),
+         "+f"(d[119]),
+         "+f"(d[120]),
+         "+f"(d[121]),
+         "+f"(d[122]),
+         "+f"(d[123]),
+         "+f"(d[124]),
+         "+f"(d[125]),
+         "+f"(d[126]),
+         "+f"(d[127])
+        :: "memory");
+}
+
 
 // ── GmmaDescriptors (unchanged from h2_s6) ───────────────────────────────────
 
@@ -129,7 +412,7 @@ void wgmma_ss_call(float* acc, uint64_t desc_a, uint64_t desc_b) {
 // ── Kernel ────────────────────────────────────────────────────────────────────
 
 template<int BM, int BN, int BK, int NUM_WG, int NUM_STAGES>
-__device__ __forceinline__ void h2s7_impl(
+__device__ __forceinline__ void h2_s7_wait_hint_impl(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
     __nv_bfloat16* __restrict__ C,
@@ -263,6 +546,19 @@ __device__ __forceinline__ void h2s7_impl(
 #define WAIT_MMA(n_) \
     asm volatile("wgmma.wait_group.sync.aligned " #n_ ";\n" ::: "memory")
 
+    // h9: For the s7-best config (BN=256, M_ITERS=1, D=128), use the
+    // accumulator-hint version of wait_group — replicates Triton's pattern of
+    // listing all 128 accumulator registers as input constraints to wait_group.
+    // Other configs fall back to the plain WAIT_MMA(n) macro.
+#define WAIT_MMA_HINT(n_) do { \
+    if constexpr (M_ITERS == 1 && D == 128) { \
+        if constexpr ((n_) == 1) wgmma_wait_1_with_acc_hint(acc[0]); \
+        else                     wgmma_wait_0_with_acc_hint(acc[0]); \
+    } else { \
+        WAIT_MMA(n_); \
+    } \
+} while (0)
+
     // ── Prologue ──────────────────────────────────────────────────────────────
     #pragma unroll
     for (int s = 0; s < NS - 1; s++) {
@@ -277,7 +573,7 @@ __device__ __forceinline__ void h2s7_impl(
         WAIT_SMEM(NS - 2);
         __syncthreads();
         COMPUTE_TILE(cur);
-        WAIT_MMA(1);
+        WAIT_MMA_HINT(1);
         __syncthreads();
         LOAD_TILE(nxt, (k + NS - 1) * BK);
     }
@@ -289,10 +585,10 @@ __device__ __forceinline__ void h2s7_impl(
         WAIT_SMEM(d);
         __syncthreads();
         COMPUTE_TILE(slot);
-        WAIT_MMA(1);
+        WAIT_MMA_HINT(1);
     }
 
-    WAIT_MMA(0);
+    WAIT_MMA_HINT(0);
 
 #undef LOAD_TILE
 #undef WAIT_SMEM
@@ -321,45 +617,41 @@ __device__ __forceinline__ void h2s7_impl(
 }
 
 // ── Kernel entry points ───────────────────────────────────────────────────────
-//
-// Sweep cluster shapes (CX, CY, 1) × (s7's promising BM/BN/BK/WG/NS).
-// To keep cubin size reasonable, we restrict to configs that did well in s7
-// autotuning: BM ∈ {128, 256}, BN ∈ {64, 128, 256}, BK ∈ {32, 64}, WG=2, NS ∈ {3, 4}.
 
-#define MAKE_LAUNCHER(BM_, BN_, BK_, NG_, NS_, CX_, CY_)                         \
-extern "C" __global__ __cluster_dims__(CX_, CY_, 1)                              \
-__launch_bounds__(NG_ * 128, LB_MIN_BLOCKS)                                      \
-void matmul_h4s2_bm##BM_##_bn##BN_##_bk##BK_##_wg##NG_##_ns##NS_##_cx##CX_##_cy##CY_( \
+#define MAKE_LAUNCHER(BM_, BN_, BK_, NG_, NS_)                                   \
+extern "C" __global__ __launch_bounds__(NG_ * 128, LB_MIN_BLOCKS)               \
+void matmul_h2_s7_wait_hint_bm##BM_##_bn##BN_##_bk##BK_##_wg##NG_##_ns##NS_(              \
     const __nv_bfloat16* __restrict__ A,                                         \
     const __nv_bfloat16* __restrict__ B,                                         \
     __nv_bfloat16* __restrict__ C,                                               \
     int M, int K, int N)                                                         \
 {                                                                                \
-    h2s7_impl<BM_, BN_, BK_, NG_, NS_>(A, B, C, M, K, N);                      \
+    h2_s7_wait_hint_impl<BM_, BN_, BK_, NG_, NS_>(A, B, C, M, K, N);                      \
 }
 
-// One BM/BN/BK/WG/NS config across 8 cluster shapes
-#define MAKE_CLUSTERS(BM_, BN_, BK_, NG_, NS_) \
-    MAKE_LAUNCHER(BM_, BN_, BK_, NG_, NS_, 1, 1) \
-    MAKE_LAUNCHER(BM_, BN_, BK_, NG_, NS_, 1, 2) \
-    MAKE_LAUNCHER(BM_, BN_, BK_, NG_, NS_, 2, 1) \
-    MAKE_LAUNCHER(BM_, BN_, BK_, NG_, NS_, 2, 2) \
-    MAKE_LAUNCHER(BM_, BN_, BK_, NG_, NS_, 1, 4) \
-    MAKE_LAUNCHER(BM_, BN_, BK_, NG_, NS_, 4, 1) \
-    MAKE_LAUNCHER(BM_, BN_, BK_, NG_, NS_, 2, 4) \
-    MAKE_LAUNCHER(BM_, BN_, BK_, NG_, NS_, 4, 2)
+#define MAKE3(BM_, BN_, BK_, NG_) \
+    MAKE_LAUNCHER(BM_, BN_, BK_, NG_, 2) \
+    MAKE_LAUNCHER(BM_, BN_, BK_, NG_, 3) \
+    MAKE_LAUNCHER(BM_, BN_, BK_, NG_, 4) \
+    MAKE_LAUNCHER(BM_, BN_, BK_, NG_, 5)
 
-// Stage / pipeline-depth variants per shape
-#define MAKE_NS(BM_, BN_, BK_, NG_) \
-    MAKE_CLUSTERS(BM_, BN_, BK_, NG_, 3) \
-    MAKE_CLUSTERS(BM_, BN_, BK_, NG_, 4)
+// NW=1 warpgroup
+MAKE3( 64,  64, 16, 1) MAKE3( 64,  64, 32, 1) MAKE3( 64,  64, 64, 1)
+MAKE3( 64, 128, 16, 1) MAKE3( 64, 128, 32, 1) MAKE3( 64, 128, 64, 1)
+MAKE3( 64, 256, 16, 1) MAKE3( 64, 256, 32, 1) MAKE3( 64, 256, 64, 1)
+MAKE3(128,  64, 16, 1) MAKE3(128,  64, 32, 1) MAKE3(128,  64, 64, 1)
+MAKE3(128, 128, 16, 1) MAKE3(128, 128, 32, 1) MAKE3(128, 128, 64, 1)
+MAKE3(128, 256, 16, 1) MAKE3(128, 256, 32, 1) MAKE3(128, 256, 64, 1)
+MAKE3(256,  64, 16, 1) MAKE3(256,  64, 32, 1) MAKE3(256,  64, 64, 1)
+MAKE3(256, 128, 16, 1) MAKE3(256, 128, 32, 1) MAKE3(256, 128, 64, 1)
 
-// Focus on configs that performed well in s7 autotuning (BM in {128,256}, NG=2)
-MAKE_NS(128, 128, 32, 2) MAKE_NS(128, 128, 64, 2)
-MAKE_NS(128, 256, 32, 2) MAKE_NS(128, 256, 64, 2)
-MAKE_NS(256, 128, 32, 2) MAKE_NS(256, 128, 64, 2)
-MAKE_NS(256,  64, 32, 2) MAKE_NS(256,  64, 64, 2)
+// NW=2 warpgroups
+MAKE3(128,  64, 16, 2) MAKE3(128,  64, 32, 2) MAKE3(128,  64, 64, 2)
+MAKE3(128, 128, 16, 2) MAKE3(128, 128, 32, 2) MAKE3(128, 128, 64, 2)
+MAKE3(128, 256, 16, 2) MAKE3(128, 256, 32, 2) MAKE3(128, 256, 64, 2)
+MAKE3(256,  64, 16, 2) MAKE3(256,  64, 32, 2) MAKE3(256,  64, 64, 2)
+MAKE3(256, 128, 16, 2) MAKE3(256, 128, 32, 2) MAKE3(256, 128, 64, 2)
+MAKE3(256, 256, 16, 2) MAKE3(256, 256, 32, 2) MAKE3(256, 256, 64, 2)
 
-#undef MAKE_NS
-#undef MAKE_CLUSTERS
+#undef MAKE3
 #undef MAKE_LAUNCHER
