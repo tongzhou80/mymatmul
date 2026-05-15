@@ -10,8 +10,8 @@ import triton.testing
 
 from bench_gpu import IMPLEMENTATIONS, SIZES, RESULTS_FILE, FIELDNAMES, load_fn, validate_fn, get_impl_dtype, _all_impls
 
-WARMUP_MS = 100   # warmup budget in ms
-REP_MS    = 500   # timed budget in ms  (more reps → tighter distribution)
+WARMUP_MS = 200   # warmup budget in ms
+REP_MS    = 2000  # timed budget in ms  (more reps → tighter distribution)
 
 
 def gflops(M, N, K, ms):

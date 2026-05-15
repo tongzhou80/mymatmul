@@ -186,7 +186,7 @@ triton_fp32simt_bm128_bn128_bk16 = _make_triton_fp32_simt(128, 128, 16)
 
 _BF16_BMS      = [64, 128, 256]
 _BF16_BNS      = [64, 128, 256]
-_BF16_BKS      = [16, 32, 64]
+_BF16_BKS      = [32, 64]  # BK=16 dropped — never autotunes as best
 _BF16_NWS      = [4, 8]
 _BF16_STAGES   = [3, 4, 5]
 _BF16_MAX_SMEM = 100352

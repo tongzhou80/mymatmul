@@ -66,7 +66,7 @@ def _get_mod():
 
 _BMS = [64, 128, 256]
 _BNS = [64, 128, 256]
-_BKS = [16, 32, 64]
+_BKS = [32, 64]  # BK=16 never autotunes as best — dropped to shrink search
 _NWS = [1, 2]
 _NSS = [2, 3, 4, 5]
 _MAX_SMEM = 200 * 1024
