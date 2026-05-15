@@ -16,6 +16,8 @@ re-run the same experiments.
 | h2_s7_split | Split cp.async into 2 commits (A+B) | +3% at BK=32, −4% at BK=64 | `_matmul_h2_s7_split.cu` |
 | h2_s7_counter | Counter-based slot tracking (no `k%NS`) | −4% (slightly worse) | `_matmul_h2_s7_counter.cu` |
 | h2_s7_wait_hint | Triton's `wait for regs:` register-hint pattern on wait_group | −5% (slightly worse) | `_matmul_h2_s7_wait_hint.cu` |
+| h2_s7_predesc | Compute all descriptors BEFORE wgmma.fence (mirror Triton's order) | −1.2% at BK=32, −0.5% at BK=64 — fence-stall hiding is NOT the bottleneck | `_matmul_h2_s7_predesc.cu` |
+| h2_s7_runptr | Per-thread running pointers (Triton-style) — advance ptrs by stride each iter instead of recomputing addr from base | **+5.0% at BK=64 NS=3** (637 → 669 TF), +1% at BK=32 NS=4 | `_matmul_h2_s7_runptr.cu` |
 | h4_dsmem | 2-CTA cluster + DSMEM/TMA-multicast | −50% (h4_dsmem_experiment.md) | `_matmul_h4_dsmem.cu` |
 
 ### Same-config head-to-head with Triton (the real puzzle)
