@@ -189,7 +189,7 @@ IMPLEMENTATIONS = {
     "h2_s7_runptr":    ("mymatmul.gpu.hopper.matmul_h2_s7_runptr.matmul_h2_s7_runptr",       None, torch.bfloat16),
     "h2_s8":           ("mymatmul.gpu.hopper.matmul_h2_s8.matmul_h2_s8",                     None, torch.bfloat16),
     "h2_s9":           ("mymatmul.gpu.hopper.matmul_h2_s9.matmul_h2_s9",                     None, torch.bfloat16),
-    "h2_s8_smem_epi":  ("mymatmul.gpu.hopper.matmul_h2_s8_smem_epi.matmul_h2_s8_smem_epi",   None, torch.bfloat16),
+    "h2_s8_smem_wb":  ("mymatmul.gpu.hopper.matmul_h2_s8_smem_wb.matmul_h2_s8_smem_wb",   None, torch.bfloat16),
     "h2_s7_counter":   ("mymatmul.gpu.hopper.matmul_h2_s7_counter.matmul_h2_s7_counter",     None, torch.bfloat16),
     "h2_s7_wait_hint": ("mymatmul.gpu.hopper.matmul_h2_s7_wait_hint.matmul_h2_s7_wait_hint", None, torch.bfloat16),
     "h2_s7_swz":       ("mymatmul.gpu.hopper.matmul_h2_s7_swz.matmul_h2_s7_swz",             None, torch.bfloat16),

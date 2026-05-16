@@ -4,17 +4,13 @@
 #include <cuda_bf16.h>
 
 /*
- * h2_s8_smem_epi: h2_s7_runptr + flattened SMEM destination offsets.
+ * h2_s8_smem_wb: h2_s8_smem_wb with single (A+B) commit group per tile.
  *
- * Motivation (from PTX inspection of s7_runptr K-loop):
- *   Per cp.async, the SMEM destination is built as a chain of separate adds:
- *     A:  add(A_stage_base, _r*BK*2); add(prev, _sc*2)        — 2 add.s32
- *     B:  add(B_stage_base, _st*BK*64*2); add(prev, _kr*64*2);
- *         add(prev, _sc*2)                                     — 3 add.s32
- *   Even though `_r,_sc,_st,_kr` are loop-invariant per (tid, _i), ptxas keeps
- *   the additions separate. Pre-folding them into one byte-offset per (tid, _i)
- *   collapses each chain to 1 add (stage_base + per_thread_off[_i]).
- *   Expected savings: 1 add * 4 (A) + 2 adds * 8 (B) = ~20 add.s32 / iter.
+ * Motivation: s8 inherited s7_split's two-commit pattern (A and B issued as
+ * separate cp.async.commit_group). The split was originally chosen for finer
+ * waiting granularity, but with WAIT_SMEM(NS-2) we only ever wait on whole
+ * tiles. Merging A and B into one commit group halves the number of
+ * commit/wait instructions issued per K-iter.
  */
 
 #ifndef LB_MIN_BLOCKS
@@ -132,7 +128,7 @@ void wgmma_ss_call(float* acc, uint64_t desc_a, uint64_t desc_b) {
 // ── Kernel ────────────────────────────────────────────────────────────────────
 
 template<int BM, int BN, int BK, int NUM_WG, int NUM_STAGES>
-__device__ __forceinline__ void h2_s8_smem_epi_impl(
+__device__ __forceinline__ void h2_s8_smem_wb_impl(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
     __nv_bfloat16* __restrict__ C,
@@ -219,7 +215,7 @@ __device__ __forceinline__ void h2_s8_smem_epi_impl(
     //   COMPUTE_TILE(slot)  — fence + kick off wgmma for slot + commit (no drain)
     //   WAIT_MMA(n)         — stall until all but n wgmma groups are done
     //
-    // Pipeline loop (same structure will be reused for TMA backend in h2_s8_smem_epi):
+    // Pipeline loop (same structure will be reused for TMA backend in h2_s8_smem_wb):
     //
     //   Prologue: for s=0..NS-2: LOAD_TILE(s, s*BK)
     //
@@ -239,13 +235,11 @@ __device__ __forceinline__ void h2_s8_smem_epi_impl(
     //
     //   WAIT_MMA(0)             ← drain final group before epilogue
 
-    // runptr: same as h7 (A + B split commits) but cp.async sources come from
-    //   per-thread running pointers A_curr / B_curr instead of being recomputed
-    //   from base each iter. Each LOAD_TILE call advances A_curr by BK elements
-    //   (= BK*2 bytes) and B_curr by BK*N elements (= BK*stride_bk bytes).
+    // 1c: single commit per LOAD_TILE (A and B in one group). Halves the
+    //   commit instruction count vs the split variant; WAIT_SMEM counts in
+    //   whole stages (1 commit/iter).
 #define LOAD_TILE(slot_)                                                            \
     do {                                                                            \
-        /* Commit 1: A only */                                                      \
         char* const _A_base = (char*)&A_sh[(slot_)][0][0];                          \
         _Pragma("unroll")                                                           \
         for (int _i = 0; _i < A_GROUPS; _i++) {                                    \
@@ -255,8 +249,6 @@ __device__ __forceinline__ void h2_s8_smem_epi_impl(
                 A_ELEM * (int)sizeof(__nv_bfloat16));                               \
             A_curr[_i] += BK;                                                       \
         }                                                                           \
-        __pipeline_commit();                                                         \
-        /* Commit 2: B only */                                                      \
         char* const _B_base = (char*)&B_sh[(slot_)][0][0][0];                       \
         _Pragma("unroll")                                                           \
         for (int _i = 0; _i < B_GROUPS; _i++) {                                    \
@@ -269,8 +261,8 @@ __device__ __forceinline__ void h2_s8_smem_epi_impl(
         __pipeline_commit();                                                         \
     } while (0)
 
-    // h7: WAIT_SMEM counts in *half-stages* now (2 commits per stage).
-#define WAIT_SMEM(n_) __pipeline_wait_prior(2 * (n_))
+    // 1c: 1 commit/iter → WAIT_SMEM counts in whole stages.
+#define WAIT_SMEM(n_) __pipeline_wait_prior(n_)
 
     // COMPUTE_TILE: wgmma.fence + wgmma calls + commit (no drain)
 #define COMPUTE_TILE(slot_)                                                         \
@@ -387,13 +379,13 @@ __device__ __forceinline__ void h2_s8_smem_epi_impl(
 
 #define MAKE_LAUNCHER(BM_, BN_, BK_, NG_, NS_)                                   \
 extern "C" __global__ __launch_bounds__(NG_ * 128, LB_MIN_BLOCKS)               \
-void matmul_h2_s8_smem_epi_bm##BM_##_bn##BN_##_bk##BK_##_wg##NG_##_ns##NS_(              \
+void matmul_h2_s8_smem_wb_bm##BM_##_bn##BN_##_bk##BK_##_wg##NG_##_ns##NS_(              \
     const __nv_bfloat16* __restrict__ A,                                         \
     const __nv_bfloat16* __restrict__ B,                                         \
     __nv_bfloat16* __restrict__ C,                                               \
     int M, int K, int N)                                                         \
 {                                                                                \
-    h2_s8_smem_epi_impl<BM_, BN_, BK_, NG_, NS_>(A, B, C, M, K, N);                      \
+    h2_s8_smem_wb_impl<BM_, BN_, BK_, NG_, NS_>(A, B, C, M, K, N);                      \
 }
 
 #define MAKE3(BM_, BN_, BK_, NG_) \

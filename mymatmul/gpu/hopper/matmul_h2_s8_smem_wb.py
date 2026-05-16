@@ -38,10 +38,10 @@ def _chk(err, op=""):
 # ── Compilation ───────────────────────────────────────────────────────────────
 
 _HOPPER_DIR = os.path.dirname(os.path.abspath(__file__))
-_CU_PATH    = os.path.join(_HOPPER_DIR, "_matmul_h2_s8_smem_epi.cu")
+_CU_PATH    = os.path.join(_HOPPER_DIR, "_matmul_h2_s8_smem_wb.cu")
 _NVCC       = "/usr/local/cuda/bin/nvcc"
 _ARCH       = "sm_90a"
-_CUBIN      = os.path.join(_HOPPER_DIR, f"_matmul_h2_s8_smem_epi_{_ARCH}.cubin")
+_CUBIN      = os.path.join(_HOPPER_DIR, f"_matmul_h2_s8_smem_wb_{_ARCH}.cubin")
 
 _mod_lock = threading.Lock()
 _module   = None
@@ -52,7 +52,7 @@ def _get_mod():
         if _module is not None: return _module
         _ensure_ctx()
         if not os.path.exists(_CUBIN) or os.path.getmtime(_CU_PATH) > os.path.getmtime(_CUBIN):
-            print(f"[h2_s8_smem_epi] compiling for {_ARCH} ...", end=" ", flush=True)
+            print(f"[h2_s8_smem_wb] compiling for {_ARCH} ...", end=" ", flush=True)
             cmd = [_NVCC, f"-arch={_ARCH}", "-O3", "--std=c++17", "--cubin",
                    "-DLB_MIN_BLOCKS=1", _CU_PATH, "-o", _CUBIN]
             r = subprocess.run(cmd, capture_output=True, text=True)
@@ -96,7 +96,7 @@ _CONFIGS = [
 
 
 def _kname(bm, bn, bk, nwg, ns):
-    return f"matmul_h2_s8_smem_epi_bm{bm}_bn{bn}_bk{bk}_wg{nwg}_ns{ns}"
+    return f"matmul_h2_s8_smem_wb_bm{bm}_bn{bn}_bk{bk}_wg{nwg}_ns{ns}"
 
 # ── Launch ────────────────────────────────────────────────────────────────────
 
@@ -169,17 +169,17 @@ def _tune(M, N, K):
     return best
 
 
-def matmul_h2_s8_smem_epi(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+def matmul_h2_s8_smem_wb(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     M, K = A.shape;  _, N = B.shape
     key = (M, N, K)
     if key not in _best:
         cfgs = [(bm, bn, bk, nwg, ns) for bm, bn, bk, nwg, ns in _CONFIGS
                 if M % bm == 0 and N % bn == 0 and K % bk == 0
                 and K // bk >= ns]
-        print(f"[h2_s8_smem_epi] autotuning {M}×{N}×{K} over {len(cfgs)} configs ...")
+        print(f"[h2_s8_smem_wb] autotuning {M}×{N}×{K} over {len(cfgs)} configs ...")
         _best[key] = _tune(M, N, K)
         bm, bn, bk, nwg, ns = _best[key]
         mi = _m_iters(bm, nwg)
-        print(f"[h2_s8_smem_epi] best: BM={bm} BN={bn} BK={bk} WG={nwg} NS={ns} M_ITERS={mi}")
+        print(f"[h2_s8_smem_wb] best: BM={bm} BN={bn} BK={bk} WG={nwg} NS={ns} M_ITERS={mi}")
     bm, bn, bk, nwg, ns = _best[key]
     return _launch(_get_mod(), _kname(bm, bn, bk, nwg, ns), A, B, bm, bn, bk, nwg, ns)
