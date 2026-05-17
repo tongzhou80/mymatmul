@@ -154,18 +154,19 @@ def _tune(M, N, K):
     for i, (bm, bn, bk, nwg, ns) in enumerate(cfgs):
         kn = _kname(bm, bn, bk, nwg, ns)
         try:
-            _, ms, _ = triton.testing.do_bench(
+            # Score by median (less noise-sensitive than min); rep 50→100 ms.
+            ms_med, _, _ = triton.testing.do_bench(
                 lambda bm=bm, bn=bn, bk=bk, nwg=nwg, ns=ns, kn=kn:
                     _launch(mod, kn, A, B, bm, bn, bk, nwg, ns),
-                warmup=10, rep=50, quantiles=(0.5, 0.0, 1.0))
+                warmup=10, rep=100, quantiles=(0.5, 0.0, 1.0))
         except Exception as e:
             print(f"  [{i+1}/{len(cfgs)}] {kn} FAILED: {e}"); continue
-        tf = 2 * M * N * K / (ms / 1e3) / 1e12
+        tf = 2 * M * N * K / (ms_med / 1e3) / 1e12
         mi = _m_iters(bm, nwg)
         print(f"  [{i+1:3d}/{len(cfgs)}] BM={bm:3d} BN={bn:3d} BK={bk:2d} "
               f"WG={nwg} NS={ns} M_ITERS={mi}  {tf:6.1f} TFLOPS")
-        if ms < best_t:
-            best_t, best = ms, (bm, bn, bk, nwg, ns)
+        if ms_med < best_t:
+            best_t, best = ms_med, (bm, bn, bk, nwg, ns)
     return best
 
 

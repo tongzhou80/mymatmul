@@ -405,14 +405,37 @@ void matmul_h2_s8_smem_wb_swz_bm##BM_##_bn##BN_##_bk##BK_##_wg##NG_##_ns##NS_##_
     h2_s8_smem_wb_swz_impl<BM_, BN_, BK_, NG_, NS_, GM_>(A, B, C, M, K, N);       \
 }
 
-// swz: specialised to known-best (BM=128 BN=256 BK=64 WG=2 NS=3); autotune GROUP_M.
+// Autotune space (BM, BN, BK, NW, NS) matches h2_s8_smem_wb; extra GROUP_M dim.
 #define MAKE_GROUPS(BM_, BN_, BK_, NG_, NS_) \
     MAKE_LAUNCHER(BM_, BN_, BK_, NG_, NS_, 1) \
     MAKE_LAUNCHER(BM_, BN_, BK_, NG_, NS_, 2) \
     MAKE_LAUNCHER(BM_, BN_, BK_, NG_, NS_, 4) \
     MAKE_LAUNCHER(BM_, BN_, BK_, NG_, NS_, 8)
 
-MAKE_GROUPS(128, 256, 64, 2, 3)
+#define MAKE3(BM_, BN_, BK_, NG_) \
+    MAKE_GROUPS(BM_, BN_, BK_, NG_, 2) \
+    MAKE_GROUPS(BM_, BN_, BK_, NG_, 3) \
+    MAKE_GROUPS(BM_, BN_, BK_, NG_, 4) \
+    MAKE_GROUPS(BM_, BN_, BK_, NG_, 5)
 
+// NW=1 warpgroup
+MAKE3( 64,  64, 32, 1) MAKE3( 64,  64, 64, 1)
+MAKE3( 64, 128, 32, 1) MAKE3( 64, 128, 64, 1)
+MAKE3( 64, 256, 32, 1) MAKE3( 64, 256, 64, 1)
+MAKE3(128,  64, 32, 1) MAKE3(128,  64, 64, 1)
+MAKE3(128, 128, 32, 1) MAKE3(128, 128, 64, 1)
+MAKE3(128, 256, 32, 1) MAKE3(128, 256, 64, 1)
+MAKE3(256,  64, 32, 1) MAKE3(256,  64, 64, 1)
+MAKE3(256, 128, 32, 1) MAKE3(256, 128, 64, 1)
+
+// NW=2 warpgroups
+MAKE3(128,  64, 32, 2) MAKE3(128,  64, 64, 2)
+MAKE3(128, 128, 32, 2) MAKE3(128, 128, 64, 2)
+MAKE3(128, 256, 32, 2) MAKE3(128, 256, 64, 2)
+MAKE3(256,  64, 32, 2) MAKE3(256,  64, 64, 2)
+MAKE3(256, 128, 32, 2) MAKE3(256, 128, 64, 2)
+MAKE3(256, 256, 32, 2) MAKE3(256, 256, 64, 2)
+
+#undef MAKE3
 #undef MAKE_GROUPS
 #undef MAKE_LAUNCHER
