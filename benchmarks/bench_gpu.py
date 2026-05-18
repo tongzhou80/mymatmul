@@ -143,6 +143,8 @@ IMPLEMENTATIONS = {
     "triton_bf16_autotuned": ("mymatmul.gpu.matmul_triton.triton_bf16_autotuned", None, torch.bfloat16),
     # cuBLAS BF16 reference (tensor cores, bfloat16 inputs/output)
     "cublas_bf16": ("mymatmul.gpu.matmul_torch.matmul_torch_bf16", None, torch.bfloat16),
+    # CUTLASS BF16 (single config, BM=128 BN=256 BK=64 cluster 2x1)
+    "cutlass_bf16": ("mymatmul.gpu.cutlass.matmul_cutlass.matmul_cutlass_bf16", None, torch.bfloat16),
     # TC3: TC2b + tunable NUM_STAGES smem pipeline (NS=2 == TC2b)
     "tc3": ("mymatmul.gpu.tensor_core.matmul_cuda_tc3.matmul_tc3", None, torch.bfloat16),
     # TC4: TC2b with ldmatrix.x4.trans for B (pairs two N-tiles, halves B ldmatrix count)
