@@ -154,7 +154,7 @@ def main() -> None:
     args = parser.parse_args()
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from bench_gpu import IMPLEMENTATIONS
+    from bench import IMPLEMENTATIONS
 
     rows = []
     for name in args.impls:

@@ -1,7 +1,7 @@
 """Profile DRAM bandwidth for a single impl. Usage: python profile_dram.py <impl_name> [size]"""
 import sys
 import torch
-from bench_gpu import IMPLEMENTATIONS, load_fn
+from bench import IMPLEMENTATIONS, load_fn
 
 impl_name = sys.argv[1]
 sz = int(sys.argv[2]) if len(sys.argv) > 2 else 4096

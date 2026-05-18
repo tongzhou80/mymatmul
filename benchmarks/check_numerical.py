@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(__file__))
-from bench_gpu import load_fn, get_impl_dtype
+from bench import load_fn, get_impl_dtype
 
 DEFAULT_IMPLS = ["tc5_regpruned", "cublas_bf16", "triton_bf16_autotuned"]
 

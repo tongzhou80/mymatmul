@@ -332,7 +332,7 @@ def main() -> None:
 
     bench_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, bench_dir)
-    from bench_gpu import _all_impls
+    from bench import _all_impls
     all_i = _all_impls()
 
     import torch

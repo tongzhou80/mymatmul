@@ -239,7 +239,7 @@ def main() -> None:
     parser.add_argument(
         "--impls", nargs="+", default=DEFAULT_IMPLS,
         metavar="IMPL",
-        help="Impl names from bench_gpu.IMPLEMENTATIONS (default: cuBLAS + Triton configs)",
+        help="Impl names from bench.IMPLEMENTATIONS (default: cuBLAS + Triton configs)",
     )
     parser.add_argument(
         "--size", type=int, default=4096, metavar="N",
@@ -258,7 +258,7 @@ def main() -> None:
 
     bench_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, bench_dir)
-    from bench_gpu import _all_impls
+    from bench import _all_impls
     import torch
     all_i = _all_impls()
 
