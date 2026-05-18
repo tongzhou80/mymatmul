@@ -27,7 +27,6 @@ methodology).
 | 4 | `h2_s7_runptr`      | **running pointers** — Triton-style per-thread gmem ptrs, save ~15 int ops/iter | 631 | 85.9% | 63.8% |
 | 5 | `h2_s8_smem_wb`     | **SMEM-staged vec-4 writeback** — fix coalescing of wgmma fragment layout | 657 | 89.4% | 66.4% |
 | 6 | `h2_s8_smem_wb_swz` | **CTA swizzle (GROUP_M)** — improve L2 reuse via co-located CTA waves | **725** | **98.6%** | 73.3% |
-| — | CUTLASS BF16        | reference (autotuned over 7 (TileShape, ClusterShape) configs) | 635 | 86.4% | 64.2% |
 
 We go from **53% of cuBLAS** at step 1 to **99% at step 6**. Across the
 full sweep (2048-16384) we beat Triton at every size and tie/beat
