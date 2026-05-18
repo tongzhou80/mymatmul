@@ -194,6 +194,8 @@ IMPLEMENTATIONS = {
     "h2_s8_smem_wb_u3":   ("mymatmul.gpu.hopper.matmul_h2_s8_smem_wb_u3.matmul_h2_s8_smem_wb_u3",     None, torch.bfloat16),
     "h2_s8_smem_wb_clu":  ("mymatmul.gpu.hopper.matmul_h2_s8_smem_wb_clu.matmul_h2_s8_smem_wb_clu",   None, torch.bfloat16),
     "h2_s8_smem_wb_swz":  ("mymatmul.gpu.hopper.matmul_h2_s8_smem_wb_swz.matmul_h2_s8_smem_wb_swz",   None, torch.bfloat16),
+    "h2_s8_smem_wb_flat": ("mymatmul.gpu.hopper.matmul_h2_s8_smem_wb_flat.matmul_h2_s8_smem_wb_flat", None, torch.bfloat16),
+    "h2_s8_smem_wb_swz_pipe": ("mymatmul.gpu.hopper.matmul_h2_s8_smem_wb_swz_pipe.matmul_h2_s8_smem_wb_swz_pipe", None, torch.bfloat16),
     "h2_s7_counter":   ("mymatmul.gpu.hopper.matmul_h2_s7_counter.matmul_h2_s7_counter",     None, torch.bfloat16),
     "h2_s7_wait_hint": ("mymatmul.gpu.hopper.matmul_h2_s7_wait_hint.matmul_h2_s7_wait_hint", None, torch.bfloat16),
     "h2_s7_swz":       ("mymatmul.gpu.hopper.matmul_h2_s7_swz.matmul_h2_s7_swz",             None, torch.bfloat16),

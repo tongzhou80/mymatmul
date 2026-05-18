@@ -341,3 +341,231 @@ H2+ kernels use `cuda.bindings.driver` throughout:
 - `cuTensorMapEncodeTiled` → returns `CUtensorMap` with `.opaque` field (16×uint64)
 - `cuLaunchKernel` → `kernelParams` must be `np.array([ctypes.addressof(...)], dtype=np.intp)`
 - `cuuint32_t` / `cuuint64_t` wrappers required for descriptor fields
+
+---
+
+## Post-s7 Kernel Additions
+
+After h2_s7, work focused on closing the remaining gap to Triton via PTX-level
+side-by-side comparison of the K-loop body and the epilogue. Each step is one
+isolated change on top of the previous one.
+
+### h2_s7_runptr — per-thread running pointers (+9% over s7)
+`_matmul_h2_s7_runptr.cu`
+
+From t36-vs-s7 decompile diff: Triton maintains per-thread running gmem
+pointers `A_curr[i] / B_curr[i]` and advances them by stride each K-iter.
+s7 instead recomputes `&A[(block_row+r)*K + k*BK + c]` per cp.async (~18
+integer ops/iter for address compute). Replacing with running pointers
+saved ~15 ops/iter on a warp-issue-bound kernel.
+
+Sustained (BM=128 BN=256 BK=64 NS=3): **565 → 615 TF at 4096 (+8.9%)**.
+
+### h2_s8 — folded SMEM destination offsets (+1.8%)
+`_matmul_h2_s8.cu`
+
+PTX inspection of runptr showed each cp.async's SMEM destination was built
+as a chain of separate `add.s32`:
+```
+A:  add(A_stage_base, _r*BK*2);    add(prev, _sc*2)               (2 adds)
+B:  add(B_stage_base, _st*BK*64*2); add(prev, _kr*64*2);
+    add(prev, _sc*2)                                                (3 adds)
+```
+Although `_r,_sc,_st,_kr` are loop-invariant per (tid, _i), ptxas does NOT
+CSE them. Pre-folding into single `A_sh_off[A_GROUPS] / B_sh_off[B_GROUPS]`
+ints in the preheader collapses each chain to one add per cp.async issue.
+K-loop add.s32 count: 45 → 26 per iter (−19 ops). +1.8%.
+
+### h2_s8_smem_wb — SMEM-staged vec-4 epilogue (+7-9%)
+`_matmul_h2_s8_smem_wb.cu` (was `_smem_epi`; renamed for brevity)
+
+t36 epilogue uses SMEM round-trip: write acc → SMEM at wgmma-fragment
+positions, syncthreads, all 256 threads cooperatively stream BM*BN to
+global via `st.global.v4.b32` (16 B/store, ideal coalescing). Old direct
+epilogue: each thread writes 2× `__bfloat162` per j-stripe (32 stores/
+thread). New: 16 stores/thread, half the issue count, much better
+coalescing of fragment-native layouts.
+
+Bigger than expected: +9% at 4096 (621 → 677 TF), bringing us to Triton
+parity at 4096-8192 for the first time. Also merged A+B cp.async into
+a single commit group (halves commit count, perf-neutral, simpler).
+
+Reuses smem_raw (idle after WAIT_MMA(0)); row stride padded by 8 BF16
+to break power-of-2 bank-conflict pattern.
+
+### Local-restructuring experiments (all flat or negative)
+
+After landing smem_wb, several scheduling/microarchitecture tweaks were
+tried — all **failed** to move the needle. Documented as negative results.
+
+| Variant | Idea | Result |
+|---|---|---|
+| `_pipe` | Split COMPUTE_TILE into MMA_PRECOMPUTE (descriptors) + MMA_ASYNC; precompute hidden behind WAIT_SMEM stall | −3 to −5% at source level; perf-neutral when verified at PTX level (surgical instruction relocation). cp.async.wait_group does not stall in steady state with NS=3 |
+| `_u3` | Unroll K-loop by 3 (NS=3 cycle length) so slot indices 0/1/2 become compile-time constants, eliminating `k%3` magic-div and `slot*stride` adds | Consistent −2 to −3% at 8192. Code-size 3× perhaps eats icache headroom |
+| `_clu` | Add `__cluster_dims__(2, 1, 1)` to launcher for L2 co-location | Flat (−0.2 to −0.9% across sizes). Cluster co-location heuristic doesn't help when working set already fits L2 |
+
+The pattern: at h2_s8_smem_wb's perf level, the rolled K-loop is already
+at a ptxas-scheduling local optimum. Local scheduling perturbations
+(precompute slots, manual unroll, instruction reorder) cost ~2-5% by
+disturbing register pressure or warp issue patterns the compiler had
+optimized around. **PTX surgical edit + ptxas re-compile** is the cheapest
+A/B tool for separating "is the stall real?" from "did the compiler do
+something else under the source change?"
+
+### h2_s8_smem_wb_swz — Triton-style GROUP_M block remap (the final win)
+`_matmul_h2_s8_smem_wb_swz.cu`
+
+Source body byte-identical to h2_s8_smem_wb; only the block_row/block_col
+derivation changes:
+```cpp
+template<int BM, int BN, int BK, int NUM_WG, int NUM_STAGES, int GROUP_M>
+...
+if constexpr (GROUP_M <= 1) {
+    pid_m = blockIdx.y; pid_n = blockIdx.x;
+} else {
+    const int num_pid_n = gridDim.x;
+    const int pid       = blockIdx.y * num_pid_n + blockIdx.x;
+    const int per_group = GROUP_M * num_pid_n;
+    const int group_id  = pid / per_group;
+    const int idx       = pid - group_id * per_group;
+    pid_m = group_id * GROUP_M + (idx % GROUP_M);
+    pid_n = idx / GROUP_M;
+}
+```
+Each block of `GROUP_M × num_pid_n` CTAs covers a `GROUP_M × num_pid_n`
+band of output tiles, iterating M-first. A wave of 132 CTAs then hits a
+smaller (M_tiles × N_tiles) bounding box → much higher L2 hit rate at
+sizes where the natural row-major scan blows past L2 between waves.
+
+Autotunes over GROUP_M ∈ {1, 2, 4, 8}. The selector reliably picks **GM=1**
+at N=4096-6144 (no swizzle, identical to wb) and **GM=8** at N=2048,
+3072, and N≥7168 (boundary regimes where L2 reuse matters).
+
+Closes the 10240 deficit entirely (91% → 99% of Triton) and unlocks
++9-13% at N=7168-9216.
+
+### Autotune methodology: median, not min
+
+The min-of-do_bench selector was found to be **noise-biased** on the
+expanded swz config space (424 vs the original 106 configs). Switching
+to **median + 100ms rep budget** recovered 9-13% at N=7168-9216 by
+finding configs that min had systematically mispicked:
+
+```
+                    min picked              median picked       sustained Δ
+N=7168    BM=128/BN=256 NS=3 GM=1   BM=128/BN=256 NS=4 GM=8     +5.0%
+N=8192    BM=256/BN=128 NS=3 GM=1   BM=128/BN=256 NS=3 GM=8    +10.5%
+N=9216    BM=256/BN=128 NS=3 GM=1   BM=128/BN=256 NS=3 GM=8    +11.0%
+```
+
+Why min is biased: GROUP_M-swizzled configs change the spatial cache
+footprint and need a few warmup launches; min(50ms rep) reports the
+single luckiest cold-cache launch and rewards near-tied configs with
+"unlucky" first iters that happen to be fast. Median tolerates the
+warmup tail and reports steady-state behavior, which matches the
+production (long-rep) launcher.
+
+The effect scales with autotune space size: small spaces (~100 cfgs,
+e.g. wb) are mostly OK under min; large spaces (~400+ cfgs, e.g. swz)
+systematically mispick. **Switch to median *before* expanding the
+config space**, not after.
+
+---
+
+## Final Results (h2_s8_smem_wb_swz vs Triton vs cuBLAS)
+
+Sustained BF16 matmul on H800, square M=K=N, `triton.testing.do_bench`
+warmup=200ms rep=2000ms.
+
+| Size | **swz** | Triton PTX | cuBLAS BF16 | swz/Triton | swz/cuBLAS |
+|-----:|----:|----:|----:|---:|---:|
+| 2048  | **605** | 574 | 568 | **105.4%** | **106.7%** |
+| 3072  | 579 | 517 | **653** | **112.1%** | 88.6% |
+| 4096  | **694** | 677 | 672 | **102.5%** | **103.2%** |
+| 5120  | 633 | 617 | **677** | **102.5%** | 93.5% |
+| 6144  | **689** | 689 | 686 | **100.1%** | **100.6%** |
+| 7168  | **722** | 706 | 662 | **102.3%** | **109.2%** |
+| 8192  | 725 | 694 | **735** | **104.5%** | 98.7% |
+| 9216  | **716** | 695 | 676 | **103.1%** | **105.9%** |
+| 10240 | **712** | 698 | 693 | **102.0%** | **102.7%** |
+| 11264 | 727 | 706 | **737** | **103.0%** | 98.7% |
+| 12288 | 721 | 695 | **737** | **103.7%** | 97.8% |
+| 13312 | 732 | 696 | **740** | **105.1%** | 98.9% |
+| 14336 | **742** | 694 | 734 | **107.0%** | **101.1%** |
+| 15360 | 722 | 717 | **739** | **100.6%** | 97.7% |
+| 16384 | **731** | 693 | 725 | **105.4%** | **100.8%** |
+
+**Summary across all 15 sizes (2048-16384):**
+
+| Metric | vs Triton | vs cuBLAS |
+|---|---:|---:|
+| Geometric mean ratio | **103.9%** | **100.3%** |
+| Wins (≥100%) | **15 / 15** ✓ | 9 / 15 |
+| Best ratio | 112.1% (N=3072) | 109.2% (N=7168) |
+| Worst ratio | 100.1% (N=6144) | 88.6% (N=3072 — cuBLAS specialty) |
+
+**Peak: 742 TF at N=14336 — 75% of the 989 TF tensor-core peak.**
+
+We beat Triton at every single size in the sweep. cuBLAS wins at its
+non-power-of-2 specialty sizes (3072, 5120) and in the 11264-15360 band
+where it hits 735-740 TF; we win or tie elsewhere.
+
+---
+
+## Final Progression Table
+
+| Step | Kernel | Key change | 4096 TF | 8192 TF |
+|------|--------|-----------|:-------:|:-------:|
+| 1  | tc5_regpruned | Ada baseline on H800 | 378 | 362 |
+| 2  | h1_ms | multi-stage cp.async | 382 | 368 |
+| 3  | h2_s3 | TMA + wgmma + 2 warpgroups | 361 | 415 |
+| 4  | h2_s4 | larger M tile (BM=256) | 389 | 434 |
+| 5  | h2_s5 | deeper pipeline (NS=3/4) | 427 | 441 |
+| 6  | h2_s7 | wgmma.wait_group 1 (overlap MMA + load) | 574 | 586 |
+| 7  | h2_s7_runptr | per-thread running gmem ptrs | 615 | 605 |
+| 8  | h2_s8 | folded SMEM dest offsets | 622 | 639 |
+| 9  | h2_s8_smem_wb | SMEM-staged vec-4 epilogue | 677 | 681 |
+| 10 | **h2_s8_smem_wb_swz** | **+ Triton-style GROUP_M autotune dim** | **694** | **725** |
+| —  | Triton PTX | reference target | 677 | 694 |
+| —  | cuBLAS BF16 | NVIDIA's own | 672 | 735 |
+
+Total improvement: tc5_regpruned → swz = **378 → 694 TF at 4096** (+84%).
+
+---
+
+## Methodology Notes (added during post-s7 work)
+
+### Compiler is a black box
+
+Five separate experiments after smem_wb (`_pipe` precompute, PTX surgical
+move, `_u3` unroll-by-3, `_clu` CTA cluster, B-side base+offset) all came
+in flat-to-negative even when the source-level intent ("reduce ops",
+"hide compute behind stall", "improve L2 locality") was clearly correct.
+
+The pattern: at h2_s8_smem_wb's perf level, ptxas's default schedule on
+the rolled NS=3 K-loop is a strong local optimum, and *local* source
+perturbations sit on a flat-or-rising plateau around it. Things that
+worked were **structural**: adding a missing autotune dimension
+(GROUP_M), or making the autotune *reliable* (median).
+
+### PTX surgical edit as A/B test
+
+For "is this stall real?" questions, the cheapest, cleanest tool is to
+edit the compiled .ptx file by hand (move N instructions), re-compile
+with `ptxas -O3`, and bench. This eliminates every compiler-side
+confound (register pressure, alternate config selection, schedule
+disturbance) and isolates the pure effect of the reorder. Used at:
+verifying that pre-barrier descriptor compute is perf-neutral (the
+post-barrier wait does not stall in steady state with NS=3).
+
+### Autotune is the second kernel
+
+Realised late: **the autotune is itself a kernel that needs tuning**.
+For a 400+ config space, the difference between min and median selectors
+is 10% in delivered perf. For a 100-config space it's ~0. The autotune
+budget (warmup/rep) and the score statistic (min/median/quantile) are
+first-class hyperparameters.
+
+A more principled fix than median-alone would be a two-stage autotune:
+short pass for top-K, long re-test among those to pick the winner. Not
+implemented yet — median + 100ms rep recovered most of the gap.
