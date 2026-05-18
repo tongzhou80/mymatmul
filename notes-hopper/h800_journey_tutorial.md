@@ -448,13 +448,54 @@ The same swizzle on the faster `h2_s8_smem_wb` base — where the
 warp-issue bottleneck is gone — works perfectly. **The right answer
 was "autotune over GROUP_M", not "always 1" or "always > 1".**
 
-### 8.7. Direct read of cuBLAS / CUTLASS as a target
-We compared against Triton's pre-compiled PTX and cuBLAS BF16. We tried
-also building a CUTLASS reference kernel; the wrapper overhead
-(per-call `cuTensorMapEncodeTiled`) added ~40 µs and dominated short
-sweeps. Fixed with a per-call `Gemm` state cache + persistent output
-buffer, but at that point CUTLASS as a reference contributes nothing
-new — it ends up in roughly the same place as Triton.
+### 8.7. CUTLASS as a reference (cautionary tale on wrapper overhead)
+We built a CUTLASS BF16 reference via `CollectiveBuilder` (see
+`mymatmul/gpu/cutlass/`). Two snags along the way:
+
+**(a) Per-call wrapper overhead dominated short benches.** First version:
+each call did `Gemm gemm; gemm.can_implement(args); gemm.initialize(args, ws);
+gemm.run();`. The `initialize` call invokes `cuTensorMapEncodeTiled` 3×
+(for A, B, C) — ~30 µs/call. Plus `cudaMalloc/cudaFree` of the workspace
+per call (~5-15 µs). For a 4096³ matmul (~200 µs kernel), this was ~17%
+overhead and CUTLASS landed at 550 TF instead of its real ~686.
+**Fix**: per-config `Gemm` state cache + persistent output buffer →
+re-init only when (M, N, K, A_ptr, B_ptr, C_ptr) changes. After the
+fix CUTLASS hit 686 / 635 / 642 TF at 4096 / 8192 / 10240.
+
+**(b) `KernelScheduleAuto` picked the wrong path.** Default auto-select
+gave a non-cooperative schedule whose wgmma instructions are serialised
+across function boundaries (warning code 20011 from `ptxas`). Switching
+to explicit `KernelTmaWarpSpecializedCooperative` recovered the
+expected perf — note this schedule requires `BM ≥ 128` (one config we
+had to drop).
+
+**The bigger caveat — our autotune is small.** CUTLASS's published
+strength comes from a *library* of hundreds of pre-compiled kernels
+(tile × cluster × schedule × stage-count × ...), with config-per-shape
+tables built offline by the CUTLASS profiler. Our wrapper exposes only
+7 hand-picked (TileShape, ClusterShape) combinations under one schedule
+(cooperative) and one BK (64). With that limited search:
+
+| Size | CUTLASS (7-config) | Triton PTX | cuBLAS | vs Triton | vs cuBLAS |
+|---:|---:|---:|---:|---:|---:|
+| 4096  | 686 | 677 | 672 | **+1.3%** | **+2.0%** |
+| 8192  | 635 | 694 | 735 | −8.5% | −13.6% |
+| 10240 | 642 | 698 | 693 | −8.0% | −7.4% |
+
+So CUTLASS-as-tested matches Triton/cuBLAS at small sizes (4096) and
+lags both at larger sizes. **This isn't a CUTLASS weakness** — cuBLAS
+itself uses CUTLASS kernels under the hood for most shapes. The gap
+is purely our 7-config sweep not exhausting the search space. A full
+production CUTLASS path (50+ configs, multiple schedules, BK
+variation) would likely match cuBLAS exactly.
+
+We didn't push this further because (1) each CUTLASS template
+instantiation takes 30-60s to compile (a 50-config sweep is 30+ min
+of nvcc), and (2) once we'd verified CUTLASS lands "between Triton
+and cuBLAS at small sizes, behind both at large sizes" we had a good
+enough reference. The real signal we wanted — Triton vs cuBLAS as
+upper bounds for hand-written kernels — was already captured by those
+two impls.
 
 ---
 
