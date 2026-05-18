@@ -243,6 +243,8 @@ IMPLEMENTATIONS = {
     "h4_dsmem":    ("mymatmul.gpu.hopper.matmul_h4_dsmem.matmul_h4_dsmem",       None, torch.bfloat16),
     # Triton PTX: pre-compiled BM=128,BN=256,BK=32,NS=4 cp.async+wgmma-SS kernel
     "triton_ptx": ("mymatmul.gpu.hopper.matmul_triton_ptx.matmul_triton_ptx", None, torch.bfloat16),
+    # Blackwell B1: direct port of 4090-best tc5_lb (sm_80 mma.sync, forward-compatible)
+    "b1_tc5": ("mymatmul.gpu.blackwell.matmul_b1_tc5.matmul_b1_tc5", None, torch.bfloat16),
     "tc6_x4b":       ("mymatmul.gpu.tensor_core.matmul_cuda_tc6_x4b.matmul_tc6_x4b",             None, torch.bfloat16),
     "tc8_4096":     ("mymatmul.gpu.tensor_core.matmul_cuda_tc8_4096.matmul_tc8_4096",             None, torch.bfloat16),
     "tc8_4096_ptx": ("mymatmul.gpu.tensor_core.matmul_cuda_tc8_4096_ptx.matmul_tc8_4096_ptx",   None, torch.bfloat16),
