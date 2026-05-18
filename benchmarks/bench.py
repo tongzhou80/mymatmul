@@ -71,6 +71,7 @@ IMPLEMENTATIONS = {
     "triton_ptx":         ("mymatmul.gpu.hopper.matmul_triton_ptx.matmul_triton_ptx",                       None, torch.bfloat16),
     # ── Blackwell series ──
     "b1_tc5": ("mymatmul.gpu.blackwell.matmul_b1_tc5.matmul_b1_tc5", None, torch.bfloat16),
+    "b2_ms":  ("mymatmul.gpu.blackwell.matmul_b2_ms.matmul_b2_ms",   None, torch.bfloat16),
 }
 
 SIZES = [128, 256, 512, 1024, 2048, 4096, 8192]
@@ -190,8 +191,33 @@ def tflops(M, N, K, ms):
     return 2 * M * N * K / (ms / 1e3) / 1e12
 
 
+def _get_tuned_config(name, M, N, K) -> str | None:
+    """Return the autotuned config string for (impl, shape), if the impl exposes one.
+
+    Convention: autotuner modules store `_best: dict[(M, N, K), tuple]`. We look
+    that up after the kernel has run (so the autotune entry is populated).
+    """
+    entry = _all_impls().get(name)
+    if entry is None: return None
+    module_path = entry[0].rsplit(".", 1)[0]
+    try:
+        mod = importlib.import_module(module_path)
+    except Exception:
+        return None
+    best = getattr(mod, "_best", None)
+    if not isinstance(best, dict): return None
+    cfg = best.get((M, N, K))
+    if cfg is None: return None
+    if isinstance(cfg, tuple):
+        fields = getattr(mod, "_BEST_FIELDS", None)
+        if fields and len(fields) == len(cfg):
+            return " ".join(f"{k}={v}" for k, v in zip(fields, cfg))
+        return "(" + ",".join(str(x) for x in cfg) + ")"
+    return str(cfg)
+
+
 def run(impl_names, shapes):
-    """Returns results[impl][shape] = (tflops_med, ms_med, ms_min) or None for skip/fail."""
+    """Returns results[impl][shape] = (tflops_med, ms_med, ms_min, config_or_None)."""
     all_i = _all_impls()
     results: dict = {name: {} for name in impl_names}
 
@@ -232,8 +258,10 @@ def run(impl_names, shapes):
                 continue
             tf = tflops(M, N, K, ms_med)
             tf_best = tflops(M, N, K, ms_min)
-            print(f"  {tag}: {tf:7.1f} TFLOPS  (median {ms_med:.3f} ms, best {ms_min:.3f} → {tf_best:7.1f} TFLOPS)")
-            results[name][shape] = (tf, ms_med, ms_min)
+            cfg = _get_tuned_config(name, M, N, K)
+            cfg_str = f"  cfg={cfg}" if cfg else ""
+            print(f"  {tag}: {tf:7.1f} TFLOPS  (median {ms_med:.3f} ms, best {ms_min:.3f} → {tf_best:7.1f} TFLOPS){cfg_str}")
+            results[name][shape] = (tf, ms_med, ms_min, cfg)
 
     return results
 
@@ -257,6 +285,18 @@ def print_summary(impl_names, shapes, results):
             r = results[name].get(shape)
             row_cells.append(f"{r[0]:>{col_w}.1f}" if r else f"{'—':>{col_w}}")
         print(f"{name:<{name_w}}" + "".join(row_cells))
+
+    # Selected autotuned configs (one line per (impl, shape) that had one).
+    cfg_lines = [(name, shape_labels[i], r[3])
+                 for name in impl_names
+                 for i, shape in enumerate(shapes)
+                 if (r := results[name].get(shape)) and r[3]]
+    if cfg_lines:
+        print("\nSelected configs (autotuned):")
+        nw = max(len(n) for n, _, _ in cfg_lines)
+        sw = max(len(s) for _, s, _ in cfg_lines)
+        for name, slabel, cfg in cfg_lines:
+            print(f"  {name:<{nw}}  {slabel:<{sw}}  {cfg}")
     print()
 
 

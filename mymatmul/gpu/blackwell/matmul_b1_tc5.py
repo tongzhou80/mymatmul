@@ -36,6 +36,10 @@ _MAX_SMEM = 100352
 # LB_MIN_BLOCKS: same register-budget knob as on Ada.
 _LB_FOR_NW = {4: [1, 2, 3, 4], 8: [1, 2]}
 
+# Field labels for the (BM, BN, BK, NW, LB) entries stored in _best.
+# Read by benchmarks/bench.py to format the summary table's config column.
+_BEST_FIELDS = ("BM", "BN", "BK", "NW", "LB")
+
 
 def _smem(bm, bn, bk):
     return (2 * bm * bk + 2 * bk * bn) * 2
