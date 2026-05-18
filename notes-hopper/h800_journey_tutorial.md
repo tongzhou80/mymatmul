@@ -52,6 +52,12 @@ cuBLAS at most sizes — see §1b.
 989 TFLOPS BF16 tensor-core peak), single GPU
 (`CUDA_VISIBLE_DEVICES=2`).
 
+**Software**: PyTorch **2.5.1+cu124**, Triton 3.x, nvcc from CUDA 13.0.
+The cuBLAS BF16 numbers come from PyTorch's bundled cuBLAS (≈ cuBLAS
+12.4). Newer torch versions ship newer cuBLAS, so absolute cuBLAS
+numbers may shift; the relative shape of the picture (cuBLAS strong at
+8192/specialty sizes, ours competitive elsewhere) is expected to hold.
+
 **Timing**: `triton.testing.do_bench(warmup=200ms, rep=2000ms,
 quantiles=(0.5, 0.0, 1.0))`. Reported number is `ms_min` from the
 returned (median, min, max) triple — i.e., the best-of run within a
