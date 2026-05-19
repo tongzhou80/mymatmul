@@ -99,9 +99,10 @@ __device__ __forceinline__ void b4_pipe_impl(
     __nv_bfloat16* __restrict__ C,
     int M, int K, int N
 ) {
-    static_assert(BM == 128 && BN == 128, "b4 fixed at 128x128 tile");
+    static_assert(BM == 64 || BM == 128, "BM ∈ {64, 128} for tcgen05.mma cta_group::1");
+    static_assert(BN % 8 == 0 && BN >= 8 && BN <= 256, "BN ∈ {8, 16, ..., 256}");
     static_assert(BK % 16 == 0, "BK must be multiple of 16");
-    static_assert(NUM_WARPS == 4, "epilogue assumes 4 warps drain 4*32=128 rows");
+    static_assert(NUM_WARPS == BM / 32, "epilogue needs NW = BM/32 (each warp drains 32 rows)");
     constexpr int THREADS = NUM_WARPS * 32;
     constexpr int K_INNER = 8;
     constexpr int K_TILES = BK / K_INNER;   // 2, 4, 8, 16 for BK = 16, 32, 64, 128
@@ -286,18 +287,27 @@ __device__ __forceinline__ void b4_pipe_impl(
 
 // ── Launchers ───────────────────────────────────────────────────────────────
 
-#define MAKE_LAUNCHER(BK_, NS_)                                                        \
-extern "C" __global__ __launch_bounds__(128, LB_MIN_BLOCKS)                            \
-void matmul_b4_pipe_bm128_bn128_bk##BK_##_nw4_ns##NS_(                                 \
+#define MAKE_LAUNCHER(BM_, BN_, BK_, NW_, NS_)                                         \
+extern "C" __global__ __launch_bounds__(NW_ * 32, LB_MIN_BLOCKS)                       \
+void matmul_b4_pipe_bm##BM_##_bn##BN_##_bk##BK_##_nw##NW_##_ns##NS_(                   \
     const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,          \
     __nv_bfloat16* __restrict__ C, int M, int K, int N)                                \
 {                                                                                       \
-    b4_pipe_impl<128, 128, BK_, 4, NS_>(A, B, C, M, K, N);                             \
+    b4_pipe_impl<BM_, BN_, BK_, NW_, NS_>(A, B, C, M, K, N);                           \
 }
 
-MAKE_LAUNCHER(16, 2) MAKE_LAUNCHER(16, 3) MAKE_LAUNCHER(16, 4) MAKE_LAUNCHER(16, 5)
-MAKE_LAUNCHER(32, 2) MAKE_LAUNCHER(32, 3) MAKE_LAUNCHER(32, 4) MAKE_LAUNCHER(32, 5)
-MAKE_LAUNCHER(64, 2) MAKE_LAUNCHER(64, 3) MAKE_LAUNCHER(64, 4) MAKE_LAUNCHER(64, 5)
-MAKE_LAUNCHER(128, 2) MAKE_LAUNCHER(128, 3)
+// BM=128 only (NW=4). 3 BN × 4 BK × 4 NS = 48 launchers.
+#define ROW_BM_128(BN_, BK_) \
+    MAKE_LAUNCHER(128, BN_, BK_, 4, 2) MAKE_LAUNCHER(128, BN_, BK_, 4, 3) \
+    MAKE_LAUNCHER(128, BN_, BK_, 4, 4) MAKE_LAUNCHER(128, BN_, BK_, 4, 5)
 
+#define ROW(BN_) \
+    ROW_BM_128(BN_, 16) ROW_BM_128(BN_, 32) ROW_BM_128(BN_, 64) ROW_BM_128(BN_, 128)
+
+ROW(64)
+ROW(128)
+ROW(256)
+
+#undef ROW
+#undef ROW_BM_128
 #undef MAKE_LAUNCHER
