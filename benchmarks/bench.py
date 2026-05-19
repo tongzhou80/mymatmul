@@ -70,8 +70,9 @@ IMPLEMENTATIONS = {
     "h4":                 ("mymatmul.gpu.hopper.matmul_h4.matmul_h4",                                       None, torch.bfloat16),
     "triton_ptx":         ("mymatmul.gpu.hopper.matmul_triton_ptx.matmul_triton_ptx",                       None, torch.bfloat16),
     # ── Blackwell series ──
-    "b1_tc5": ("mymatmul.gpu.blackwell.matmul_b1_tc5.matmul_b1_tc5", None, torch.bfloat16),
-    "b2_ms":  ("mymatmul.gpu.blackwell.matmul_b2_ms.matmul_b2_ms",   None, torch.bfloat16),
+    "b1_tc5":  ("mymatmul.gpu.blackwell.matmul_b1_tc5.matmul_b1_tc5",   None, torch.bfloat16),
+    "b2_ms":   ("mymatmul.gpu.blackwell.matmul_b2_ms.matmul_b2_ms",     None, torch.bfloat16),
+    "b3_tc05": ("mymatmul.gpu.blackwell.matmul_b3_tc05.matmul_b3_tc05", None, torch.bfloat16),
 }
 
 SIZES = [128, 256, 512, 1024, 2048, 4096, 8192]
