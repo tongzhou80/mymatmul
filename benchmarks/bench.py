@@ -77,6 +77,7 @@ IMPLEMENTATIONS = {
     "b4_pipe": ("mymatmul.gpu.blackwell.matmul_b4_pipe.matmul_b4_pipe", None, torch.bfloat16),
     "b5_tma":  ("mymatmul.gpu.blackwell.matmul_b5_tma.matmul_b5_tma",   None, torch.bfloat16),
     "b6_ms":   ("mymatmul.gpu.blackwell.matmul_b6_ms.matmul_b6_ms",     None, torch.bfloat16),
+    "b7_msa":  ("mymatmul.gpu.blackwell.matmul_b7_msa.matmul_b7_msa",   None, torch.bfloat16),
 }
 
 SIZES = [128, 256, 512, 1024, 2048, 4096, 8192]
