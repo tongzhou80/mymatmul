@@ -30,6 +30,7 @@ IMPLEMENTATIONS = {
     "cublas_fp32_notf32":         ("mymatmul.gpu.matmul_torch.matmul_torch_fp32_notf32", None),
     # ── BF16 references ──
     "triton_bf16_autotuned": ("mymatmul.gpu.matmul_triton.triton_bf16_autotuned", None, torch.bfloat16),
+    "triton_blackwell":      ("mymatmul.gpu.matmul_triton.triton_bf16_blackwell_pytorch", None, torch.bfloat16),
     "cublas_bf16":           ("mymatmul.gpu.matmul_torch.matmul_torch_bf16",      None, torch.bfloat16),
     "cutlass_bf16":          ("mymatmul.gpu.cutlass.matmul_cutlass.matmul_cutlass_bf16", None, torch.bfloat16),
     # ── Ada tensor-core series ──

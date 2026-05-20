@@ -279,3 +279,161 @@ triton_fp32simt_bm128_bn64_bk32  = _make_triton_fp32_simt(128,  64, 32)
 triton_fp32simt_bm64_bn64_bk32   = _make_triton_fp32_simt(64,   64, 32)
 # BN=256 configs; BK=16 fits in 48KB smem with double buffering (2×(128×16+16×256)×4=49152B)
 triton_fp32simt_bm128_bn256_bk16 = _make_triton_fp32_simt(128, 256, 16)
+
+
+# ============================================================================
+# Blackwell-standard Triton matmul
+#
+# Mirrors Triton's tutorials/09-persistent-matmul.py `matmul_kernel_tma_persistent`:
+#   - TMA-backed loads via `tl.make_tensor_descriptor` (auto-128B-swizzled)
+#   - persistent grid: each CTA processes multiple output tiles in a flat loop
+#   - warp_specialize=True enables Blackwell's async warp scheduler
+#   - tl.dot(a, b.T, acc) — same B-as-(N,K) layout convention as gau-nernst v2
+#
+# Reference autotune space (from tutorials/09 lines 369-382, March 2026):
+#   BM=128, BN∈{128,256}, BK∈{64,128}, num_stages∈{2,3,4}, num_warps∈{4,8}
+# ============================================================================
+
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+    _TENSOR_DESCRIPTOR_AVAILABLE = True
+except ImportError:
+    _TENSOR_DESCRIPTOR_AVAILABLE = False
+
+
+_bw_configs = [
+    triton.Config(
+        {'BLOCK_SIZE_M': BM, 'BLOCK_SIZE_N': BN, 'BLOCK_SIZE_K': BK,
+         'GROUP_SIZE_M': 8, 'WARP_SPECIALIZE': ws, 'EPILOGUE_SUBTILE': epi,
+         'FLATTEN': fl},
+        num_stages=s, num_warps=w,
+    )
+    for BM in [128]
+    for BN in [128, 256]
+    for BK in [64, 128]
+    for s in [2, 3, 4]
+    for w in [4, 8]
+    for ws in [True, False]
+    for epi in [True, False]
+    for fl in [True, False]
+    # EPI=True with FLATTEN=False is invalid per tutorial's prune_invalid_configs.
+    if not (epi and not fl)
+]
+
+
+@triton.jit
+def _bw_compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
+    group_id = tile_id // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (tile_id % group_size_m)
+    pid_n = (tile_id % num_pid_in_group) // group_size_m
+    return pid_m, pid_n
+
+
+@triton.autotune(configs=_bw_configs, key=["M", "N", "K"])
+@triton.jit
+def _matmul_bf16_bw_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr,
+    EPILOGUE_SUBTILE: tl.constexpr,
+    FLATTEN: tl.constexpr,
+):
+    dtype = c_ptr.dtype.element_ty
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    num_tiles = num_pid_m * num_pid_n
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    # Device-side descriptor creation (Triton-tutorial matmul_kernel_descriptor_persistent).
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr, shape=[M, K], strides=[K, 1],
+        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K])
+    b_desc = tl.make_tensor_descriptor(
+        b_ptr, shape=[N, K], strides=[K, 1],
+        block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K])
+    c_desc = tl.make_tensor_descriptor(
+        c_ptr, shape=[M, N], strides=[N, 1],
+        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N // 2 if EPILOGUE_SUBTILE else BLOCK_SIZE_N])
+
+    # Decouple epilogue tile_id from prologue tile_id so they can pipeline.
+    tile_id_c = start_pid - NUM_SMS
+
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS,
+                            flatten=FLATTEN, warp_specialize=WARP_SPECIALIZE):
+        pid_m, pid_n = _bw_compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            offs_k = ki * BLOCK_SIZE_K
+            a = a_desc.load([offs_am, offs_k])
+            b = b_desc.load([offs_bn, offs_k])
+            accumulator = tl.dot(a, b.T, accumulator)
+
+        tile_id_c += NUM_SMS
+        pid_m, pid_n = _bw_compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        offs_cm = pid_m * BLOCK_SIZE_M
+        offs_cn = pid_n * BLOCK_SIZE_N
+
+        if EPILOGUE_SUBTILE:
+            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+            acc = tl.permute(acc, (0, 2, 1))
+            acc0, acc1 = tl.split(acc)
+            c_desc.store([offs_cm, offs_cn], acc0.to(dtype))
+            c_desc.store([offs_cm, offs_cn + BLOCK_SIZE_N // 2], acc1.to(dtype))
+        else:
+            c_desc.store([offs_cm, offs_cn], accumulator.to(dtype))
+
+
+_BW_ALLOCATOR_SET = False
+
+
+def _bw_register_allocator():
+    """Triton needs a global memory allocator for TMA descriptors; register once."""
+    global _BW_ALLOCATOR_SET
+    if _BW_ALLOCATOR_SET:
+        return
+    def alloc_fn(size, alignment, stream):
+        return torch.empty(size, device="cuda", dtype=torch.int8)
+    triton.set_allocator(alloc_fn)
+    _BW_ALLOCATOR_SET = True
+
+
+def triton_bf16_blackwell(A, B):
+    """Blackwell-standard Triton matmul (device-side TMA descriptors).
+
+    Requires B as (N, K) row-major in memory.  WARP_SPECIALIZE + EPILOGUE_SUBTILE
+    are both autotuned per shape.
+    """
+    _bw_register_allocator()
+
+    M, K = A.shape
+    N_, K_ = B.shape
+    assert K == K_, f"K mismatch: A is (M,K)={A.shape}, B is (N,K)={B.shape}"
+    N = N_
+    C = torch.empty((M, N), device=A.device, dtype=torch.bfloat16)
+
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+
+    def grid(META):
+        BM = META["BLOCK_SIZE_M"]
+        BN = META["BLOCK_SIZE_N"]
+        return (min(NUM_SMS, triton.cdiv(M, BM) * triton.cdiv(N, BN)),)
+
+    _matmul_bf16_bw_kernel[grid](A, B, C, M, N, K, NUM_SMS=NUM_SMS)
+    return C
+
+
+def triton_bf16_blackwell_pytorch(A, B):
+    """PyTorch-convention wrapper: takes A (M,K), B (K,N) and pre-transposes B."""
+    return triton_bf16_blackwell(A, B.t().contiguous())
