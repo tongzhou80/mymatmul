@@ -156,64 +156,158 @@ __device__ __forceinline__ void b5_tma_impl(
     const int off_m  = bid_m * BLOCK_M;
     const int off_n  = bid_n * BLOCK_N;
 
-    // ── SMEM ────────────────────────────────────────────────────────────────
+    // ── Pipeline state ──────────────────────────────────────────────────────
+    //
+    //   NUM_STAGES SMEM ring-buffer slots, each with its own pair of mbarriers:
+    //     tile_ready_mbar[s] — fires when TMA finishes loading slot s
+    //     mma_done_mbar[s]   — fires when all MMAs consuming slot s have completed
+    //
+    //   We currently use NUM_STAGES=1 (no pipelining): the main loop fully
+    //   processes each K-tile before moving to the next.  All macros take a
+    //   `slot` argument so the structure is ready for NS>1 in a future revision.
+    //
+    constexpr int NUM_STAGES = 1;
+    constexpr int A_SLOT_BYTES = BLOCK_M * BLOCK_K * sizeof(__nv_bfloat16);
+    constexpr int B_SLOT_BYTES = BLOCK_N * BLOCK_K * sizeof(__nv_bfloat16);
+    constexpr int CP_BYTES_PER_TILE = A_SLOT_BYTES + B_SLOT_BYTES;
+
     extern __shared__ __align__(1024) char smem[];
-    const uint32_t A_smem = (uint32_t)__cvta_generic_to_shared(smem);
-    const uint32_t B_smem = A_smem + BLOCK_M * BLOCK_K * sizeof(__nv_bfloat16);
+    const uint32_t SMEM_BASE = (uint32_t)__cvta_generic_to_shared(smem);
+    #define A_SMEM_SLOT(s_) (SMEM_BASE + (s_) * A_SLOT_BYTES)
+    #define B_SMEM_SLOT(s_) (SMEM_BASE + NUM_STAGES * A_SLOT_BYTES + (s_) * B_SLOT_BYTES)
 
-    __shared__ uint64_t mbars[1];
-    __shared__ uint32_t tmem_addr[1];
-    const uint32_t mbar_addr = (uint32_t)__cvta_generic_to_shared(mbars);
+    __shared__ uint64_t tile_ready_mbar[NUM_STAGES];
+    __shared__ uint64_t mma_done_mbar[NUM_STAGES];
+    __shared__ uint32_t tmem_addr_holder[1];
 
+    // ── One-time setup ──────────────────────────────────────────────────────
     if (warp_id == 0 && elect_sync()) {
-        mbarrier_init(mbar_addr, 1);
+        #pragma unroll
+        for (int s = 0; s < NUM_STAGES; s++) {
+            mbarrier_init((uint32_t)__cvta_generic_to_shared(&tile_ready_mbar[s]), 1);
+            mbarrier_init((uint32_t)__cvta_generic_to_shared(&mma_done_mbar[s]),   1);
+        }
         asm volatile("fence.mbarrier_init.release.cluster;");
     } else if (warp_id == 1) {
-        uint32_t addr = (uint32_t)__cvta_generic_to_shared(tmem_addr);
-        tcgen05_alloc(addr, BLOCK_N);
+        tcgen05_alloc((uint32_t)__cvta_generic_to_shared(tmem_addr_holder), BLOCK_N);
     }
     __syncthreads();
-    const uint32_t taddr = tmem_addr[0];
+    const uint32_t taddr = tmem_addr_holder[0];
 
-    int phase = 0;
+    // Per-slot parity counters (in registers): which phase to wait for next.
+    uint32_t tile_ready_phase[NUM_STAGES] = {};
+    uint32_t mma_done_phase  [NUM_STAGES] = {};
     const uint32_t idesc = make_idesc_bf16(BLOCK_M, BLOCK_N);
-    const int num_iters = K / BLOCK_K;
+
+    // ── Pipeline event macros ───────────────────────────────────────────────
+    // Each macro is one event; the K-loop below reads as the dependency graph.
+    //
+    //   LOAD_TILE(slot, k0)
+    //       Issue async TMA load of K-tile k0 into SMEM slot `slot`.
+    //       Signals tile_ready_mbar[slot] when bytes have landed in SMEM.
+    //
+    //   WAIT_ON_TILE_READY(slot)
+    //       Block all threads until LOAD_TILE(slot, _) has completed.
+    //       Ensures SMEM data is visible to tcgen05.mma (issues the required
+    //       async-proxy fence).
+    //
+    //   MMA_ASYNC(slot, first_iter)
+    //       Issue all K_MMAS tcgen05.mma's consuming SMEM slot `slot`,
+    //       accumulating into D (TMEM).  On the very first MMA of the kernel
+    //       (first_iter && first_mma), overwrite D instead of accumulating.
+    //       Signals mma_done_mbar[slot] when all MMAs have completed.
+    //
+    //   WAIT_ON_MMA(slot)
+    //       Block all threads until MMA_ASYNC(slot, _) has completed.
+    //       After this, the SMEM slot is free to be re-loaded.
+
+#define LOAD_TILE(slot_, k0_)                                                          \
+    do {                                                                                \
+        const int _slot = (slot_);                                                      \
+        if (warp_id == 0 && elect_sync()) {                                             \
+            const uint32_t _mb = (uint32_t)__cvta_generic_to_shared(&tile_ready_mbar[_slot]); \
+            _Pragma("unroll")                                                           \
+            for (int _k = 0; _k < BLOCK_K / 64; _k++) {                                 \
+                const int _off_k = (k0_) + _k * 64;                                     \
+                tma_2d_load(A_SMEM_SLOT(_slot) + _k * BLOCK_M * 128,                    \
+                            A_tmap, _off_k, off_m, _mb);                                \
+                tma_2d_load(B_SMEM_SLOT(_slot) + _k * BLOCK_N * 128,                    \
+                            B_tmap, _off_k, off_n, _mb);                                \
+            }                                                                           \
+            mbarrier_arrive_expect_tx(_mb, CP_BYTES_PER_TILE);                          \
+        }                                                                               \
+    } while (0)
+
+#define WAIT_ON_TILE_READY(slot_)                                                       \
+    do {                                                                                \
+        const int _slot = (slot_);                                                      \
+        const uint32_t _mb = (uint32_t)__cvta_generic_to_shared(&tile_ready_mbar[_slot]); \
+        mbarrier_wait(_mb, tile_ready_phase[_slot]);                                    \
+        tile_ready_phase[_slot] ^= 1;                                                   \
+        /* async-proxy → tcgen05 visibility: required between TMA and MMA */            \
+        asm volatile("tcgen05.fence::after_thread_sync;");                              \
+    } while (0)
+
+#define MMA_ASYNC(slot_, first_iter_)                                                   \
+    do {                                                                                \
+        const int _slot = (slot_);                                                      \
+        if (warp_id == 0 && elect_sync()) {                                             \
+            _Pragma("unroll")                                                           \
+            for (int _k1 = 0; _k1 < BLOCK_K / 64; _k1++) {                              \
+                _Pragma("unroll")                                                       \
+                for (int _k2 = 0; _k2 < 64 / MMA_K; _k2++) {                            \
+                    const uint64_t _a = make_desc(                                      \
+                        A_SMEM_SLOT(_slot) + _k1 * BLOCK_M * 128 + _k2 * 32);           \
+                    const uint64_t _b = make_desc(                                      \
+                        B_SMEM_SLOT(_slot) + _k1 * BLOCK_N * 128 + _k2 * 32);           \
+                    const bool _accumulate = !(first_iter_) || _k1 > 0 || _k2 > 0;      \
+                    tcgen05_mma(taddr, _a, _b, idesc, _accumulate);                     \
+                }                                                                       \
+            }                                                                           \
+            tcgen05_commit(                                                             \
+                (uint32_t)__cvta_generic_to_shared(&mma_done_mbar[_slot]));             \
+        }                                                                               \
+    } while (0)
+
+#define WAIT_ON_MMA(slot_)                                                              \
+    do {                                                                                \
+        const int _slot = (slot_);                                                      \
+        const uint32_t _mb = (uint32_t)__cvta_generic_to_shared(&mma_done_mbar[_slot]); \
+        mbarrier_wait(_mb, mma_done_phase[_slot]);                                      \
+        mma_done_phase[_slot] ^= 1;                                                     \
+    } while (0)
 
     // ── Main K-iter loop ────────────────────────────────────────────────────
+    //
+    //   Single-stage (no pipelining): each iteration runs the full event chain
+    //   LOAD → WAIT → MMA → WAIT before starting the next K-tile.
+    //
+    //   Dependency chain per iter:
+    //       LOAD_TILE(0, k0)
+    //           │
+    //           ▼
+    //       WAIT_ON_TILE_READY(0)        ← SMEM slot 0 is populated
+    //           │
+    //           ▼
+    //       MMA_ASYNC(0)                 ← issues all K_MMAS to read slot 0
+    //           │
+    //           ▼
+    //       WAIT_ON_MMA(0)               ← SMEM slot 0 is now free for reuse
+    //
+    const int num_iters = K / BLOCK_K;
     for (int iter_k = 0; iter_k < num_iters; iter_k++) {
-        // ── TMA load (one thread) ──
-        if (warp_id == 0 && elect_sync()) {
-            for (int k = 0; k < BLOCK_K / 64; k++) {
-                int off_k = iter_k * BLOCK_K + k * 64;
-                // boxes are (BLOCK_M, 64) and (BLOCK_N, 64); the TMA's 2D shape
-                // is (width=64=K-cols, height=BLOCK_M=M-rows).
-                tma_2d_load(A_smem + k * BLOCK_M * 128, A_tmap, off_k, off_m, mbar_addr);
-                tma_2d_load(B_smem + k * BLOCK_N * 128, B_tmap, off_k, off_n, mbar_addr);
-            }
-            int cp_size = (BLOCK_M + BLOCK_N) * BLOCK_K * sizeof(__nv_bfloat16);
-            mbarrier_arrive_expect_tx(mbar_addr, cp_size);
-        }
-        mbarrier_wait(mbar_addr, phase);
-        asm volatile("tcgen05.fence::after_thread_sync;");
-        phase ^= 1;
+        const int k0 = iter_k * BLOCK_K;
 
-        // ── MMA loop (one thread issues) ──
-        if (warp_id == 0 && elect_sync()) {
-            // k1: outer 64-K-tile.  k2: inner MMA_K=16 strides within a tile.
-            bool first = (iter_k == 0);
-            for (int k1 = 0; k1 < BLOCK_K / 64; k1++) {
-                for (int k2 = 0; k2 < 64 / MMA_K; k2++) {
-                    uint64_t a_desc = make_desc(A_smem + k1 * BLOCK_M * 128 + k2 * 32);
-                    uint64_t b_desc = make_desc(B_smem + k1 * BLOCK_N * 128 + k2 * 32);
-                    bool enable_d = !first || k1 > 0 || k2 > 0;
-                    tcgen05_mma(taddr, a_desc, b_desc, idesc, enable_d);
-                }
-            }
-            tcgen05_commit(mbar_addr);
-        }
-        mbarrier_wait(mbar_addr, phase);
-        phase ^= 1;
+        LOAD_TILE(0, k0);
+        WAIT_ON_TILE_READY(0);
+        MMA_ASYNC(0, /*first_iter=*/(iter_k == 0));
+        WAIT_ON_MMA(0);
     }
+
+#undef LOAD_TILE
+#undef WAIT_ON_TILE_READY
+#undef MMA_ASYNC
+#undef WAIT_ON_MMA
 
     // ── Epilogue: tcgen05.ld.32x32b.x8 ──
     asm volatile("tcgen05.fence::after_thread_sync;");
